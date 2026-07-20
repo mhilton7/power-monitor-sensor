@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,14 +14,24 @@ ROOT = Path(env.subst("$PROJECT_DIR"))  # type: ignore[name-defined]
 
 
 def git_commit() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "--short=12", "HEAD"],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    return result.stdout.strip() if result.returncode == 0 else "uncommitted"
+    executable = shutil.which("git")
+    if executable is not None:
+        result = subprocess.run(
+            [executable, "rev-parse", "--short=12", "HEAD"], cwd=ROOT,
+            text=True, capture_output=True, check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    head_path = ROOT / ".git" / "HEAD"
+    if head_path.is_file():
+        head = head_path.read_text(encoding="ascii").strip()
+        if head.startswith("ref: "):
+            reference = ROOT / ".git" / head[5:]
+            if reference.is_file():
+                return reference.read_text(encoding="ascii").strip()[:12]
+        elif len(head) >= 12:
+            return head[:12]
+    return "uncommitted"
 
 
 epoch = os.environ.get("SOURCE_DATE_EPOCH")
