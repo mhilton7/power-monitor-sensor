@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "firmware_version": "1.0.0",
+  "protocol": "pm-protocol/1.0.0",
+  "hardware_target": "esp32-s3-n16r8",
+  "image_url": "https://server.example.invalid/releases/1.0.0/firmware.bin",
+  "image_size": 1177840,
+  "image_sha256": "baff5519cad82d0eb817633822912c201f4c5e440b4748e8c5dcac5bed57cd30",
+  "minimum_rollback_version": "1.0.0",
+  "release_notes": "Power Monitor Sensor Agent 1.0.0: initial pm-protocol/1.0.0 production release. Physical PZEM, microSD, enclosure, and signed-OTA validation remains required on the target installation.",
+  "signature_algorithm": "ecdsa-p256-sha256",
+  "allow_downgrade": false
+}
