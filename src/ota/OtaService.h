@@ -37,7 +37,8 @@ struct OtaStatus {
 class OtaService {
  public:
   explicit OtaService(ConfigService& config);
-  bool checkRunningImage();
+  bool runningImagePendingVerification() const;
+  bool checkRunningImage(bool health_checks_passed);
   bool applyFromManifestUrl(const std::string& manifest_url);
   bool parseManifest(const std::string& json, OtaManifest& manifest,
                      std::string& error) const;

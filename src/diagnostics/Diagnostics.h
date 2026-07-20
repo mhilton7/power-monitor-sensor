@@ -34,6 +34,13 @@ struct HttpMetrics {
   std::uint64_t rate_limited{0};
 };
 
+struct QueueMetrics {
+  std::uint32_t storage_depth{0};
+  std::uint32_t action_depth{0};
+  std::uint64_t storage_dropped{0};
+  std::uint64_t action_dropped{0};
+};
+
 class Diagnostics {
  public:
   Diagnostics();
@@ -44,6 +51,7 @@ class Diagnostics {
   void setQueueDepths(std::uint32_t storage_depth, std::uint32_t action_depth,
                       std::uint64_t storage_dropped,
                       std::uint64_t action_dropped);
+  QueueMetrics queueMetrics() const;
   void setSyncMetrics(const SyncMetrics& metrics);
   SyncMetrics syncMetrics() const;
   void recordHttpStatus(int status, bool rejected_signature = false,
@@ -82,4 +90,3 @@ class Diagnostics {
 };
 
 }  // namespace pm
-

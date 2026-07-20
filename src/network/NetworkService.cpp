@@ -48,6 +48,12 @@ void NetworkService::update() {
     connectStation();
     next_reconnect_ms_ = clock_.monotonicMs() + nextBackoffMs();
   }
+  if (!connected && config_.hasWifiCredentials() &&
+      !status_.setup_ap_active && station_connect_started_ms_ != 0 &&
+      clock_.monotonicMs() - station_connect_started_ms_ >= 60'000U &&
+      clock_.monotonicMs() >= next_setup_recovery_ms_) {
+    startSetupAp();
+  }
   if (connected) {
     status_.rssi_dbm = WiFi.RSSI();
     const std::string current_ip = WiFi.localIP().toString().c_str();
@@ -57,12 +63,13 @@ void NetworkService::update() {
     }
     status_.ip_address = current_ip;
   }
-  if (status_.setup_ap_active && config_.hasWifiCredentials() &&
+  if (status_.setup_ap_active &&
       clock_.monotonicMs() - setup_last_activity_ms_ >
           static_cast<std::uint64_t>(build::SETUP_AP_TTL_SECONDS) * 1000U) {
     WiFi.softAPdisconnect(true);
     dns_server_.stop();
     status_.setup_ap_active = false;
+    next_setup_recovery_ms_ = clock_.monotonicMs() + 300'000U;
   }
   if (status_.setup_ap_active) {
     dns_server_.processNextRequest();
@@ -71,6 +78,14 @@ void NetworkService::update() {
 
 void NetworkService::touchSetupActivity() {
   setup_last_activity_ms_ = clock_.monotonicMs();
+}
+
+void NetworkService::applyConfiguration() {
+  WiFi.disconnect(false, false);
+  status_.station_connected = false;
+  status_.server_reachable = false;
+  status_.server_authenticated = false;
+  connectStation();
 }
 
 NetworkStatus NetworkService::status() const { return status_; }
@@ -108,7 +123,21 @@ void NetworkService::startSetupAp() {
 void NetworkService::connectStation() {
   WiFi.mode(status_.setup_ap_active ? WIFI_AP_STA : WIFI_STA);
   WiFi.setHostname(config_.config().hostname.c_str());
+  if (config_.config().static_network_enabled) {
+    IPAddress address;
+    IPAddress gateway;
+    IPAddress subnet;
+    IPAddress dns;
+    address.fromString(config_.config().static_ip.c_str());
+    gateway.fromString(config_.config().static_gateway.c_str());
+    subnet.fromString(config_.config().static_subnet.c_str());
+    dns.fromString(config_.config().static_dns.c_str());
+    WiFi.config(address, gateway, subnet, dns);
+  }
   const std::string password = config_.wifiPassword();
+  if (station_connect_started_ms_ == 0) {
+    station_connect_started_ms_ = clock_.monotonicMs();
+  }
   WiFi.begin(config_.config().wifi_ssid.c_str(), password.c_str());
 }
 
@@ -120,6 +149,7 @@ void NetworkService::onConnected() {
   status_.gateway = WiFi.gatewayIP().toString().c_str();
   status_.dns = WiFi.dnsIP().toString().c_str();
   backoff_attempt_ = 0;
+  station_connect_started_ms_ = 0;
   const auto& ntp = config_.config().ntp_servers;
   configTzTime("UTC0", ntp[0].c_str(), ntp[1].c_str(), ntp[2].c_str());
   MDNS.end();

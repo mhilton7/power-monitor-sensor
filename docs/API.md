@@ -6,9 +6,11 @@ Machine contracts are `shared/openapi/device-api.yaml`, `shared/openapi/server-i
 
 ## Device API
 
-Reads: `GET /api/v1/health`, `/info`, `/live`, `/readings`, `/events`, `/storage`, `/sync-status`, `/config`, `/metrics`, and `/diagnostics/bundle`. Readings accept `after_sequence`, `from_utc`, `to_utc`, and bounded `limit`; `Accept: application/x-ndjson` returns one record per line. An expired cursor returns 410 with the retained range.
+Reads: `GET /api/v1/health`, `/info`, `/live`, `/readings`, `/events`, `/storage`, `/sync-status`, `/config`, `/metrics`, `/ota/status`, and `/diagnostics/bundle`. Readings accept `after_sequence`, `from_utc`, `to_utc`, and bounded `limit`; `Accept: application/x-ndjson` streams one bounded page with one record per line. An expired cursor returns 410 with the retained range. General authenticated traffic has a burst ceiling, and expensive history reads have a separate rate limit.
 
-Mutations: `PUT /api/v1/config`, `POST /api/v1/sync/ack`, `/setup/apply`, `/ota/apply`, and `/actions/{test-pzem,test-sd,remount-sd,rebuild-index,prepare-card-removal,test-dns,test-ntp,test-server-tls,test-heartbeat,reboot,network-reset,factory-reset,rollback-ota}`. Long work uses a bounded maintenance queue. Destructive actions require exact `X-PM-Action-Token` phrases.
+Mutations: `PUT /api/v1/config`, `POST /api/v1/sync/ack`, `/setup/apply`, `/enrollment/reenroll`, `/ota/apply`, and `/actions/{test-pzem,test-sd,remount-sd,rebuild-index,prepare-card-removal,test-dns,test-ntp,test-server-tls,test-heartbeat,reboot,network-reset,factory-reset,rollback-ota}`. Long work uses a bounded maintenance queue. Destructive actions require exact `X-PM-Action-Token` phrases; reenrollment uses `REENROLL`, immediately revokes the old device secret locally, and consumes a new single-use token through the normal TLS enrollment flow.
+
+Configuration schema 1 includes display identity and mirrored site/circuit role, DHCP or static IPv4, server TLS trust and host allowlist, pull/push/hybrid mode, live/heartbeat/sync/meter/log intervals, CT rating and threshold fractions, voltage/frequency limits, NTP/timezone, SD warning/retention policy, local session duration, signed-OTA channel/window, and diagnostic level. Secret fields are write-only. Network-critical changes keep a previous known-good copy and roll back if the device cannot report through the new server/trust settings.
 
 Browser sessions use a random short-lived `HttpOnly; SameSite=Strict` cookie plus `X-PM-CSRF`; origin checks and login throttling apply. The local UI is HTTP, so its cookie does not claim `Secure`. Do not expose it to the public Internet; use a trusted LAN/VLAN or private VPN.
 

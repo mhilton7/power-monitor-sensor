@@ -39,6 +39,7 @@ class EnergyNormalizer {
 class IntervalAggregator {
  public:
   explicit IntervalAggregator(Limits limits);
+  void setLimits(Limits limits);
   void reset(std::uint64_t start_utc_ms, std::uint64_t start_monotonic_ms);
   void add(const MeasurementSnapshot& sample);
   bool hasSamples() const;

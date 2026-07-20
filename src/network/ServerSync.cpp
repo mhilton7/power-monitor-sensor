@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <esp_system.h>
 #include <mbedtls/base64.h>
 
 #include "security/Crypto.h"
@@ -61,6 +63,52 @@ bool parseHttpsTarget(const std::string& url, std::string& host,
   return !host.empty() && port != 0;
 }
 
+const char* resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external_reset";
+    case ESP_RST_SW: return "software_reset";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT: return "task_watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    case ESP_RST_UNKNOWN:
+    default: return "unknown";
+  }
+}
+
+bool networkCriticalChanged(const RuntimeConfig& before,
+                            const RuntimeConfig& after) {
+  return before.server_url != after.server_url ||
+         before.server_ca_pem != after.server_ca_pem ||
+         before.server_fingerprint != after.server_fingerprint ||
+         before.connection_mode != after.connection_mode ||
+         before.allowed_server_addresses != after.allowed_server_addresses;
+}
+
+bool stationConfigurationChanged(const RuntimeConfig& before,
+                                 const RuntimeConfig& after) {
+  return before.wifi_ssid != after.wifi_ssid ||
+         before.static_network_enabled != after.static_network_enabled ||
+         before.static_ip != after.static_ip ||
+         before.static_gateway != after.static_gateway ||
+         before.static_subnet != after.static_subnet ||
+         before.static_dns != after.static_dns;
+}
+
+bool hostAllowed(const RuntimeConfig& config, const std::string& host) {
+  bool constrained = false;
+  for (const auto& allowed : config.allowed_server_addresses) {
+    if (allowed.empty()) continue;
+    constrained = true;
+    if (allowed == host) return true;
+  }
+  return !constrained;
+}
+
 }  // namespace
 
 ServerSync::ServerSync(ConfigService& config, NetworkService& network,
@@ -87,11 +135,36 @@ void ServerSync::tick() {
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
+  if (pending_config_validation_) {
+    if (network.station_connected && now >= next_config_validation_attempt_ms_ &&
+        now - pending_config_started_ms_ >= 2000U &&
+        reportConfiguration(pending_config_version_, "applied",
+                            "post_apply_connectivity_validated")) {
+      pending_config_validation_ = false;
+    } else if (now - pending_config_started_ms_ >= 30'000U) {
+      const bool restored = config_.rollbackToPrevious();
+      pending_config_validation_ = false;
+      pending_config_rollback_report_ = restored;
+      metrics_.last_error = restored ? "network_config_rolled_back"
+                                     : "network_config_rollback_failed";
+      if (restored) network_.applyConfiguration();
+    } else {
+      next_config_validation_attempt_ms_ = now + 2000U;
+    }
+    diagnostics_.setSyncMetrics(metrics_);
+    return;
+  }
+  if (pending_config_rollback_report_ && network.station_connected &&
+      now >= next_config_validation_attempt_ms_) {
+    pending_config_rollback_report_ =
+        !reportConfiguration(pending_config_version_, "rolled_back",
+                             "post_apply_connectivity_failed");
+    next_config_validation_attempt_ms_ = now + 5000U;
+  }
   if (now >= next_heartbeat_ms_) {
     if (heartbeat()) {
       retry_attempt_ = 0;
-      next_heartbeat_ms_ = now +
-          static_cast<std::uint64_t>(config_.config().heartbeat_interval_seconds) * 1000U;
+      next_heartbeat_ms_ = now + heartbeatDelayMs();
     } else {
       next_retry_ms_ = now + retryDelayMs();
     }
@@ -112,7 +185,8 @@ void ServerSync::tick() {
   }
   if (now >= next_config_poll_ms_) {
     fetchConfiguration();
-    next_config_poll_ms_ = now + 300'000U;
+    next_config_poll_ms_ = now +
+        static_cast<std::uint64_t>(config_.config().sync_interval_seconds) * 1000U;
   }
   if (!config_.safeMode() && now >= next_manifest_poll_ms_) {
     checkFirmwareManifest();
@@ -163,13 +237,48 @@ bool ServerSync::enroll() {
   const std::string device_id = result["device_id"] | "";
   const std::string encoded_secret = result["enrollment_secret"] | "";
   const std::string ota_public_key = result["ota_signing_public_key"] | "";
+  RuntimeConfig assigned = config_.config();
+  assigned.friendly_name = result["friendly_name"] | assigned.friendly_name.c_str();
+  assigned.site_id = result["site_id"] | assigned.site_id.c_str();
+  assigned.circuit_id = result["circuit_id"] | assigned.circuit_id.c_str();
+  assigned.parent_circuit_id =
+      result["parent_circuit_id"] | assigned.parent_circuit_id.c_str();
+  assigned.measurement_role =
+      result["measurement_role"] | assigned.measurement_role.c_str();
+  if (assigned.hostname.rfind("power-monitor-", 0) == 0 &&
+      device_id.size() == 36) {
+    std::string suffix = device_id;
+    suffix.erase(std::remove(suffix.begin(), suffix.end(), '-'), suffix.end());
+    assigned.hostname = "power-monitor-" + suffix.substr(suffix.size() - 6);
+  }
+  assigned.config_version = result["config_version"] | assigned.config_version;
+  const std::uint32_t heartbeat_policy =
+      result["policy"]["heartbeat_interval_seconds"] |
+      (result["heartbeat_interval_seconds"] | assigned.heartbeat_interval_seconds);
+  if (heartbeat_policy >= 5U && heartbeat_policy <= 3600U) {
+    assigned.heartbeat_interval_seconds = heartbeat_policy;
+  }
+  const char* policy_mode = result["policy"]["connection_mode"] | nullptr;
+  if (policy_mode != nullptr) {
+    assigned.connection_mode = std::strcmp(policy_mode, "pull") == 0
+                                   ? ConnectionMode::Pull
+                                   : (std::strcmp(policy_mode, "push") == 0
+                                          ? ConnectionMode::Push
+                                          : ConnectionMode::Hybrid);
+  }
+  const ConfigValidation assigned_validation = config_.validate(assigned, true);
+  if (!assigned_validation.valid) {
+    metrics_.last_error = "enrollment_assignment_invalid";
+    return false;
+  }
   std::array<std::uint8_t, 64> secret{};
   std::size_t secret_length = 0;
   if (mbedtls_base64_decode(secret.data(), secret.size(), &secret_length,
                             reinterpret_cast<const std::uint8_t*>(encoded_secret.data()),
                             encoded_secret.size()) != 0 ||
       !config_.saveEnrollment(device_id, secret.data(), secret_length,
-                              ota_public_key)) {
+                              ota_public_key) ||
+      !config_.stage(assigned, true) || !config_.commitStaged()) {
     std::fill(secret.begin(), secret.end(), 0U);
     metrics_.last_error = "enrollment_credentials_invalid";
     return false;
@@ -203,6 +312,14 @@ bool ServerSync::heartbeat() {
     config_.setServerAckSequence(acknowledgement);
   }
   immediate_sync_ = document["synchronize_now"] | immediate_sync_;
+  const std::uint32_t recommended =
+      document["recommended_heartbeat_interval_seconds"] | 0U;
+  heartbeat_interval_override_seconds_ =
+      recommended >= 5U && recommended <= 3600U ? recommended : 0U;
+  const std::string available = document["available_firmware_version"] | "";
+  if (!available.empty()) {
+    available_firmware_version_ = available;
+  }
   ++metrics_.heartbeat_successes;
   metrics_.last_heartbeat_utc_ms = clock_.utcMs();
   metrics_.last_error.clear();
@@ -310,16 +427,54 @@ bool ServerSync::fetchConfiguration() {
   if (requested_version <= config_.config().config_version) {
     return true;
   }
+  const RuntimeConfig previous = config_.config();
   ConfigValidation validation;
   const bool applied = config_.updateFromJson(response.body, false, false, validation);
+  if (applied && stationConfigurationChanged(previous, config_.config())) {
+    pending_config_version_ = requested_version;
+    pending_config_started_ms_ = clock_.monotonicMs();
+    next_config_validation_attempt_ms_ = pending_config_started_ms_ + 2000U;
+    pending_config_validation_ = true;
+    network_.applyConfiguration();
+    return true;
+  }
   JsonDocument report;
   report["config_version"] = requested_version;
   report["status"] = applied ? "applied" : "rejected";
   report["detail"] = validation.code;
   std::string body;
   serializeJson(report, body);
-  request("POST", "/api/v1/device-config/report", body, true);
-  return applied;
+  const HttpResult report_response =
+      request("POST", "/api/v1/device-config/report", body, true);
+  if (applied && networkCriticalChanged(previous, config_.config()) &&
+      report_response.status != 200 && report_response.status != 204) {
+    const bool restored = config_.rollbackToPrevious();
+    report["status"] = "rolled_back";
+    report["detail"] = restored ? "server_connectivity_validation_failed"
+                                 : "configuration_rollback_failed";
+    body.clear();
+    serializeJson(report, body);
+    request("POST", "/api/v1/device-config/report", body, true);
+    metrics_.last_error = restored ? "network_config_rolled_back"
+                                   : "network_config_rollback_failed";
+    return false;
+  }
+  return applied &&
+         (report_response.status == 200 || report_response.status == 204);
+}
+
+bool ServerSync::reportConfiguration(const std::uint32_t version,
+                                     const char* status,
+                                     const char* detail) {
+  JsonDocument report;
+  report["config_version"] = version;
+  report["status"] = status;
+  report["detail"] = detail;
+  std::string body;
+  serializeJson(report, body);
+  const HttpResult response =
+      request("POST", "/api/v1/device-config/report", body, true);
+  return response.status == 200 || response.status == 204;
 }
 
 bool ServerSync::checkFirmwareManifest() {
@@ -365,6 +520,13 @@ ServerSync::HttpResult ServerSync::request(const char* method,
   http.setTimeout(10000);
   http.setReuse(false);
   const std::string url = joinUrl(config_.config().server_url, endpoint);
+  std::string target_host;
+  std::uint16_t target_port = 443;
+  if (!parseHttpsTarget(url, target_host, target_port) ||
+      !hostAllowed(config_.config(), target_host)) {
+    result.error = "server_address_not_allowed";
+    return result;
+  }
   if (!http.begin(client, url.c_str())) {
     result.error = "http_begin_failed";
     return result;
@@ -446,7 +608,7 @@ std::string ServerSync::heartbeatBody() const {
   document["firmware_version"] = version::FIRMWARE;
   document["build_hash"] = version::GIT_COMMIT;
   document["uptime_seconds"] = clock_.monotonicMs() / 1000U;
-  document["reboot_reason"] = "reported_by_health_endpoint";
+  document["reboot_reason"] = resetReasonName();
   document["configuration_version"] = config_.config().config_version;
   JsonObject wifi = document["wifi"].to<JsonObject>();
   wifi["connected"] = network.station_connected;
@@ -468,6 +630,7 @@ std::string ServerSync::heartbeatBody() const {
     live["current_a"] = latest.current_a;
     live["active_power_w"] = latest.active_power_w;
     live["meter_energy_total_wh"] = latest.raw_energy_wh;
+    live["device_lifetime_energy_wh"] = latest.device_lifetime_energy_wh;
     live["frequency_hz"] = latest.frequency_hz;
     live["power_factor"] = latest.power_factor;
     live["quality_flags"] = latest.quality_flags;
@@ -489,11 +652,27 @@ std::string ServerSync::heartbeatBody() const {
   resources["free_heap_bytes"] = ESP.getFreeHeap();
   resources["minimum_free_heap_bytes"] = ESP.getMinFreeHeap();
   JsonObject queues = resources["queue_depths"].to<JsonObject>();
-  queues["storage"] = 0;
-  queues["actions"] = 0;
+  const QueueMetrics queue_metrics = diagnostics_.queueMetrics();
+  queues["storage"] = queue_metrics.storage_depth;
+  queues["actions"] = queue_metrics.action_depth;
+  queues["storage_dropped"] = queue_metrics.storage_dropped;
+  queues["actions_dropped"] = queue_metrics.action_dropped;
   std::string output;
   serializeJson(document, output);
   return output;
+}
+
+std::uint32_t ServerSync::heartbeatDelayMs() const {
+  const std::uint32_t seconds = heartbeat_interval_override_seconds_ == 0
+                                    ? config_.config().heartbeat_interval_seconds
+                                    : heartbeat_interval_override_seconds_;
+  const std::uint32_t base = seconds * 1000U;
+  std::array<std::uint8_t, 2> random{};
+  crypto::secureRandom(random.data(), random.size());
+  const std::uint32_t jitter =
+      ((static_cast<std::uint32_t>(random[0]) << 8U) | random[1]) %
+      (base / 10U + 1U);
+  return base + jitter;
 }
 
 std::uint32_t ServerSync::retryDelayMs() {

@@ -56,6 +56,11 @@ ProvisioningResult ProvisioningService::apply(const std::string& json) {
   }
   RuntimeConfig candidate = config_.config();
   candidate.wifi_ssid = ssid;
+  candidate.static_network_enabled = document["static_network_enabled"] | false;
+  candidate.static_ip = document["static_ip"] | "";
+  candidate.static_gateway = document["static_gateway"] | "";
+  candidate.static_subnet = document["static_subnet"] | "";
+  candidate.static_dns = document["static_dns"] | "";
   candidate.server_url = server_url;
   candidate.server_ca_pem = server_ca_pem;
   candidate.server_fingerprint = server_fingerprint;

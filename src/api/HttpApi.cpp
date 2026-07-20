@@ -35,6 +35,7 @@ void HttpApi::begin() {
   registerReadRoutes();
   registerMutationRoutes();
   server_.on("/", HTTP_GET, [this](AsyncWebServerRequest* request) {
+    network_.touchSetupActivity();
     const ui::Asset* asset = ui::findAsset("/index.html");
     if (asset == nullptr) {
       sendProblem(request, 500, "ui_asset_missing", "Embedded UI asset is unavailable.");
@@ -50,7 +51,8 @@ void HttpApi::begin() {
     response->addHeader("Referrer-Policy", "no-referrer");
     request->send(response);
   });
-  server_.on("/assets/app.js", HTTP_GET, [](AsyncWebServerRequest* request) {
+  server_.on("/assets/app.js", HTTP_GET, [this](AsyncWebServerRequest* request) {
+    network_.touchSetupActivity();
     const ui::Asset* asset = ui::findAsset("/assets/app.js");
     if (asset == nullptr) {
       request->send(404);
@@ -62,7 +64,8 @@ void HttpApi::begin() {
     response->addHeader("Cache-Control", "public, max-age=31536000, immutable");
     request->send(response);
   });
-  server_.on("/assets/style.css", HTTP_GET, [](AsyncWebServerRequest* request) {
+  server_.on("/assets/style.css", HTTP_GET, [this](AsyncWebServerRequest* request) {
+    network_.touchSetupActivity();
     const ui::Asset* asset = ui::findAsset("/assets/style.css");
     if (asset == nullptr) {
       request->send(404);
@@ -123,6 +126,13 @@ void HttpApi::registerReadRoutes() {
   });
   server_.on("/api/v1/readings", HTTP_GET, [this](AsyncWebServerRequest* request) {
     if (!authorize(request, "", false)) return;
+    if (clock_.monotonicMs() < history_allowed_at_ms_) {
+      sendProblem(request, 429, "history_rate_limited",
+                  "Wait before issuing another storage history request.",
+                  false, true);
+      return;
+    }
+    history_allowed_at_ms_ = clock_.monotonicMs() + 250U;
     const HistoryPage page = coordinator_.requestHistory(parseHistoryQuery(request));
     const bool ndjson = request->hasHeader("Accept") &&
                         request->getHeader("Accept")->value().indexOf("application/x-ndjson") >= 0;
@@ -130,6 +140,13 @@ void HttpApi::registerReadRoutes() {
   });
   server_.on("/api/v1/events", HTTP_GET, [this](AsyncWebServerRequest* request) {
     if (!authorize(request, "", false)) return;
+    if (clock_.monotonicMs() < history_allowed_at_ms_) {
+      sendProblem(request, 429, "history_rate_limited",
+                  "Wait before issuing another storage history request.",
+                  false, true);
+      return;
+    }
+    history_allowed_at_ms_ = clock_.monotonicMs() + 250U;
     sendPage(request,
              coordinator_.requestHistory(parseHistoryQuery(request), true), false);
   });
@@ -192,6 +209,23 @@ void HttpApi::registerReadRoutes() {
     sendJson(request, 200,
              diagnostics_.metricsJson(storage_.health(), meter_.metrics()));
   });
+  server_.on("/api/v1/ota/status", HTTP_GET,
+             [this](AsyncWebServerRequest* request) {
+    if (!authorize(request, "", false)) return;
+    const OtaStatus status = ota_.status();
+    JsonDocument document;
+    document["schema_version"] = 1;
+    document["in_progress"] = status.in_progress;
+    document["pending_reboot"] = status.pending_reboot;
+    document["bytes_received"] = status.bytes_received;
+    document["image_size"] = status.image_size;
+    document["target_version"] = status.target_version;
+    document["last_result"] = status.last_result;
+    document["last_error"] = status.last_error;
+    std::string body;
+    serializeJson(document, body);
+    sendJson(request, 200, body);
+  });
   server_.on("/api/v1/diagnostics/bundle", HTTP_GET,
              [this](AsyncWebServerRequest* request) {
     if (!authorize(request, "", false)) return;
@@ -208,6 +242,7 @@ void HttpApi::registerReadRoutes() {
 void HttpApi::registerMutationRoutes() {
   registerBodyRoute("/api/v1/auth/login", HTTP_POST,
                     [this](AsyncWebServerRequest* request) {
+    network_.touchSetupActivity();
     const std::string body = takeBody(request);
     if (!sameOrigin(request)) {
       sendProblem(request, 403, "origin_rejected", "Cross-origin login is not allowed.");
@@ -269,10 +304,17 @@ void HttpApi::registerMutationRoutes() {
                          request->getParam("dry_run")->value() == "true";
     const bool ct_ack = request->hasHeader("X-PM-CT-Change-Acknowledged") &&
                         request->getHeader("X-PM-CT-Change-Acknowledged")->value() == "true";
+    const float previous_ct_rating = config_.config().ct_rating_a;
     ConfigValidation result;
     if (!config_.updateFromJson(body, dry_run, ct_ack, result)) {
       sendProblem(request, 422, result.code.c_str(), result.detail.c_str());
       return;
+    }
+    if (!dry_run && previous_ct_rating != config_.config().ct_rating_a) {
+      coordinator_.enqueueEvent(
+          "EVT_CT_RATING_CHANGED", "warning",
+          "CT rating changed after explicit installed-hardware acknowledgement.",
+          clock_.utcMs(), config_.identity().boot_id);
     }
     JsonDocument document;
     document["valid"] = true;
@@ -284,6 +326,7 @@ void HttpApi::registerMutationRoutes() {
   });
   registerBodyRoute("/api/v1/setup/apply", HTTP_POST,
                     [this](AsyncWebServerRequest* request) {
+    network_.touchSetupActivity();
     const std::string body = takeBody(request);
     if (!localSession(request, true) || config_.hasAdminPassword()) {
       sendProblem(request, 403, "setup_not_authorized", "First-run setup requires the setup session and closes after administrator creation.");
@@ -314,6 +357,34 @@ void HttpApi::registerMutationRoutes() {
       return;
     }
     sendJson(request, 200, "{\"status\":\"acknowledged\"}");
+  });
+  registerBodyRoute("/api/v1/enrollment/reenroll", HTTP_POST,
+                    [this](AsyncWebServerRequest* request) {
+    const std::string body = takeBody(request);
+    if (!authorize(request, body, true)) return;
+    if (!request->hasHeader("X-PM-Action-Token") ||
+        request->getHeader("X-PM-Action-Token")->value() != "REENROLL") {
+      sendProblem(request, 403, "action_confirmation_required",
+                  "The exact short-lived reenrollment confirmation is required.");
+      return;
+    }
+    JsonDocument document;
+    if (deserializeJson(document, body)) {
+      sendProblem(request, 400, "reenrollment_json_invalid",
+                  "Reenrollment body is invalid.");
+      return;
+    }
+    const std::string token = document["enrollment_token"] | "";
+    if (!config_.beginReenrollment(token)) {
+      sendProblem(request, 422, "reenrollment_failed",
+                  "The one-time token could not replace existing credentials.");
+      return;
+    }
+    coordinator_.enqueueEvent(
+        "EVT_REENROLLMENT_REQUESTED", "warning",
+        "Authorized credential revocation and reenrollment requested.",
+        clock_.utcMs(), config_.identity().boot_id);
+    sendJson(request, 200, "{\"status\":\"reenrollment_pending\"}");
   });
   registerAction("/api/v1/actions/test-pzem", MaintenanceAction::TestPzem);
   registerAction("/api/v1/actions/test-sd", MaintenanceAction::TestSd);
@@ -400,6 +471,21 @@ std::string HttpApi::takeBody(AsyncWebServerRequest* request) const {
 
 bool HttpApi::authorize(AsyncWebServerRequest* request, const std::string& body,
                         const bool mutation) {
+  if (network_.status().setup_ap_active) {
+    network_.touchSetupActivity();
+  }
+  const std::uint64_t now = clock_.monotonicMs();
+  if (api_window_started_ms_ == 0 || now - api_window_started_ms_ >= 1000U) {
+    api_window_started_ms_ = now;
+    api_requests_in_window_ = 0;
+  }
+  if (api_requests_in_window_ >= 60U) {
+    sendProblem(request, 429, "api_rate_limited",
+                "The authenticated API request rate exceeded the bounded limit.",
+                false, true);
+    return false;
+  }
+  ++api_requests_in_window_;
   if (!sameOrigin(request)) {
     sendProblem(request, 403, "origin_rejected", "Cross-origin API access is not allowed.");
     return false;
@@ -526,9 +612,17 @@ void HttpApi::sendPage(AsyncWebServerRequest* request, const HistoryPage& page,
     return;
   }
   if (ndjson) {
-    std::string body;
-    for (const auto& record : page.records) body += record + "\n";
-    sendJson(request, 200, body, "application/x-ndjson");
+    AsyncResponseStream* response =
+        request->beginResponseStream("application/x-ndjson");
+    response->setCode(200);
+    response->addHeader("Cache-Control", "no-store");
+    response->addHeader("X-Content-Type-Options", "nosniff");
+    for (const auto& record : page.records) {
+      response->print(record.c_str());
+      response->print('\n');
+    }
+    diagnostics_.recordHttpStatus(200);
+    request->send(response);
     return;
   }
   JsonDocument document;

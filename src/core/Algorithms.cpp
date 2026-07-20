@@ -41,11 +41,11 @@ std::uint32_t validateMeasurement(MeasurementSnapshot& sample,
       sample.frequency_hz > limits.maximum_frequency_hz) {
     flags |= FrequencyOutOfRange;
   }
-  if (sample.current_a >= limits.ct_rating_a * 1.10F) {
+  if (sample.current_a >= limits.ct_rating_a * limits.ct_fault_fraction) {
     flags |= CtOverRange;
-  } else if (sample.current_a >= limits.ct_rating_a * 0.90F) {
+  } else if (sample.current_a >= limits.ct_rating_a * limits.ct_critical_fraction) {
     flags |= CtWarning90;
-  } else if (sample.current_a >= limits.ct_rating_a * 0.80F) {
+  } else if (sample.current_a >= limits.ct_rating_a * limits.ct_warning_fraction) {
     flags |= CtWarning80;
   }
   sample.valid = (flags & (VoltageOutOfRange | FrequencyOutOfRange |
@@ -109,6 +109,10 @@ std::uint64_t EnergyNormalizer::offsetWh() const { return offset_wh_; }
 
 IntervalAggregator::IntervalAggregator(Limits limits)
     : limits_(std::move(limits)) {}
+
+void IntervalAggregator::setLimits(Limits limits) {
+  limits_ = std::move(limits);
+}
 
 void IntervalAggregator::reset(const std::uint64_t start_utc_ms,
                                const std::uint64_t start_monotonic_ms) {

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <vector>
 
 #include <ArduinoJson.h>
@@ -47,22 +48,54 @@ bool verifyPinnedPeer(WiFiClientSecure& client, const std::string& url,
          client.verify(fingerprint.c_str(), host.c_str());
 }
 
+bool hostAllowed(const RuntimeConfig& config, const std::string& url) {
+  std::string host;
+  std::uint16_t port = 443;
+  if (!parseHttpsTarget(url, host, port)) return false;
+  bool constrained = false;
+  for (const auto& allowed : config.allowed_server_addresses) {
+    if (allowed.empty()) continue;
+    constrained = true;
+    if (allowed == host) return true;
+  }
+  return !constrained;
+}
+
+bool withinUpdateWindow(const RuntimeConfig& config) {
+  if (!config.ota_update_window_enabled) return true;
+  const std::time_t now = std::time(nullptr);
+  if (now < 1'600'000'000) return false;
+  std::tm utc{};
+  gmtime_r(&now, &utc);
+  const int start = config.ota_update_window_start_hour;
+  const int end = config.ota_update_window_end_hour;
+  return start < end ? utc.tm_hour >= start && utc.tm_hour < end
+                     : utc.tm_hour >= start || utc.tm_hour < end;
+}
+
 }  // namespace
 
 OtaService::OtaService(ConfigService& config) : config_(config) {
   mutex_ = xSemaphoreCreateMutex();
 }
 
-bool OtaService::checkRunningImage() {
+bool OtaService::runningImagePendingVerification() const {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  return running != nullptr &&
+         esp_ota_get_state_partition(running, &state) == ESP_OK &&
+         state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+bool OtaService::checkRunningImage(const bool health_checks_passed) {
   const esp_partition_t* running = esp_ota_get_running_partition();
   esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
   if (running == nullptr || esp_ota_get_state_partition(running, &state) != ESP_OK) {
     return false;
   }
   if (state == ESP_OTA_IMG_PENDING_VERIFY) {
-    // Application calls this only after storage, meter initialization, network
-    // service startup, and task creation have succeeded.
-    return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
+    return health_checks_passed &&
+           esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
   }
   return true;
 }
@@ -71,7 +104,13 @@ bool OtaService::applyFromManifestUrl(const std::string& manifest_url) {
   if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
     return false;
   }
-  if (status_.in_progress || config_.safeMode()) {
+  if (status_.in_progress || config_.safeMode() ||
+      !withinUpdateWindow(config_.config())) {
+    if (!status_.in_progress) {
+      status_.last_result = "rejected";
+      status_.last_error = config_.safeMode() ? "ota_disabled_in_safe_mode"
+                                              : "outside_ota_update_window";
+    }
     xSemaphoreGive(mutex_);
     return false;
   }
@@ -227,6 +266,10 @@ bool OtaService::fetchText(const std::string& url, std::string& body,
     error = "ota_url_insecure";
     return false;
   }
+  if (!hostAllowed(config_.config(), url)) {
+    error = "ota_host_not_allowed";
+    return false;
+  }
   WiFiClientSecure client;
   if (!configureTls(client)) {
     error = "tls_trust_not_configured";
@@ -265,6 +308,10 @@ bool OtaService::fetchText(const std::string& url, std::string& body,
 
 bool OtaService::downloadAndApply(const OtaManifest& manifest,
                                   std::string& error) {
+  if (!hostAllowed(config_.config(), manifest.image_url)) {
+    error = "ota_host_not_allowed";
+    return false;
+  }
   WiFiClientSecure client;
   if (!configureTls(client)) {
     error = "tls_trust_not_configured";

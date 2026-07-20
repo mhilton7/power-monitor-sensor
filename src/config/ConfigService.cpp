@@ -28,6 +28,16 @@ bool startsWith(const std::string& value, const char* prefix) {
   return value.rfind(prefix, 0) == 0;
 }
 
+bool validIpv4(const std::string& value) {
+  IPAddress address;
+  return !value.empty() && address.fromString(value.c_str());
+}
+
+bool validMeasurementRole(const std::string& value) {
+  return value == "main" || value == "service-leg" || value == "branch" ||
+         value == "submeter" || value == "other";
+}
+
 std::string defaultHostname(const DeviceIdentity& identity) {
   std::string source = identity.device_id.empty() ? identity.hardware_id : identity.device_id;
   source.erase(std::remove(source.begin(), source.end(), '-'), source.end());
@@ -82,6 +92,11 @@ ConfigValidation ConfigService::validate(const RuntimeConfig& candidate,
   if (candidate.friendly_name.empty() || candidate.friendly_name.size() > 64) {
     return {false, "friendly_name_invalid", "Friendly name must contain 1 through 64 characters."};
   }
+  if (candidate.site_id.size() > 64 || candidate.circuit_id.size() > 64 ||
+      candidate.parent_circuit_id.size() > 64 ||
+      !validMeasurementRole(candidate.measurement_role)) {
+    return {false, "circuit_metadata_invalid", "Site/circuit identifiers must be bounded and the measurement role must be supported."};
+  }
   if (candidate.hostname.empty() || candidate.hostname.size() > 63 ||
       candidate.hostname.front() == '-' || candidate.hostname.back() == '-' ||
       !std::all_of(candidate.hostname.begin(), candidate.hostname.end(), [](const char value) {
@@ -89,8 +104,39 @@ ConfigValidation ConfigService::validate(const RuntimeConfig& candidate,
       })) {
     return {false, "hostname_invalid", "Hostname must be a lowercase RFC 1123 label."};
   }
-  if (!candidate.server_url.empty() && !startsWith(candidate.server_url, "https://")) {
+  if (candidate.wifi_ssid.size() > 32 || candidate.static_ip.size() > 15 ||
+      candidate.static_gateway.size() > 15 ||
+      candidate.static_subnet.size() > 15 || candidate.static_dns.size() > 15) {
+    return {false, "network_string_too_large", "Wi-Fi and IPv4 configuration fields exceed device limits."};
+  }
+  if (candidate.server_url.size() > 256 ||
+      (!candidate.server_url.empty() &&
+       !startsWith(candidate.server_url, "https://"))) {
     return {false, "server_url_insecure", "The central server URL must use HTTPS."};
+  }
+  if (candidate.server_ca_pem.size() > 8192 ||
+      candidate.server_fingerprint.size() > 128) {
+    return {false, "tls_trust_too_large", "TLS trust material exceeds device limits."};
+  }
+  if (!candidate.server_url.empty() && candidate.server_ca_pem.empty() &&
+      candidate.server_fingerprint.empty()) {
+    return {false, "tls_trust_required", "A private CA PEM or certificate fingerprint is required for the central server."};
+  }
+  if (candidate.static_network_enabled &&
+      (!validIpv4(candidate.static_ip) || !validIpv4(candidate.static_gateway) ||
+       !validIpv4(candidate.static_subnet) || !validIpv4(candidate.static_dns))) {
+    return {false, "static_network_invalid", "Static IPv4 address, gateway, subnet mask, and DNS must all be valid."};
+  }
+  for (const auto& address : candidate.allowed_server_addresses) {
+    if (address.size() > 253 || address.find('/') != std::string::npos) {
+      return {false, "allowed_server_address_invalid", "Allowed server entries must be bounded hostnames or IP addresses without paths."};
+    }
+  }
+  if (candidate.live_interval_seconds < 1 ||
+      candidate.live_interval_seconds > 60 ||
+      candidate.sync_interval_seconds < 5 ||
+      candidate.sync_interval_seconds > 3600) {
+    return {false, "network_interval_invalid", "Live and synchronization intervals are outside supported ranges."};
   }
   if (candidate.sample_interval_seconds < 1 || candidate.sample_interval_seconds > 30) {
     return {false, "sample_interval_invalid", "Sample interval must be 1 through 30 seconds."};
@@ -104,6 +150,10 @@ ConfigValidation ConfigService::validate(const RuntimeConfig& candidate,
       candidate.heartbeat_interval_seconds > 3600) {
     return {false, "heartbeat_interval_invalid", "Heartbeat interval must be 5 through 3600 seconds."};
   }
+  if (candidate.sync_retry_max_seconds < 1 ||
+      candidate.sync_retry_max_seconds > 86400) {
+    return {false, "sync_retry_limit_invalid", "Maximum synchronization retry delay must be 1 through 86400 seconds."};
+  }
   if (candidate.pzem_timeout_ms < 100 || candidate.pzem_timeout_ms > 5000) {
     return {false, "pzem_timeout_invalid", "PZEM timeout must be 100 through 5000 milliseconds."};
   }
@@ -112,6 +162,13 @@ ConfigValidation ConfigService::validate(const RuntimeConfig& candidate,
   }
   if (candidate.ct_rating_a != config_.ct_rating_a && !ct_change_acknowledged) {
     return {false, "ct_change_ack_required", "Changing CT rating requires explicit physical-hardware acknowledgement."};
+  }
+  if (candidate.ct_warning_fraction <= 0.0F ||
+      candidate.ct_warning_fraction >= candidate.ct_critical_fraction ||
+      candidate.ct_critical_fraction > 1.0F ||
+      candidate.ct_fault_fraction <= candidate.ct_critical_fraction ||
+      candidate.ct_fault_fraction > 2.0F) {
+    return {false, "ct_thresholds_invalid", "CT warning, critical, and fault thresholds must increase safely within supported bounds."};
   }
   if (candidate.voltage_minimum_v < 0.0F ||
       candidate.voltage_maximum_v <= candidate.voltage_minimum_v ||
@@ -126,12 +183,36 @@ ConfigValidation ConfigService::validate(const RuntimeConfig& candidate,
   if (candidate.sd_spi_hz < 1'000'000 || candidate.sd_spi_hz > build::MAX_SD_SPI_HZ) {
     return {false, "sd_spi_frequency_invalid", "SD SPI frequency must be 1 through 20 MHz."};
   }
+  if (candidate.storage_warning_free_bytes < 1024U * 1024U ||
+      candidate.storage_warning_free_bytes > 64ULL * 1024ULL * 1024ULL * 1024ULL) {
+    return {false, "storage_warning_threshold_invalid", "Storage warning threshold must be 1 MiB through 64 GiB."};
+  }
+  if (candidate.retention_days < 1 || candidate.retention_days > 3650) {
+    return {false, "retention_days_invalid", "Retention must be 1 through 3650 days when enabled."};
+  }
+  if (candidate.timezone.empty() || candidate.timezone.size() > 64) {
+    return {false, "timezone_invalid", "Display timezone must contain 1 through 64 characters."};
+  }
+  for (const auto& server : candidate.ntp_servers) {
+    if (server.empty() || server.size() > 253) {
+      return {false, "ntp_server_invalid", "Exactly three bounded NTP server names are required."};
+    }
+  }
   if (candidate.local_session_timeout_seconds < 60 ||
       candidate.local_session_timeout_seconds > 86400) {
     return {false, "session_timeout_invalid", "Local session timeout must be 60 through 86400 seconds."};
   }
   if (candidate.ota_channel != "stable" && candidate.ota_channel != "beta") {
     return {false, "ota_channel_invalid", "OTA channel must be stable or beta."};
+  }
+  if (candidate.ota_update_window_start_hour > 23 ||
+      candidate.ota_update_window_end_hour > 23 ||
+      (candidate.ota_update_window_enabled &&
+       candidate.ota_update_window_start_hour == candidate.ota_update_window_end_hour)) {
+    return {false, "ota_update_window_invalid", "OTA update window hours must be distinct values from 0 through 23."};
+  }
+  if (candidate.diagnostic_log_level > 5) {
+    return {false, "diagnostic_log_level_invalid", "Diagnostic log level must be 0 through 5."};
   }
   return {true, "ok", "Configuration is valid."};
 }
@@ -168,6 +249,15 @@ bool ConfigService::rollbackStaged() {
   preferences_.remove("server_ca_stage");
   preferences_.remove("server_fp_stage");
   staged_valid_ = false;
+  return true;
+}
+
+bool ConfigService::rollbackToPrevious() {
+  RuntimeConfig previous;
+  if (!loadConfig("cfg_prev", previous) || !saveConfig("cfg", previous)) {
+    return false;
+  }
+  config_ = previous;
   return true;
 }
 
@@ -369,6 +459,22 @@ bool ConfigService::networkReset() {
   return saveConfig("cfg", config_);
 }
 
+bool ConfigService::beginReenrollment(const std::string& token) {
+  if (token.empty() || token.size() > 256 || !setEnrollmentToken(token)) {
+    return false;
+  }
+  const bool removed_device = preferences_.remove("device_id");
+  const bool removed_secret = preferences_.remove("enroll_sec");
+  preferences_.remove("ota_pub");
+  if (!removed_device || !removed_secret) {
+    preferences_.remove("enroll_tok");
+    return false;
+  }
+  identity_.device_id.clear();
+  identity_.enrolled = false;
+  return true;
+}
+
 bool ConfigService::factoryReset() {
   if (!preferences_.clear()) {
     return false;
@@ -424,18 +530,25 @@ bool ConfigService::loadConfig(const char* key, RuntimeConfig& output) const {
   if (!parseConfig(std::string(value.c_str()), output, result) || !result.valid) {
     return false;
   }
-  output.server_ca_pem = std::string(preferences_.getString("server_ca", "").c_str());
-  output.server_fingerprint = std::string(preferences_.getString("server_fp", "").c_str());
+  const bool previous = std::strcmp(key, "cfg_prev") == 0;
+  output.server_ca_pem = std::string(preferences_.getString(
+      previous ? "server_ca_prev" : "server_ca", "").c_str());
+  output.server_fingerprint = std::string(preferences_.getString(
+      previous ? "server_fp_prev" : "server_fp", "").c_str());
   return true;
 }
 
 bool ConfigService::saveConfig(const char* key, const RuntimeConfig& value) {
   const std::string json = serializeConfig(value);
   const bool config_saved = preferences_.putString(key, json.c_str()) == json.size();
-  if (std::strcmp(key, "cfg") == 0 || std::strcmp(key, "cfg_stage") == 0) {
+  if (std::strcmp(key, "cfg") == 0 || std::strcmp(key, "cfg_stage") == 0 ||
+      std::strcmp(key, "cfg_prev") == 0) {
     const bool staging = std::strcmp(key, "cfg_stage") == 0;
-    const char* ca_key = staging ? "server_ca_stage" : "server_ca";
-    const char* fingerprint_key = staging ? "server_fp_stage" : "server_fp";
+    const bool previous = std::strcmp(key, "cfg_prev") == 0;
+    const char* ca_key = staging ? "server_ca_stage" :
+                         (previous ? "server_ca_prev" : "server_ca");
+    const char* fingerprint_key = staging ? "server_fp_stage" :
+                                  (previous ? "server_fp_prev" : "server_fp");
     const bool ca_saved = preferences_.putString(ca_key, value.server_ca_pem.c_str()) ==
                           value.server_ca_pem.size();
     const bool fingerprint_saved =
@@ -452,17 +565,35 @@ std::string ConfigService::serializeConfig(const RuntimeConfig& value) const {
   document["config_version"] = value.config_version;
   document["friendly_name"] = value.friendly_name;
   document["hostname"] = value.hostname;
+  document["site_id"] = value.site_id;
+  document["circuit_id"] = value.circuit_id;
+  document["parent_circuit_id"] = value.parent_circuit_id;
+  document["measurement_role"] = value.measurement_role;
   document["wifi_ssid"] = value.wifi_ssid;
+  document["static_network_enabled"] = value.static_network_enabled;
+  document["static_ip"] = value.static_ip;
+  document["static_gateway"] = value.static_gateway;
+  document["static_subnet"] = value.static_subnet;
+  document["static_dns"] = value.static_dns;
   document["server_url"] = value.server_url;
   document["server_ca_configured"] = !value.server_ca_pem.empty();
   document["server_fingerprint_configured"] = !value.server_fingerprint.empty();
   document["connection_mode"] = connectionModeName(value.connection_mode);
+  JsonArray allowed = document["allowed_server_addresses"].to<JsonArray>();
+  for (const auto& address : value.allowed_server_addresses) {
+    if (!address.empty()) allowed.add(address);
+  }
+  document["live_interval_seconds"] = value.live_interval_seconds;
   document["sample_interval_seconds"] = value.sample_interval_seconds;
   document["pzem_timeout_ms"] = value.pzem_timeout_ms;
   document["durable_log_interval_seconds"] = value.durable_log_interval_seconds;
   document["heartbeat_interval_seconds"] = value.heartbeat_interval_seconds;
+  document["sync_interval_seconds"] = value.sync_interval_seconds;
   document["sync_retry_max_seconds"] = value.sync_retry_max_seconds;
   document["ct_rating_a"] = value.ct_rating_a;
+  document["ct_warning_fraction"] = value.ct_warning_fraction;
+  document["ct_critical_fraction"] = value.ct_critical_fraction;
+  document["ct_fault_fraction"] = value.ct_fault_fraction;
   document["voltage_minimum_v"] = value.voltage_minimum_v;
   document["voltage_maximum_v"] = value.voltage_maximum_v;
   document["frequency_minimum_hz"] = value.frequency_minimum_hz;
@@ -473,10 +604,14 @@ std::string ConfigService::serializeConfig(const RuntimeConfig& value) const {
     ntp.add(server);
   }
   document["sd_spi_hz"] = value.sd_spi_hz;
+  document["storage_warning_free_bytes"] = value.storage_warning_free_bytes;
   document["retention_enabled"] = value.retention_enabled;
   document["retention_days"] = value.retention_days;
   document["local_session_timeout_seconds"] = value.local_session_timeout_seconds;
   document["ota_channel"] = value.ota_channel;
+  document["ota_update_window_enabled"] = value.ota_update_window_enabled;
+  document["ota_update_window_start_hour"] = value.ota_update_window_start_hour;
+  document["ota_update_window_end_hour"] = value.ota_update_window_end_hour;
   document["diagnostic_log_level"] = value.diagnostic_log_level;
   std::string output;
   serializeJson(document, output);
@@ -495,15 +630,44 @@ bool ConfigService::parseConfig(const std::string& json, RuntimeConfig& value,
   value.config_version = document["config_version"] | value.config_version;
   value.friendly_name = document["friendly_name"] | value.friendly_name.c_str();
   value.hostname = document["hostname"] | value.hostname.c_str();
+  value.site_id = document["site_id"] | value.site_id.c_str();
+  value.circuit_id = document["circuit_id"] | value.circuit_id.c_str();
+  value.parent_circuit_id = document["parent_circuit_id"] | value.parent_circuit_id.c_str();
+  value.measurement_role = document["measurement_role"] | value.measurement_role.c_str();
   value.wifi_ssid = document["wifi_ssid"] | value.wifi_ssid.c_str();
+  value.static_network_enabled = document["static_network_enabled"] | value.static_network_enabled;
+  value.static_ip = document["static_ip"] | value.static_ip.c_str();
+  value.static_gateway = document["static_gateway"] | value.static_gateway.c_str();
+  value.static_subnet = document["static_subnet"] | value.static_subnet.c_str();
+  value.static_dns = document["static_dns"] | value.static_dns.c_str();
   value.server_url = document["server_url"] | value.server_url.c_str();
+  if (document["server_ca_pem"].is<const char*>()) {
+    value.server_ca_pem = document["server_ca_pem"].as<const char*>();
+  }
+  if (document["server_fingerprint"].is<const char*>()) {
+    value.server_fingerprint = document["server_fingerprint"].as<const char*>();
+  }
   value.connection_mode = parseMode(document["connection_mode"] | connectionModeName(value.connection_mode));
+  if (document["allowed_server_addresses"].is<JsonArray>()) {
+    value.allowed_server_addresses = {};
+    std::size_t index = 0;
+    for (JsonVariant item : document["allowed_server_addresses"].as<JsonArray>()) {
+      if (index < value.allowed_server_addresses.size() && item.is<const char*>()) {
+        value.allowed_server_addresses[index++] = item.as<const char*>();
+      }
+    }
+  }
+  value.live_interval_seconds = document["live_interval_seconds"] | value.live_interval_seconds;
   value.sample_interval_seconds = document["sample_interval_seconds"] | value.sample_interval_seconds;
   value.pzem_timeout_ms = document["pzem_timeout_ms"] | value.pzem_timeout_ms;
   value.durable_log_interval_seconds = document["durable_log_interval_seconds"] | value.durable_log_interval_seconds;
   value.heartbeat_interval_seconds = document["heartbeat_interval_seconds"] | value.heartbeat_interval_seconds;
+  value.sync_interval_seconds = document["sync_interval_seconds"] | value.sync_interval_seconds;
   value.sync_retry_max_seconds = document["sync_retry_max_seconds"] | value.sync_retry_max_seconds;
   value.ct_rating_a = document["ct_rating_a"] | value.ct_rating_a;
+  value.ct_warning_fraction = document["ct_warning_fraction"] | value.ct_warning_fraction;
+  value.ct_critical_fraction = document["ct_critical_fraction"] | value.ct_critical_fraction;
+  value.ct_fault_fraction = document["ct_fault_fraction"] | value.ct_fault_fraction;
   value.voltage_minimum_v = document["voltage_minimum_v"] | value.voltage_minimum_v;
   value.voltage_maximum_v = document["voltage_maximum_v"] | value.voltage_maximum_v;
   value.frequency_minimum_hz = document["frequency_minimum_hz"] | value.frequency_minimum_hz;
@@ -518,10 +682,14 @@ bool ConfigService::parseConfig(const std::string& json, RuntimeConfig& value,
     }
   }
   value.sd_spi_hz = document["sd_spi_hz"] | value.sd_spi_hz;
+  value.storage_warning_free_bytes = document["storage_warning_free_bytes"] | value.storage_warning_free_bytes;
   value.retention_enabled = document["retention_enabled"] | value.retention_enabled;
   value.retention_days = document["retention_days"] | value.retention_days;
   value.local_session_timeout_seconds = document["local_session_timeout_seconds"] | value.local_session_timeout_seconds;
   value.ota_channel = document["ota_channel"] | value.ota_channel.c_str();
+  value.ota_update_window_enabled = document["ota_update_window_enabled"] | value.ota_update_window_enabled;
+  value.ota_update_window_start_hour = document["ota_update_window_start_hour"] | value.ota_update_window_start_hour;
+  value.ota_update_window_end_hour = document["ota_update_window_end_hour"] | value.ota_update_window_end_hour;
   value.diagnostic_log_level = document["diagnostic_log_level"] | value.diagnostic_log_level;
   result = validate(value, true);
   return result.valid;

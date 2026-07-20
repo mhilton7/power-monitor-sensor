@@ -25,6 +25,8 @@ export class App {
   private config?: EffectiveConfig;
   private storage: Record<string, unknown> = {};
   private metrics: Record<string, unknown> = {};
+  private otaStatus: Record<string, unknown> = {};
+  private events: Record<string, unknown> = {};
   private view: View = "status";
   private setupRequired = false;
 
@@ -82,8 +84,9 @@ export class App {
 
   private async refresh(): Promise<void> {
     try {
-      [this.health, this.live, this.config, this.storage, this.metrics] = await Promise.all([
+      [this.health, this.live, this.config, this.storage, this.metrics, this.otaStatus, this.events] = await Promise.all([
         api.getHealth(), api.getLive(), api.getConfig(), api.getStorage(), api.getMetrics(),
+        api.getOtaStatus(), api.getEvents(),
       ]);
       this.renderView();
     } catch (error) {
@@ -107,7 +110,7 @@ export class App {
       case "storage": main.innerHTML = renderStorage(this.health, this.storage); break;
       case "network": main.innerHTML = renderNetwork(this.health, this.config); break;
       case "meter": main.innerHTML = renderMeter(this.health, this.live, this.config); break;
-      case "maintenance": main.innerHTML = renderMaintenance(this.metrics); break;
+      case "maintenance": main.innerHTML = renderMaintenance(this.metrics, this.otaStatus, this.events); break;
       case "setup": main.innerHTML = renderSetup(this.config, this.setupRequired); break;
     }
     this.bindViewActions();
@@ -123,6 +126,31 @@ export class App {
         button.disabled = true;
         try { await api.runAction(action, confirmation ?? undefined); } finally { button.disabled = false; }
       });
+    });
+    const exportForm = this.root.querySelector<HTMLFormElement>("#export-form");
+    exportForm?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const result = this.root.querySelector<HTMLElement>("#export-result");
+      if (!result) return;
+      const data = new FormData(exportForm);
+      const sequence = Number(data.get("after_sequence") ?? 0);
+      const toUtc = (value: FormDataEntryValue | null): string | undefined => {
+        const text = String(value ?? "");
+        return text ? new Date(text).toISOString() : undefined;
+      };
+      try {
+        result.textContent = "Preparing a bounded NDJSON page…";
+        const blob = await api.exportHistory(sequence, toUtc(data.get("from_utc")), toUtc(data.get("to_utc")));
+        const href = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = href;
+        link.download = `power-monitor-readings-after-${Math.max(0, Math.trunc(sequence))}.ndjson`;
+        link.click();
+        URL.revokeObjectURL(href);
+        result.textContent = "Export downloaded. Continue from the last sequence for another page.";
+      } catch (error) {
+        result.textContent = error instanceof Error ? error.message : "History export failed.";
+      }
     });
     const form = this.root.querySelector<HTMLFormElement>("#config-form");
     form?.addEventListener("submit", async (event) => {
@@ -149,6 +177,21 @@ export class App {
         result.textContent = "Setup committed. The sensor is rebooting to join Wi-Fi and enroll.";
       } catch (error) {
         result.textContent = error instanceof Error ? error.message : "First-run setup failed.";
+      }
+    });
+    const reenrollmentForm = this.root.querySelector<HTMLFormElement>("#reenrollment-form");
+    reenrollmentForm?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const result = this.root.querySelector<HTMLElement>("#reenrollment-result");
+      const input = reenrollmentForm.elements.namedItem("enrollment_token") as HTMLInputElement;
+      if (!result || destructiveConfirmation("credential revocation and reenrollment", "REENROLL") === null) return;
+      try {
+        await api.beginReenrollment(input.value);
+        input.value = "";
+        result.textContent = "Existing server credentials were revoked. Enrollment is pending.";
+      } catch (error) {
+        input.value = "";
+        result.textContent = error instanceof Error ? error.message : "Reenrollment failed.";
       }
     });
   }

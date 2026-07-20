@@ -60,6 +60,16 @@ void Diagnostics::setQueueDepths(const std::uint32_t storage_depth,
   }
 }
 
+QueueMetrics Diagnostics::queueMetrics() const {
+  if (!lock()) {
+    return {};
+  }
+  const QueueMetrics copy{storage_queue_depth_, action_queue_depth_,
+                          storage_dropped_, action_dropped_};
+  unlock();
+  return copy;
+}
+
 void Diagnostics::setSyncMetrics(const SyncMetrics& metrics) {
   if (lock()) {
     sync_ = metrics;
@@ -109,14 +119,24 @@ std::string Diagnostics::healthJson(const ConfigService& config,
                                     const ClockService& clock,
                                     const StorageHealth& storage,
                                     const MeterMetrics& meter) const {
+  MeasurementSnapshot latest;
+  const bool has_latest = this->latest(latest);
+  const SyncMetrics sync = syncMetrics();
   JsonDocument document;
   document["schema_version"] = 1;
   document["protocol"] = version::PROTOCOL;
   document["device_id"] = config.identity().device_id;
   document["friendly_name"] = config.config().friendly_name;
+  document["site_id"] = config.config().site_id;
+  document["circuit_id"] = config.config().circuit_id;
+  document["parent_circuit_id"] = config.config().parent_circuit_id;
+  document["measurement_role"] = config.config().measurement_role;
+  const bool storage_healthy =
+      storage.writable &&
+      storage.free_bytes >= config.config().storage_warning_free_bytes;
   document["status"] = config.safeMode()
                            ? "safe_mode"
-                           : (storage.writable && meter.last_error == MeterError::None
+                           : (storage_healthy && meter.last_error == MeterError::None
                                   ? "healthy"
                                   : "degraded");
   document["uptime_seconds"] = clock.monotonicMs() / 1000U;
@@ -128,6 +148,9 @@ std::string Diagnostics::healthJson(const ConfigService& config,
   wifi["connected"] = network.station_connected;
   wifi["rssi_dbm"] = network.rssi_dbm;
   wifi["ip_address"] = network.ip_address;
+  wifi["subnet"] = network.subnet;
+  wifi["gateway"] = network.gateway;
+  wifi["dns"] = network.dns;
   wifi["hostname"] = network.hostname;
   JsonObject time = document["time"].to<JsonObject>();
   time["synchronized"] = clock.synchronized();
@@ -135,7 +158,8 @@ std::string Diagnostics::healthJson(const ConfigService& config,
   time["last_trusted_utc_ms"] = clock.lastTrustedUtcMs();
   JsonObject meter_json = document["meter"].to<JsonObject>();
   meter_json["connected"] = meter.last_error == MeterError::None;
-  meter_json["last_valid_reading_utc"] = latest_.valid ? latest_.utc_ms : 0;
+  meter_json["last_valid_reading_utc"] =
+      has_latest && latest.valid ? latest.utc_ms : 0;
   meter_json["consecutive_errors"] = meter.consecutive_errors;
   meter_json["last_error"] = meterErrorCode(meter.last_error);
   JsonObject storage_json = document["storage"].to<JsonObject>();
@@ -143,6 +167,9 @@ std::string Diagnostics::healthJson(const ConfigService& config,
   storage_json["mounted"] = storage.mounted;
   storage_json["writable"] = storage.writable;
   storage_json["free_bytes"] = storage.free_bytes;
+  storage_json["warning_free_bytes"] = config.config().storage_warning_free_bytes;
+  storage_json["low_space"] =
+      storage.mounted && storage.free_bytes < config.config().storage_warning_free_bytes;
   storage_json["last_write_utc"] = storage.last_write_utc_ms;
   storage_json["oldest_sequence"] = storage.oldest_sequence;
   storage_json["newest_sequence"] = storage.newest_sequence;
@@ -151,7 +178,7 @@ std::string Diagnostics::healthJson(const ConfigService& config,
   server["configured"] = !config.config().server_url.empty();
   server["reachable"] = network.server_reachable;
   server["authenticated"] = network.server_authenticated;
-  server["last_heartbeat_utc"] = sync_.last_heartbeat_utc_ms;
+  server["last_heartbeat_utc"] = sync.last_heartbeat_utc_ms;
   std::string output;
   serializeJson(document, output);
   return output;
@@ -193,6 +220,9 @@ std::string Diagnostics::liveJson(const ConfigService& config,
 
 std::string Diagnostics::metricsJson(const StorageHealth& storage,
                                      const MeterMetrics& meter) const {
+  const QueueMetrics queue = queueMetrics();
+  const SyncMetrics sync_metrics = syncMetrics();
+  const HttpMetrics http_metrics = httpMetrics();
   JsonDocument document;
   document["schema_version"] = 1;
   document["free_heap_bytes"] = ESP.getFreeHeap();
@@ -200,10 +230,10 @@ std::string Diagnostics::metricsJson(const StorageHealth& storage,
   document["psram_size_bytes"] = ESP.getPsramSize();
   document["free_psram_bytes"] = ESP.getFreePsram();
   JsonObject queues = document["queues"].to<JsonObject>();
-  queues["storage_depth"] = storage_queue_depth_;
-  queues["action_depth"] = action_queue_depth_;
-  queues["storage_dropped"] = storage_dropped_;
-  queues["action_dropped"] = action_dropped_;
+  queues["storage_depth"] = queue.storage_depth;
+  queues["action_depth"] = queue.action_depth;
+  queues["storage_dropped"] = queue.storage_dropped;
+  queues["action_dropped"] = queue.action_dropped;
   JsonObject pzem = document["pzem"].to<JsonObject>();
   pzem["requests"] = meter.requests;
   pzem["successes"] = meter.successes;
@@ -218,17 +248,17 @@ std::string Diagnostics::metricsJson(const StorageHealth& storage,
   sd["mount_cycles"] = storage.mount_cycles;
   sd["repair_count"] = storage.repair_count;
   JsonObject sync = document["sync"].to<JsonObject>();
-  sync["heartbeat_successes"] = sync_.heartbeat_successes;
-  sync["heartbeat_failures"] = sync_.heartbeat_failures;
-  sync["batch_successes"] = sync_.batch_successes;
-  sync["batch_failures"] = sync_.batch_failures;
-  sync["authentication_rejections"] = sync_.authentication_rejections;
+  sync["heartbeat_successes"] = sync_metrics.heartbeat_successes;
+  sync["heartbeat_failures"] = sync_metrics.heartbeat_failures;
+  sync["batch_successes"] = sync_metrics.batch_successes;
+  sync["batch_failures"] = sync_metrics.batch_failures;
+  sync["authentication_rejections"] = sync_metrics.authentication_rejections;
   JsonObject http = document["http"].to<JsonObject>();
-  http["requests"] = http_.requests;
-  http["status_2xx"] = http_.status_2xx;
-  http["status_4xx"] = http_.status_4xx;
-  http["status_5xx"] = http_.status_5xx;
-  http["rejected_signatures"] = http_.rejected_signatures;
+  http["requests"] = http_metrics.requests;
+  http["status_2xx"] = http_metrics.status_2xx;
+  http["status_4xx"] = http_metrics.status_4xx;
+  http["status_5xx"] = http_metrics.status_5xx;
+  http["rejected_signatures"] = http_metrics.rejected_signatures;
   std::string output;
   serializeJson(document, output);
   return output;

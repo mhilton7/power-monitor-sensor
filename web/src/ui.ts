@@ -43,6 +43,9 @@ export function renderBanners(health: Health): string {
   if (!health.storage.present || !health.storage.writable) {
     banners.push(`<div class="banner critical" role="alert"><strong>Durable history is not protected.</strong> The required microSD card is missing, unmounted, read-only, full, or damaged. Live readings may continue; buffered RAM data will not survive reboot.</div>`);
   }
+  if (health.storage.low_space) {
+    banners.push(`<div class="banner warning" role="alert"><strong>microSD free space is below the configured warning threshold.</strong> Review acknowledged retention or replace the card using the prepare-removal workflow.</div>`);
+  }
   if (!health.meter.connected) {
     banners.push(`<div class="banner warning" role="status"><strong>Meter communication degraded.</strong> Invalid readings are not replaced with zero. Check low-voltage UART wiring only after the installation is safely de-energized.</div>`);
   }
@@ -73,6 +76,7 @@ export function renderStorage(health: Health, storage: Record<string, unknown>):
   return `<section aria-labelledby="storage-heading"><h2 id="storage-heading">microSD storage</h2><p>The removable FAT32 card is the authoritative history store.</p>
     <div class="panel-grid"><article class="panel"><h3>Card health</h3><dl><dt>Present</dt><dd>${statusLabel(health.storage.present)}</dd><dt>Writable</dt><dd>${statusLabel(health.storage.writable)}</dd><dt>Free</dt><dd>${number(freeGb, 2)} GB</dd><dt>Index</dt><dd>${escapeHtml(storage.index_healthy ?? "Unknown")}</dd></dl></article>
     <article class="panel"><h3>Stored range</h3><dl><dt>Oldest sequence</dt><dd>${health.storage.oldest_sequence}</dd><dt>Newest sequence</dt><dd>${health.storage.newest_sequence}</dd><dt>Server acknowledged</dt><dd>${health.storage.server_ack_sequence}</dd></dl></article></div>
+    <form id="export-form" class="form-grid"><label>After sequence<input name="after_sequence" type="number" min="0" step="1" value="0" /></label><label>From local date/time<input name="from_utc" type="datetime-local" /></label><label>To local date/time<input name="to_utc" type="datetime-local" /></label><button type="submit">Export bounded NDJSON page</button><p id="export-result" role="status"></p></form>
     <div class="actions" aria-label="Storage maintenance"><button data-action="test-sd">Test card</button><button data-action="remount-sd">Remount</button><button data-action="rebuild-index">Rebuild index</button><button data-action="prepare-card-removal">Prepare removal</button></div>
     <p class="warning-text">Prepare removal before physically touching the card. This action does not make a mains enclosure safe to open.</p></section>`;
 }
@@ -85,14 +89,18 @@ export function renderNetwork(health: Health, config: EffectiveConfig): string {
 
 export function renderMeter(health: Health, live: LiveReading, config: EffectiveConfig): string {
   const ratio = live.current_a / config.ct_rating_a;
-  const level = ratio >= 1.1 ? "Possible configuration or hardware fault" : ratio >= 0.9 ? "90% CT warning" : ratio >= 0.8 ? "80% CT warning" : "Within configured range";
+  const warning = config.ct_warning_fraction ?? 0.8;
+  const critical = config.ct_critical_fraction ?? 0.9;
+  const fault = config.ct_fault_fraction ?? 1.1;
+  const level = ratio >= fault ? "Possible configuration or hardware fault" : ratio >= critical ? `${number(critical * 100, 0)}% CT warning` : ratio >= warning ? `${number(warning * 100, 0)}% CT warning` : "Within configured range";
   return `<section aria-labelledby="meter-heading"><h2 id="meter-heading">PZEM meter</h2><div class="panel-grid"><article class="panel"><h3>Communication</h3><dl><dt>Status</dt><dd>${statusLabel(health.meter.connected)}</dd><dt>Recent errors</dt><dd>${health.meter.consecutive_errors}</dd><dt>Last error</dt><dd>${escapeHtml(health.meter.last_error)}</dd></dl></article>
   <article class="panel"><h3>CT scope</h3><dl><dt>Configured rating</dt><dd>${config.ct_rating_a} A</dd><dt>Current loading</dt><dd>${number(ratio * 100)}%</dd><dt>Threshold status</dt><dd>${level}</dd></dl></article></div>
   <div class="banner warning"><strong>Electrical scope:</strong> the CT must surround exactly one current-carrying conductor, and the PZEM voltage input must reference the same monitored circuit and phase. Never move or clamp conductors while energized.</div><button data-action="test-pzem">Run communication test</button></section>`;
 }
 
-export function renderMaintenance(metrics: Record<string, unknown>): string {
+export function renderMaintenance(metrics: Record<string, unknown>, ota: Record<string, unknown>, events: Record<string, unknown>): string {
   return `<section aria-labelledby="maintenance-heading"><h2 id="maintenance-heading">Maintenance and recovery</h2><p>Diagnostics are redacted. Signed OTA verifies target, protocol, signature, image hash, and downgrade policy before changing the inactive slot.</p>
+  <div class="panel-grid"><article class="panel"><h3>Signed OTA status</h3><pre>${escapeHtml(JSON.stringify(ota, null, 2))}</pre></article><article class="panel"><h3>Recent device events</h3><pre>${escapeHtml(JSON.stringify(events, null, 2))}</pre></article></div>
   <details><summary>Machine counters</summary><pre>${escapeHtml(JSON.stringify(metrics, null, 2))}</pre></details>
   <div class="actions"><a class="button" href="/api/v1/diagnostics/bundle" download>Download diagnostics</a><button data-action="reboot" data-destructive="REBOOT">Reboot</button><button data-action="network-reset" data-destructive="RESET NETWORK">Reset network</button><button class="danger" data-action="factory-reset" data-destructive="FACTORY RESET">Factory reset</button></div></section>`;
 }
@@ -104,6 +112,8 @@ export function renderSetup(config: EffectiveConfig, setupRequired = false): str
     <form id="first-run-form" class="form-grid"><label>Friendly name<input name="friendly_name" value="${escapeHtml(config.friendly_name)}" minlength="1" maxlength="64" required /></label>
     <label>Wi-Fi SSID<input name="wifi_ssid" maxlength="32" autocomplete="off" required /></label>
     <label>Wi-Fi password<input name="wifi_password" type="password" maxlength="63" autocomplete="new-password" /></label>
+    <label class="check"><input name="static_network_enabled" type="checkbox" /> Use optional static IPv4 settings below (DHCP is the default).</label>
+    <label>Static IPv4 address<input name="static_ip" inputmode="decimal" maxlength="15" /></label><label>Gateway<input name="static_gateway" inputmode="decimal" maxlength="15" /></label><label>Subnet mask<input name="static_subnet" inputmode="decimal" maxlength="15" /></label><label>DNS server<input name="static_dns" inputmode="decimal" maxlength="15" /></label>
     <label>Central server URL<input name="server_url" type="url" pattern="https://.*" placeholder="https://monitor.example" required /></label>
     <label>Private CA certificate (PEM)<textarea name="server_ca_pem" rows="7" maxlength="8192" spellcheck="false"></textarea></label>
     <label>Or SHA-256 certificate fingerprint<input name="server_fingerprint" maxlength="128" spellcheck="false" /></label>
@@ -123,6 +133,7 @@ export function renderSetup(config: EffectiveConfig, setupRequired = false): str
   <label>CT rating (A)<input name="ct_rating_a" type="number" min="1" max="1000" step="0.1" value="${config.ct_rating_a}" required /></label>
   <label class="check"><input name="ct_ack" type="checkbox" /> I verified the configured CT rating matches the installed PZEM/CT set.</label>
   <button type="submit">Validate and apply</button><p id="config-result" role="status"></p></form>
+  <form id="reenrollment-form" class="form-grid"><label>New one-time enrollment token<input name="enrollment_token" type="password" maxlength="256" autocomplete="off" required /></label><button class="danger" type="submit">Revoke and reenroll</button><p id="reenrollment-result" role="status"></p></form>
   <div class="scope-note"><strong>No rate settings:</strong> this device stores raw and normalized energy only. Utility rates and bill estimates belong on the central server.</div></section>`;
 }
 
@@ -141,10 +152,20 @@ export function readSetupForm(form: HTMLFormElement): SetupPayload {
   if (!Number.isFinite(ct) || ct < 1 || ct > 1000 || data.get("ct_ack") !== "on") {
     throw new Error("Verify and acknowledge the installed CT rating (1 through 1000 A).");
   }
+  const staticEnabled = data.get("static_network_enabled") === "on";
+  const staticValues = ["static_ip", "static_gateway", "static_subnet", "static_dns"].map((name) => String(data.get(name) ?? "").trim());
+  if (staticEnabled && staticValues.some((value) => !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value))) {
+    throw new Error("Static networking requires an IPv4 address, gateway, subnet mask, and DNS server.");
+  }
   return {
     friendly_name: String(data.get("friendly_name") ?? "").trim(),
     wifi_ssid: String(data.get("wifi_ssid") ?? ""),
     wifi_password: String(data.get("wifi_password") ?? ""),
+    static_network_enabled: staticEnabled,
+    static_ip: staticValues[0],
+    static_gateway: staticValues[1],
+    static_subnet: staticValues[2],
+    static_dns: staticValues[3],
     server_url: String(data.get("server_url") ?? "").trim(),
     server_ca_pem: ca,
     server_fingerprint: fingerprint,

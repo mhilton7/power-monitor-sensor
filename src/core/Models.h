@@ -53,6 +53,9 @@ struct MeasurementSnapshot {
 
 struct Limits {
   float ct_rating_a{100.0F};
+  float ct_warning_fraction{0.8F};
+  float ct_critical_fraction{0.9F};
+  float ct_fault_fraction{1.1F};
   float minimum_voltage_v{80.0F};
   float maximum_voltage_v{280.0F};
   float minimum_frequency_hz{45.0F};

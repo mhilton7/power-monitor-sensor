@@ -19,6 +19,8 @@ export interface Health {
     mounted: boolean;
     writable: boolean;
     free_bytes: number;
+    warning_free_bytes?: number;
+    low_space?: boolean;
     oldest_sequence: number;
     newest_sequence: number;
     server_ack_sequence: number;
@@ -54,6 +56,9 @@ export interface EffectiveConfig {
   durable_log_interval_seconds: number;
   heartbeat_interval_seconds: number;
   ct_rating_a: number;
+  ct_warning_fraction?: number;
+  ct_critical_fraction?: number;
+  ct_fault_fraction?: number;
   timezone: string;
   sd_spi_hz: number;
 }
@@ -62,6 +67,11 @@ export interface SetupPayload {
   friendly_name: string;
   wifi_ssid: string;
   wifi_password: string;
+  static_network_enabled: boolean;
+  static_ip: string;
+  static_gateway: string;
+  static_subnet: string;
+  static_dns: string;
   server_url: string;
   server_ca_pem: string;
   server_fingerprint: string;

@@ -75,7 +75,7 @@ describe("local diagnostics UI", () => {
 
   it("logs in, clears the password, and renders fetched state", async () => {
     const responses = [
-      { csrf: "csrf", expires_in_seconds: 900, setup_required: false }, health, live, config, { index_healthy: true }, {},
+      { csrf: "csrf", expires_in_seconds: 900, setup_required: false }, health, live, config, { index_healthy: true }, {}, {}, { records: [] },
     ];
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "Content-Type": "application/json" } })));
     document.body.innerHTML = '<div id="app"></div>';
@@ -86,5 +86,28 @@ describe("local diagnostics UI", () => {
     root.querySelector<HTMLFormElement>("#login-form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     await vi.waitFor(() => expect(root.textContent).toContain("Garage HVAC"));
     expect(input.value).toBe("");
+  });
+
+  it("ends the local session when its server-issued timeout expires", async () => {
+    vi.useFakeTimers();
+    const responses = [
+      { csrf: "csrf", expires_in_seconds: 1, setup_required: false }, health, live,
+      config, { index_healthy: true }, {}, {}, { records: [] }, {},
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(responses.shift() ?? {}), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })));
+    document.body.innerHTML = '<div id="app"></div>';
+    const root = document.querySelector<HTMLElement>("#app")!;
+    new App(root).start();
+    const input = root.querySelector<HTMLInputElement>("#password")!;
+    input.value = "correct horse battery staple";
+    root.querySelector<HTMLFormElement>("#login-form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(root.textContent).toContain("Garage HVAC");
+    await vi.advanceTimersByTimeAsync(1000);
+    for (let index = 0; index < 10; index += 1) await Promise.resolve();
+    expect(root.querySelector("#login-form")).not.toBeNull();
   });
 });

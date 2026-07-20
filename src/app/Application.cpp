@@ -48,7 +48,7 @@ bool Application::begin() {
   config_.recordBootStarted();
   clock_.begin();
   clock_.update();
-  storage_.begin(config_.config().sd_spi_hz);
+  const bool storage_started = storage_.begin(config_.config().sd_spi_hz);
   if (!storage_coordinator_.begin()) {
     Serial.println("Fatal: bounded storage queue could not initialize.");
     return false;
@@ -59,10 +59,12 @@ bool Application::begin() {
   meter_ = std::unique_ptr<IMeter>(new (std::nothrow) PzemMeter(
       pzem_serial_, config_.config().pzem_timeout_ms, 2));
 #endif
-  if (meter_ == nullptr || !meter_->begin()) {
+  const bool meter_started = meter_ != nullptr && meter_->begin();
+  if (!meter_started) {
     Serial.println("Meter initialization degraded; recovery API remains available.");
   }
-  if (!network_.begin()) {
+  const bool network_started = network_.begin();
+  if (!network_started) {
     Serial.println("Network initialization degraded; local recovery continues.");
   }
   sample_queue_ = xQueueCreate(8, sizeof(MeasurementSnapshot));
@@ -84,7 +86,27 @@ bool Application::begin() {
     return false;
   }
   http_->begin();
-  ota_.checkRunningImage();
+  if (ota_.runningImagePendingVerification()) {
+    const std::uint64_t deadline = millis() + 8000U;
+    while (millis() < deadline &&
+           (meter_progress_.load() == 0 || aggregation_progress_.load() == 0 ||
+            network_progress_.load() == 0 || sync_progress_.load() == 0)) {
+      delay(25);
+    }
+    const bool post_boot_healthy =
+        storage_started && storage_.health().writable && meter_started &&
+        network_started && meter_progress_.load() != 0 &&
+        aggregation_progress_.load() != 0 && network_progress_.load() != 0 &&
+        sync_progress_.load() != 0;
+    if (!ota_.checkRunningImage(post_boot_healthy)) {
+      Serial.println("OTA post-boot validation failed; rebooting for automatic rollback.");
+      delay(250);
+      ESP.restart();
+      return false;
+    }
+  } else if (!ota_.checkRunningImage(true)) {
+    Serial.println("Warning: running OTA partition state could not be inspected.");
+  }
   config_.recordBootHealthy();
   storage_coordinator_.enqueueEvent(
       "EVT_BOOT_COMPLETE", "info",
@@ -137,6 +159,9 @@ void Application::meterTask() {
     }
     Limits limits;
     limits.ct_rating_a = config_.config().ct_rating_a;
+    limits.ct_warning_fraction = config_.config().ct_warning_fraction;
+    limits.ct_critical_fraction = config_.config().ct_critical_fraction;
+    limits.ct_fault_fraction = config_.config().ct_fault_fraction;
     limits.minimum_voltage_v = config_.config().voltage_minimum_v;
     limits.maximum_voltage_v = config_.config().voltage_maximum_v;
     limits.minimum_frequency_hz = config_.config().frequency_minimum_hz;
@@ -161,6 +186,9 @@ void Application::aggregationTask() {
   registerWatchdog();
   Limits limits;
   limits.ct_rating_a = config_.config().ct_rating_a;
+  limits.ct_warning_fraction = config_.config().ct_warning_fraction;
+  limits.ct_critical_fraction = config_.config().ct_critical_fraction;
+  limits.ct_fault_fraction = config_.config().ct_fault_fraction;
   limits.minimum_voltage_v = config_.config().voltage_minimum_v;
   limits.maximum_voltage_v = config_.config().voltage_maximum_v;
   limits.minimum_frequency_hz = config_.config().frequency_minimum_hz;
@@ -172,6 +200,15 @@ void Application::aggregationTask() {
   MeasurementSnapshot sample;
   for (;;) {
     if (xQueueReceive(sample_queue_, &sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      limits.ct_rating_a = config_.config().ct_rating_a;
+      limits.ct_warning_fraction = config_.config().ct_warning_fraction;
+      limits.ct_critical_fraction = config_.config().ct_critical_fraction;
+      limits.ct_fault_fraction = config_.config().ct_fault_fraction;
+      limits.minimum_voltage_v = config_.config().voltage_minimum_v;
+      limits.maximum_voltage_v = config_.config().voltage_maximum_v;
+      limits.minimum_frequency_hz = config_.config().frequency_minimum_hz;
+      limits.maximum_frequency_hz = config_.config().frequency_maximum_hz;
+      aggregator.setLimits(limits);
       if (!started) {
         aggregator.reset(sample.utc_ms, sample.monotonic_ms);
         interval_started_ms = sample.monotonic_ms;
@@ -246,7 +283,8 @@ void Application::healthTask() {
       feedWatchdog();
     }
     const std::uint64_t now = clock_.monotonicMs();
-    if (config_.config().retention_enabled && clock_.synchronized() &&
+    if (!config_.safeMode() && config_.config().retention_enabled &&
+        clock_.synchronized() &&
         (last_retention_ms == 0 || now - last_retention_ms >= 3'600'000U)) {
       storage_.applyRetention(config_.serverAckSequence(), clock_.utcMs(),
                               config_.config().retention_days);

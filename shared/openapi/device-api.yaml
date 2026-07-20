@@ -96,6 +96,15 @@ paths:
           content:
             application/json: {schema: {type: object}}
             text/plain: {schema: {type: string}}
+  /api/v1/ota/status:
+    get:
+      operationId: getOtaStatus
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200':
+          description: Signed OTA state and most recent result
+          content:
+            application/json: {schema: {type: object}}
   /api/v1/sync/ack:
     post:
       operationId: acknowledgeSequence
@@ -104,6 +113,23 @@ paths:
       responses:
         '200': {description: Monotonic cursor stored}
         '409': {$ref: '#/components/responses/Problem'}
+  /api/v1/enrollment/reenroll:
+    post:
+      operationId: beginReenrollment
+      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enrollment_token]
+              properties:
+                enrollment_token: {type: string, minLength: 1, maxLength: 256}
+      responses:
+        '200': {description: Existing device credential revoked and one-time reenrollment pending}
+        '403': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
   /api/v1/actions/test-pzem:
     $ref: '#/components/pathItems/QueuedAction'
   /api/v1/actions/test-sd:
@@ -200,14 +226,35 @@ components:
         config_version: {type: integer, minimum: 1}
         friendly_name: {type: string, maxLength: 64}
         hostname: {type: string, maxLength: 63}
+        site_id: {type: string, maxLength: 64}
+        circuit_id: {type: string, maxLength: 64}
+        parent_circuit_id: {type: string, maxLength: 64}
+        measurement_role: {enum: [main, service-leg, branch, submeter, other]}
+        wifi_ssid: {type: string, maxLength: 32}
+        static_network_enabled: {type: boolean}
+        static_ip: {type: string, maxLength: 15}
+        static_gateway: {type: string, maxLength: 15}
+        static_subnet: {type: string, maxLength: 15}
+        static_dns: {type: string, maxLength: 15}
         server_url: {type: string, pattern: '^https://'}
         connection_mode: {enum: [pull, push, hybrid]}
+        allowed_server_addresses: {type: array, maxItems: 4, items: {type: string, maxLength: 253}}
+        live_interval_seconds: {type: integer, minimum: 1, maximum: 60}
         sample_interval_seconds: {type: integer, minimum: 1, maximum: 30}
+        pzem_timeout_ms: {type: integer, minimum: 100, maximum: 5000}
         durable_log_interval_seconds: {type: integer, minimum: 10, maximum: 3600}
         heartbeat_interval_seconds: {type: integer, minimum: 5, maximum: 3600}
+        sync_interval_seconds: {type: integer, minimum: 5, maximum: 3600}
         ct_rating_a: {type: number, minimum: 1, maximum: 1000}
+        ct_warning_fraction: {type: number}
+        ct_critical_fraction: {type: number}
+        ct_fault_fraction: {type: number}
         timezone: {type: string, maxLength: 64}
         sd_spi_hz: {type: integer, minimum: 1000000, maximum: 20000000}
+        storage_warning_free_bytes: {type: integer, minimum: 1048576}
+        ota_update_window_enabled: {type: boolean}
+        ota_update_window_start_hour: {type: integer, minimum: 0, maximum: 23}
+        ota_update_window_end_hour: {type: integer, minimum: 0, maximum: 23}
     Health:
       type: object
       required: [schema_version, protocol, device_id, friendly_name, status, uptime_seconds, boot_id, firmware_version, api_version, wifi, time, meter, storage, server]

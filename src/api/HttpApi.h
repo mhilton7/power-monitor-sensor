@@ -72,7 +72,9 @@ class HttpApi {
   SessionManager sessions_;
   std::uint32_t login_failures_{0};
   std::uint64_t login_allowed_at_ms_{0};
+  std::uint64_t history_allowed_at_ms_{0};
+  std::uint64_t api_window_started_ms_{0};
+  std::uint16_t api_requests_in_window_{0};
 };
 
 }  // namespace pm
-

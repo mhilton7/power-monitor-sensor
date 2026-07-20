@@ -17,17 +17,32 @@ struct RuntimeConfig {
   std::uint32_t config_version{1};
   std::string friendly_name{"Unassigned Power Monitor"};
   std::string hostname;
+  std::string site_id;
+  std::string circuit_id;
+  std::string parent_circuit_id;
+  std::string measurement_role{"branch"};
   std::string wifi_ssid;
+  bool static_network_enabled{false};
+  std::string static_ip;
+  std::string static_gateway;
+  std::string static_subnet;
+  std::string static_dns;
   std::string server_url;
   std::string server_ca_pem;
   std::string server_fingerprint;
   ConnectionMode connection_mode{ConnectionMode::Hybrid};
+  std::array<std::string, 4> allowed_server_addresses{};
+  std::uint32_t live_interval_seconds{2};
   std::uint32_t sample_interval_seconds{1};
   std::uint32_t pzem_timeout_ms{750};
   std::uint32_t durable_log_interval_seconds{60};
   std::uint32_t heartbeat_interval_seconds{15};
+  std::uint32_t sync_interval_seconds{300};
   std::uint32_t sync_retry_max_seconds{900};
   float ct_rating_a{100.0F};
+  float ct_warning_fraction{0.8F};
+  float ct_critical_fraction{0.9F};
+  float ct_fault_fraction{1.1F};
   float voltage_minimum_v{80.0F};
   float voltage_maximum_v{280.0F};
   float frequency_minimum_hz{45.0F};
@@ -35,10 +50,14 @@ struct RuntimeConfig {
   std::string timezone{"America/Los_Angeles"};
   std::array<std::string, 3> ntp_servers{"time.cloudflare.com", "time.google.com", "pool.ntp.org"};
   std::uint32_t sd_spi_hz{4'000'000};
+  std::uint64_t storage_warning_free_bytes{64ULL * 1024ULL * 1024ULL};
   bool retention_enabled{false};
   std::uint16_t retention_days{365};
   std::uint32_t local_session_timeout_seconds{900};
   std::string ota_channel{"stable"};
+  bool ota_update_window_enabled{false};
+  std::uint8_t ota_update_window_start_hour{2};
+  std::uint8_t ota_update_window_end_hour{5};
   std::uint8_t diagnostic_log_level{1};
 };
 
@@ -66,6 +85,7 @@ class ConfigService {
   bool stage(const RuntimeConfig& candidate, bool ct_change_acknowledged);
   bool commitStaged();
   bool rollbackStaged();
+  bool rollbackToPrevious();
   bool updateFromJson(const std::string& json, bool dry_run,
                       bool ct_change_acknowledged, ConfigValidation& result);
   std::string redactedJson() const;
@@ -95,6 +115,7 @@ class ConfigService {
                           const std::string& admin_password);
   bool verifyAdminPassword(const std::string& password) const;
   bool networkReset();
+  bool beginReenrollment(const std::string& token);
   bool factoryReset();
 
   std::uint64_t serverAckSequence() const;

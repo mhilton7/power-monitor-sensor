@@ -34,10 +34,13 @@ class ServerSync {
   bool pushReadings();
   bool pushEvents();
   bool fetchConfiguration();
+  bool reportConfiguration(std::uint32_t version, const char* status,
+                           const char* detail);
   bool checkFirmwareManifest();
   HttpResult request(const char* method, const std::string& endpoint,
                      const std::string& body, bool authenticated);
   std::string heartbeatBody() const;
+  std::uint32_t heartbeatDelayMs() const;
   std::uint32_t retryDelayMs();
 
   ConfigService& config_;
@@ -54,6 +57,12 @@ class ServerSync {
   std::uint64_t next_event_push_ms_{0};
   std::uint64_t event_cursor_{0};
   std::uint32_t retry_attempt_{0};
+  std::uint32_t heartbeat_interval_override_seconds_{0};
+  std::uint32_t pending_config_version_{0};
+  std::uint64_t pending_config_started_ms_{0};
+  std::uint64_t next_config_validation_attempt_ms_{0};
+  bool pending_config_validation_{false};
+  bool pending_config_rollback_report_{false};
   bool immediate_sync_{false};
   std::string available_firmware_version_;
 };

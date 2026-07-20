@@ -32,6 +32,7 @@ class NetworkService {
   NetworkService(ConfigService& config, ClockService& clock);
   bool begin();
   void update();
+  void applyConfiguration();
   void touchSetupActivity();
   NetworkStatus status() const;
   bool ipChangedSinceHeartbeat();
@@ -48,6 +49,8 @@ class NetworkService {
   NetworkStatus status_;
   std::uint64_t next_reconnect_ms_{0};
   std::uint64_t setup_last_activity_ms_{0};
+  std::uint64_t station_connect_started_ms_{0};
+  std::uint64_t next_setup_recovery_ms_{0};
   std::uint32_t backoff_attempt_{0};
   bool ip_changed_{false};
   DNSServer dns_server_;

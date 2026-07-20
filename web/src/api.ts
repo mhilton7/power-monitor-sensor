@@ -55,6 +55,31 @@ export const getLive = (): Promise<LiveReading> => request("/api/v1/live");
 export const getConfig = (): Promise<EffectiveConfig> => request("/api/v1/config");
 export const getStorage = (): Promise<Record<string, unknown>> => request("/api/v1/storage");
 export const getMetrics = (): Promise<Record<string, unknown>> => request("/api/v1/metrics");
+export const getOtaStatus = (): Promise<Record<string, unknown>> => request("/api/v1/ota/status");
+export const getEvents = (): Promise<Record<string, unknown>> => request("/api/v1/events?limit=20");
+
+export async function exportHistory(
+  afterSequence: number,
+  fromUtc?: string,
+  toUtc?: string,
+): Promise<Blob> {
+  const parameters = new URLSearchParams({
+    after_sequence: String(Math.max(0, Math.trunc(afterSequence))),
+    limit: "500",
+  });
+  if (fromUtc) parameters.set("from_utc", fromUtc);
+  if (toUtc) parameters.set("to_utc", toUtc);
+  const response = await fetch(`/api/v1/readings?${parameters}`, {
+    headers: { Accept: "application/x-ndjson" },
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const problem = (await response.json().catch(() => ({}))) as { code?: string; detail?: string };
+    throw new ApiError(response.status, problem.code ?? "export_failed", problem.detail ?? "History export failed.");
+  }
+  return response.blob();
+}
 
 export function updateConfig(config: EffectiveConfig, ctAcknowledged: boolean): Promise<Record<string, unknown>> {
   return request("/api/v1/config", {
@@ -68,6 +93,14 @@ export function applySetup(payload: SetupPayload): Promise<Record<string, unknow
   return request("/api/v1/setup/apply", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export function beginReenrollment(token: string): Promise<Record<string, unknown>> {
+  return request("/api/v1/enrollment/reenroll", {
+    method: "POST",
+    headers: { "X-PM-Action-Token": "REENROLL" },
+    body: JSON.stringify({ enrollment_token: token }),
   });
 }
 
