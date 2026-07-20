@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "protocol": "pm-protocol/1.0.0",
+  "device_id": "6db47e3d-b16c-4746-8f21-64310f9e9252",
+  "boot_id": "44f16f01-46c9-4ea4-9bf7-f194269dd048",
+  "firmware_version": "1.0.0",
+  "build_hash": "abc1234",
+  "uptime_seconds": 483921,
+  "reboot_reason": "power_on",
+  "wifi": {"connected": true, "ip_address": "192.168.1.41", "hostname": "power-monitor-a1b2c3.local", "rssi_dbm": -57},
+  "time": {"synchronized": true, "utc": "2026-07-20T18:42:15Z"},
+  "meter": {"connected": true, "consecutive_errors": 0},
+  "storage": {"present": true, "mounted": true, "writable": true, "oldest_sequence": 1, "newest_sequence": 583913},
+  "sync": {"server_ack_sequence": 583900, "backlog_estimate": 13, "mode": "hybrid"},
+  "resources": {"free_heap_bytes": 240000, "minimum_free_heap_bytes": 210000, "queue_depths": {"storage": 0, "actions": 0}}
+}
+

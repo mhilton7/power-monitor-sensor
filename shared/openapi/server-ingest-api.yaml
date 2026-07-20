@@ -1,0 +1,164 @@
+openapi: 3.1.0
+info:
+  title: Power Monitor central server device-ingest API
+  version: 1.0.0
+  description: Contract implemented by the separate fleet server and exercised by this repository's simulator.
+servers:
+  - url: https://power-monitor-server.example
+paths:
+  /api/v1/device-enrollment/claim:
+    post:
+      operationId: claimEnrollment
+      security: []
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/EnrollmentClaim'}}}
+      responses:
+        '200': {description: Unique device credentials and policy, content: {application/json: {schema: {$ref: '#/components/schemas/EnrollmentResponse'}}}}
+        '401': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+  /api/v1/device-heartbeats:
+    post:
+      operationId: postHeartbeat
+      security: [{deviceHmac: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Heartbeat'}}}}
+      responses:
+        '200': {description: Heartbeat acceptance and synchronization policy, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/device-readings/batch:
+    post:
+      operationId: postReadingBatch
+      security: [{deviceHmac: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schema_version, protocol, device_id, records]
+              properties:
+                schema_version: {const: 1}
+                protocol: {const: pm-protocol/1.0.0}
+                device_id: {type: string, format: uuid}
+                records: {type: array, minItems: 1, maxItems: 500, items: {$ref: '#/components/schemas/Reading'}}
+      responses:
+        '200': {description: Idempotent highest contiguous acknowledgement, content: {application/json: {schema: {type: object, required: [ack_sequence], properties: {ack_sequence: {type: integer}}}}}}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+  /api/v1/device-events/batch:
+    post:
+      operationId: postEventBatch
+      security: [{deviceHmac: []}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [device_id, events], properties: {device_id: {type: string, format: uuid}, events: {type: array, maxItems: 500, items: {type: object}}}}}}}
+      responses:
+        '200': {description: Events accepted idempotently}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/device-config/effective:
+    get:
+      operationId: getEffectiveConfig
+      security: [{deviceHmac: []}]
+      responses:
+        '200': {description: Desired versioned configuration, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/device-config/report:
+    post:
+      operationId: reportConfigResult
+      security: [{deviceHmac: []}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [config_version, status], properties: {config_version: {type: integer}, status: {enum: [applied, rejected, rolled_back]}, detail: {type: string}}}}}}
+      responses:
+        '204': {description: Report stored}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/device-firmware/manifest:
+    get:
+      operationId: getFirmwareManifest
+      security: [{deviceHmac: []}]
+      responses:
+        '200': {description: Allowed signed OTA manifest, content: {application/json: {schema: {type: object}}}}
+        '204': {description: No update available}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/time:
+    get:
+      operationId: getServerTime
+      security: []
+      responses:
+        '200': {description: TLS-protected UTC hint, content: {application/json: {schema: {type: object, required: [utc], properties: {utc: {type: string, format: date-time}}}}}}
+components:
+  securitySchemes:
+    deviceHmac:
+      type: apiKey
+      in: header
+      name: X-PM-Signature
+      description: Complete X-PM-* header set using directional HKDF key.
+  responses:
+    Problem:
+      description: RFC 9457 problem details
+      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, detail, instance]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        code: {type: string}
+    EnrollmentClaim:
+      type: object
+      required: [schema_version, protocol, enrollment_token, local_instance_id, hardware_id, capabilities]
+      properties:
+        schema_version: {const: 1}
+        protocol: {const: pm-protocol/1.0.0}
+        enrollment_token: {type: string, maxLength: 256}
+        local_instance_id: {type: string, format: uuid}
+        hardware_id: {type: string, maxLength: 64}
+        capabilities: {type: object}
+    EnrollmentResponse:
+      type: object
+      required: [device_id, enrollment_secret, protocol, config_version, policy, ota_signing_public_key]
+      properties:
+        device_id: {type: string, format: uuid}
+        enrollment_secret: {type: string, description: Base64 high-entropy secret returned exactly once.}
+        friendly_name: {type: string}
+        protocol: {const: pm-protocol/1.0.0}
+        config_version: {type: integer}
+        policy: {type: object}
+        ota_signing_public_key: {type: string}
+    Heartbeat:
+      type: object
+      required: [schema_version, protocol, device_id, boot_id, firmware_version, uptime_seconds, wifi, meter, storage, sync, resources]
+      properties:
+        schema_version: {const: 1}
+        protocol: {const: pm-protocol/1.0.0}
+        device_id: {type: string, format: uuid}
+        boot_id: {type: string, format: uuid}
+        firmware_version: {type: string}
+        uptime_seconds: {type: integer}
+        wifi: {type: object}
+        meter: {type: object}
+        storage: {type: object}
+        sync: {type: object}
+        resources: {type: object}
+    Reading:
+      type: object
+      required: [schema_version, protocol, device_id, sequence, boot_id, start_utc, end_utc, time_trusted, sample_count, valid_sample_count, active_power_w, raw_energy_start_wh, raw_energy_end_wh, interval_energy_wh, energy_method, ct_rating_a, quality_flags, firmware_version]
+      properties:
+        schema_version: {const: 1}
+        protocol: {const: pm-protocol/1.0.0}
+        device_id: {type: string, format: uuid}
+        sequence: {type: integer, minimum: 1}
+        boot_id: {type: string, format: uuid}
+        start_utc: {type: string, format: date-time}
+        end_utc: {type: string, format: date-time}
+        time_trusted: {type: boolean}
+        sample_count: {type: integer}
+        valid_sample_count: {type: integer}
+        active_power_w: {type: object}
+        raw_energy_start_wh: {type: integer}
+        raw_energy_end_wh: {type: integer}
+        interval_energy_wh: {type: number}
+        energy_method: {type: string}
+        ct_rating_a: {type: number}
+        quality_flags: {type: integer}
+        firmware_version: {type: string}

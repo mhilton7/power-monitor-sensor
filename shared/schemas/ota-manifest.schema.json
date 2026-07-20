@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://powermonitor.local/schemas/ota-manifest-v1.schema.json",
+  "title": "Signed OTA manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "firmware_version", "protocol", "hardware_target",
+    "image_url", "image_size", "image_sha256", "minimum_rollback_version",
+    "release_notes", "signature_algorithm", "signature"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "firmware_version": {"type": "string"},
+    "protocol": {"const": "pm-protocol/1.0.0"},
+    "hardware_target": {"const": "esp32-s3-n16r8"},
+    "image_url": {"type": "string", "pattern": "^https://"},
+    "image_size": {"type": "integer", "minimum": 1, "maximum": 6291456},
+    "image_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "minimum_rollback_version": {"type": "string"},
+    "release_notes": {"type": "string", "maxLength": 4096},
+    "signature_algorithm": {"const": "ecdsa-p256-sha256"},
+    "signature": {"type": "string", "minLength": 8}
+  }
+}
+

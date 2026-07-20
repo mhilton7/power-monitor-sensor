@@ -1,0 +1,27 @@
+{
+  "protocol": "pm-protocol/1.0.0",
+  "hkdf": {
+    "enrollment_secret_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "salt_hex": "",
+    "device_to_server_info": "pm-device-to-server-v1",
+    "device_to_server_key_hex": "7e1570e6e2a054f1e0b4345fda93d929a7e191a74e47b278fe72e91bb7db8e5d",
+    "server_to_device_info": "pm-server-to-device-v1",
+    "server_to_device_key_hex": "ffa132a81c27931074609bdd00df2568727f281a0467bb65f52c997722536fec"
+  },
+  "requests": [
+    {
+      "name": "heartbeat-with-duplicate-query-keys",
+      "key_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "method": "POST",
+      "path": "/api/v1/device-heartbeats",
+      "query_pairs": [["tag", "z"], ["tag", "a"]],
+      "canonical_path_query": "/api/v1/device-heartbeats?tag=a&tag=z",
+      "timestamp": "1700000000",
+      "nonce": "0123456789abcdef0123456789abcdef",
+      "body_utf8": "{\"device_id\":\"6db47e3d-b16c-4746-8f21-64310f9e9252\",\"protocol\":\"pm-protocol/1.0.0\",\"schema_version\":1}",
+      "content_sha256": "b966cc3d8825bc708ac912da68c0c3e7a2a519a6c5e15c1bf28cd12a66895416",
+      "canonical": "PM-HMAC-SHA256-V1\nPOST\n/api/v1/device-heartbeats?tag=a&tag=z\n1700000000\n0123456789abcdef0123456789abcdef\nb966cc3d8825bc708ac912da68c0c3e7a2a519a6c5e15c1bf28cd12a66895416",
+      "signature": "e85f96c04fd32864fea9e642cf2e8954f46a744f3a5e011e59afaa352616183f"
+    }
+  ]
+}

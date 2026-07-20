@@ -1,0 +1,8 @@
+{
+  "supported": ["pm-protocol/1.0.0"],
+  "cases": [
+    {"offered": "pm-protocol/1.0.0", "status": 200},
+    {"offered": "pm-protocol/1.1.0", "status": 409, "code": "protocol_mismatch"},
+    {"offered": "", "status": 400, "code": "protocol_required"}
+  ]
+}

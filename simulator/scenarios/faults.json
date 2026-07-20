@@ -1,0 +1,12 @@
+{
+  "name": "meter-and-storage-faults",
+  "duration_seconds": 600,
+  "meter": {"base_voltage_v": 121.0, "base_current_a": 9.0, "power_factor": 0.92, "frequency_hz": 59.98},
+  "faults": [
+    {"at_second": 60, "type": "pzem_timeout", "duration_seconds": 15},
+    {"at_second": 150, "type": "pzem_crc_error", "duration_seconds": 5},
+    {"at_second": 240, "type": "pzem_energy_reset"},
+    {"at_second": 300, "type": "sd_removed", "duration_seconds": 90},
+    {"at_second": 480, "type": "queue_saturation", "duration_seconds": 10}
+  ]
+}

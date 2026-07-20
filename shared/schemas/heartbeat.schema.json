@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://powermonitor.local/schemas/pm-protocol/1.0.0/heartbeat.schema.json",
+  "title": "Power Monitor heartbeat",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "protocol", "device_id", "boot_id",
+    "firmware_version", "build_hash", "uptime_seconds", "wifi", "time",
+    "meter", "storage", "sync", "resources"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "protocol": {"const": "pm-protocol/1.0.0"},
+    "device_id": {"type": "string", "format": "uuid"},
+    "boot_id": {"type": "string", "format": "uuid"},
+    "firmware_version": {"type": "string"},
+    "build_hash": {"type": "string"},
+    "uptime_seconds": {"type": "integer", "minimum": 0},
+    "reboot_reason": {"type": "string"},
+    "wifi": {
+      "type": "object",
+      "required": ["connected", "ip_address", "hostname", "rssi_dbm"],
+      "properties": {
+        "connected": {"type": "boolean"},
+        "ip_address": {"type": "string"},
+        "hostname": {"type": "string"},
+        "rssi_dbm": {"type": "integer"}
+      }
+    },
+    "time": {
+      "type": "object",
+      "required": ["synchronized", "utc"],
+      "properties": {
+        "synchronized": {"type": "boolean"},
+        "utc": {"type": "string", "format": "date-time"}
+      }
+    },
+    "meter": {"type": "object", "required": ["connected", "consecutive_errors"]},
+    "storage": {
+      "type": "object",
+      "required": ["present", "mounted", "writable", "oldest_sequence", "newest_sequence"]
+    },
+    "sync": {
+      "type": "object",
+      "required": ["server_ack_sequence", "backlog_estimate", "mode"]
+    },
+    "resources": {
+      "type": "object",
+      "required": ["free_heap_bytes", "minimum_free_heap_bytes", "queue_depths"]
+    }
+  }
+}
+

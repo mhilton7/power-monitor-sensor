@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "protocol": "pm-protocol/1.0.0",
+  "device_id": "6db47e3d-b16c-4746-8f21-64310f9e9252",
+  "friendly_name": "Garage HVAC",
+  "sequence": 583913,
+  "boot_id": "44f16f01-46c9-4ea4-9bf7-f194269dd048",
+  "start_utc": "2026-07-20T18:42:00Z",
+  "end_utc": "2026-07-20T18:43:00Z",
+  "time_trusted": true,
+  "sample_count": 60,
+  "valid_sample_count": 60,
+  "voltage_v": {"average": 121.3, "minimum": 120.8, "maximum": 121.8},
+  "current_a": {"average": 7.42, "minimum": 7.1, "maximum": 7.8},
+  "active_power_w": {"average": 873.5, "minimum": 840.0, "maximum": 910.2},
+  "average_power_factor": 0.97,
+  "average_frequency_hz": 59.98,
+  "raw_energy_start_wh": 3957113,
+  "raw_energy_end_wh": 3957128,
+  "device_lifetime_energy_wh": 3957128,
+  "interval_energy_wh": 15.0,
+  "energy_method": "pzem_delta",
+  "ct_rating_a": 100,
+  "quality_flags": 0,
+  "firmware_version": "1.0.0"
+}
+

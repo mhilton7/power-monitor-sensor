@@ -1,0 +1,16 @@
+.pio/
+.pio-core/
+.pytest_cache/
+.test-tmp/
+__pycache__/
+*.pyc
+web/node_modules/
+web/coverage/
+web/dist/
+release/*.key
+release/*.pem
+release/*.sig
+release/staging/
+.env
+.DS_Store
+Thumbs.db

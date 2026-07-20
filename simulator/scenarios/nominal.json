@@ -1,0 +1,7 @@
+{
+  "name": "nominal",
+  "duration_seconds": 300,
+  "meter": {"base_voltage_v": 121.0, "base_current_a": 7.0, "power_factor": 0.97, "frequency_hz": 60.0},
+  "faults": []
+}
+

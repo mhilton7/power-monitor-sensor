@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://powermonitor.local/schemas/config-v1.schema.json",
+  "title": "Power Monitor non-secret configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "config_version", "friendly_name", "hostname",
+    "server_url", "connection_mode", "sample_interval_seconds",
+    "durable_log_interval_seconds", "heartbeat_interval_seconds",
+    "ct_rating_a", "timezone", "sd_spi_hz"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "config_version": {"type": "integer", "minimum": 1},
+    "friendly_name": {"type": "string", "minLength": 1, "maxLength": 64},
+    "hostname": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"},
+    "server_url": {"type": "string", "pattern": "^https://", "maxLength": 256},
+    "connection_mode": {"enum": ["pull", "push", "hybrid"]},
+    "sample_interval_seconds": {"type": "integer", "minimum": 1, "maximum": 30},
+    "durable_log_interval_seconds": {"type": "integer", "minimum": 10, "maximum": 3600},
+    "heartbeat_interval_seconds": {"type": "integer", "minimum": 5, "maximum": 3600},
+    "ct_rating_a": {"type": "number", "minimum": 1, "maximum": 1000},
+    "timezone": {"type": "string", "minLength": 1, "maxLength": 64},
+    "sd_spi_hz": {"type": "integer", "minimum": 1000000, "maximum": 20000000},
+    "retention_enabled": {"type": "boolean"},
+    "retention_days": {"type": "integer", "minimum": 1, "maximum": 3650},
+    "ota_channel": {"enum": ["stable", "beta"]}
+  }
+}
+

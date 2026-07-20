@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://powermonitor.local/schemas/pm-protocol/1.0.0/problem.schema.json",
+  "title": "RFC 9457 problem details",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["type", "title", "status", "detail", "instance"],
+  "properties": {
+    "type": {"type": "string", "format": "uri-reference"},
+    "title": {"type": "string", "minLength": 1},
+    "status": {"type": "integer", "minimum": 100, "maximum": 599},
+    "detail": {"type": "string"},
+    "instance": {"type": "string"},
+    "code": {"type": "string"}
+  }
+}
+

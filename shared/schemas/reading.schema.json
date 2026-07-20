@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://powermonitor.local/schemas/pm-protocol/1.0.0/reading.schema.json",
+  "title": "Power Monitor durable interval reading",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version", "protocol", "device_id", "sequence", "boot_id",
+    "start_utc", "end_utc", "time_trusted", "sample_count",
+    "valid_sample_count", "active_power_w", "raw_energy_start_wh",
+    "raw_energy_end_wh", "interval_energy_wh", "energy_method",
+    "ct_rating_a", "quality_flags", "firmware_version"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "protocol": {"const": "pm-protocol/1.0.0"},
+    "device_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f-]{36}$"},
+    "friendly_name": {"type": "string", "minLength": 1, "maxLength": 64},
+    "sequence": {"type": "integer", "minimum": 1},
+    "boot_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f-]{36}$"},
+    "start_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "end_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "time_trusted": {"type": "boolean"},
+    "sample_count": {"type": "integer", "minimum": 0},
+    "valid_sample_count": {"type": "integer", "minimum": 0},
+    "voltage_v": {"$ref": "#/$defs/stat"},
+    "current_a": {"$ref": "#/$defs/stat"},
+    "active_power_w": {"$ref": "#/$defs/stat"},
+    "average_power_factor": {"type": "number", "minimum": 0, "maximum": 1.01},
+    "average_frequency_hz": {"type": "number", "minimum": 0},
+    "raw_energy_start_wh": {"type": "integer", "minimum": 0},
+    "raw_energy_end_wh": {"type": "integer", "minimum": 0},
+    "device_lifetime_energy_wh": {"type": "integer", "minimum": 0},
+    "interval_energy_wh": {"type": "number", "minimum": 0},
+    "energy_method": {"enum": ["pzem_delta", "pzem_reset", "pzem_rollover", "power_integration", "incomplete", "unavailable"]},
+    "ct_rating_a": {"type": "number", "exclusiveMinimum": 0, "maximum": 1000},
+    "quality_flags": {"type": "integer", "minimum": 0},
+    "firmware_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+"}
+  },
+  "$defs": {
+    "stat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["average", "minimum", "maximum"],
+      "properties": {
+        "average": {"type": "number"},
+        "minimum": {"type": "number"},
+        "maximum": {"type": "number"}
+      }
+    }
+  }
+}

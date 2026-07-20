@@ -1,0 +1,10 @@
+{
+  "name": "outage-backfill",
+  "duration_seconds": 900,
+  "meter": {"base_voltage_v": 120.0, "base_current_a": 4.0, "power_factor": 0.95, "frequency_hz": 60.0},
+  "faults": [
+    {"at_second": 120, "type": "server_unavailable", "duration_seconds": 360},
+    {"at_second": 540, "type": "request_push"}
+  ]
+}
+

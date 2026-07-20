@@ -1,0 +1,22 @@
+{
+  "request": {"after_sequence": 583000, "limit": 2},
+  "response": {
+    "schema_version": 1,
+    "first_sequence": 583001,
+    "last_sequence": 583002,
+    "has_more": true,
+    "next_after_sequence": 583002,
+    "records": [{"sequence": 583001}, {"sequence": 583002}]
+  },
+  "gone_problem": {
+    "type": "https://powermonitor.local/problems/history-expired",
+    "title": "Requested history is no longer available",
+    "status": 410,
+    "detail": "The requested sequence predates retained history.",
+    "instance": "/api/v1/readings",
+    "code": "history_expired",
+    "oldest_sequence": 1200,
+    "newest_sequence": 2000
+  }
+}
+

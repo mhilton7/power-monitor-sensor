@@ -1,0 +1,260 @@
+openapi: 3.1.0
+info:
+  title: Power Monitor Sensor Agent device API
+  version: 1.0.0
+  description: Authenticated local API for pm-protocol/1.0.0. Unknown JSON fields are ignored; required omissions return RFC 9457 problem details.
+servers:
+  - url: http://power-monitor-device.local
+paths:
+  /api/v1/health:
+    get:
+      operationId: getHealth
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Subsystem health, content: {application/json: {schema: {$ref: '#/components/schemas/Health'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/info:
+    get:
+      operationId: getInfo
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Identity and capabilities, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/live:
+    get:
+      operationId: getLive
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Latest immutable meter snapshot, content: {application/json: {schema: {$ref: '#/components/schemas/Live'}}}}
+        '503': {$ref: '#/components/responses/Problem'}
+  /api/v1/readings:
+    get:
+      operationId: getReadings
+      security: [{deviceHmac: []}, {localSession: []}]
+      parameters:
+        - {name: after_sequence, in: query, schema: {type: integer, minimum: 0}}
+        - {name: from_utc, in: query, schema: {type: string, format: date-time}}
+        - {name: to_utc, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+      responses:
+        '200':
+          description: Bounded sequence-ordered page
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ReadingPage'}}
+            application/x-ndjson: {schema: {type: string}}
+        '410': {$ref: '#/components/responses/Problem'}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/events:
+    get:
+      operationId: getEvents
+      security: [{deviceHmac: []}, {localSession: []}]
+      parameters:
+        - {name: after_sequence, in: query, schema: {type: integer, minimum: 0}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+      responses:
+        '200': {description: Event page, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/storage:
+    get:
+      operationId: getStorage
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Authoritative microSD health and range, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/sync-status:
+    get:
+      operationId: getSyncStatus
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Cursor and backlog state, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/config:
+    get:
+      operationId: getConfig
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Effective redacted configuration, content: {application/json: {schema: {$ref: '#/components/schemas/Config'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    put:
+      operationId: updateConfig
+      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      parameters:
+        - {name: dry_run, in: query, schema: {type: boolean, default: false}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Config'}}}
+      responses:
+        '200': {description: Validated or committed configuration, content: {application/json: {schema: {type: object}}}}
+        '422': {$ref: '#/components/responses/Problem'}
+  /api/v1/metrics:
+    get:
+      operationId: getMetrics
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200':
+          description: Structured counters
+          content:
+            application/json: {schema: {type: object}}
+            text/plain: {schema: {type: string}}
+  /api/v1/sync/ack:
+    post:
+      operationId: acknowledgeSequence
+      security: [{deviceHmac: []}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [ack_sequence], properties: {ack_sequence: {type: integer, minimum: 0}}}}}}
+      responses:
+        '200': {description: Monotonic cursor stored}
+        '409': {$ref: '#/components/responses/Problem'}
+  /api/v1/actions/test-pzem:
+    $ref: '#/components/pathItems/QueuedAction'
+  /api/v1/actions/test-sd:
+    $ref: '#/components/pathItems/QueuedAction'
+  /api/v1/actions/remount-sd:
+    $ref: '#/components/pathItems/QueuedAction'
+  /api/v1/actions/rebuild-index:
+    $ref: '#/components/pathItems/QueuedAction'
+  /api/v1/actions/prepare-card-removal:
+    $ref: '#/components/pathItems/QueuedAction'
+  /api/v1/actions/reboot:
+    $ref: '#/components/pathItems/DestructiveAction'
+  /api/v1/actions/network-reset:
+    $ref: '#/components/pathItems/DestructiveAction'
+  /api/v1/actions/factory-reset:
+    $ref: '#/components/pathItems/DestructiveAction'
+  /api/v1/ota/apply:
+    post:
+      operationId: applySignedOta
+      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [manifest_url], properties: {manifest_url: {type: string, pattern: '^https://'}}}}}}
+      responses:
+        '202': {description: Verified OTA job queued}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/login:
+    post:
+      operationId: login
+      security: []
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [password], properties: {password: {type: string, maxLength: 128}}}}}}
+      responses:
+        '200': {description: Short-lived session and CSRF token}
+        '401': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/logout:
+    post:
+      operationId: logout
+      security: [{localSessionCsrf: []}]
+      responses:
+        '204': {description: Session invalidated}
+components:
+  securitySchemes:
+    deviceHmac:
+      type: apiKey
+      in: header
+      name: X-PM-Signature
+      description: Requires all X-PM-* headers and the pm-protocol/1.0.0 canonical HMAC string.
+    localSession:
+      type: apiKey
+      in: cookie
+      name: pm_session
+    localSessionCsrf:
+      type: apiKey
+      in: header
+      name: X-PM-CSRF
+  pathItems:
+    QueuedAction:
+      post:
+        operationId: queueMaintenanceAction
+        security: [{deviceHmac: []}, {localSessionCsrf: []}]
+        responses:
+          '202': {description: Bounded maintenance action queued}
+          '429': {$ref: '#/components/responses/Problem'}
+    DestructiveAction:
+      post:
+        operationId: queueDestructiveAction
+        security: [{deviceHmac: []}, {localSessionCsrf: []}]
+        parameters:
+          - {name: X-PM-Action-Token, in: header, required: true, schema: {type: string}}
+        responses:
+          '202': {description: Confirmed destructive action queued}
+          '403': {$ref: '#/components/responses/Problem'}
+  responses:
+    Problem:
+      description: RFC 9457 problem details
+      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, detail, instance]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        code: {type: string}
+    Config:
+      type: object
+      description: Secret fields are never returned.
+      required: [schema_version, config_version, friendly_name, hostname, server_url, connection_mode, sample_interval_seconds, durable_log_interval_seconds, heartbeat_interval_seconds, ct_rating_a, timezone, sd_spi_hz]
+      properties:
+        schema_version: {const: 1}
+        config_version: {type: integer, minimum: 1}
+        friendly_name: {type: string, maxLength: 64}
+        hostname: {type: string, maxLength: 63}
+        server_url: {type: string, pattern: '^https://'}
+        connection_mode: {enum: [pull, push, hybrid]}
+        sample_interval_seconds: {type: integer, minimum: 1, maximum: 30}
+        durable_log_interval_seconds: {type: integer, minimum: 10, maximum: 3600}
+        heartbeat_interval_seconds: {type: integer, minimum: 5, maximum: 3600}
+        ct_rating_a: {type: number, minimum: 1, maximum: 1000}
+        timezone: {type: string, maxLength: 64}
+        sd_spi_hz: {type: integer, minimum: 1000000, maximum: 20000000}
+    Health:
+      type: object
+      required: [schema_version, protocol, device_id, friendly_name, status, uptime_seconds, boot_id, firmware_version, api_version, wifi, time, meter, storage, server]
+      properties:
+        schema_version: {const: 1}
+        protocol: {const: pm-protocol/1.0.0}
+        device_id: {type: string, format: uuid}
+        friendly_name: {type: string}
+        status: {enum: [healthy, degraded, safe_mode]}
+        uptime_seconds: {type: integer}
+        boot_id: {type: string, format: uuid}
+        firmware_version: {type: string}
+        api_version: {const: '1.0'}
+        wifi: {type: object}
+        time: {type: object}
+        meter: {type: object}
+        storage: {type: object}
+        server: {type: object}
+    Live:
+      type: object
+      required: [schema_version, device_id, friendly_name, sequence, boot_id, timestamp_utc, timestamp_trusted, voltage_v, current_a, active_power_w, meter_energy_total_wh, device_lifetime_energy_wh, frequency_hz, power_factor, ct_rating_a, quality]
+      properties:
+        schema_version: {const: 1}
+        device_id: {type: string, format: uuid}
+        friendly_name: {type: string}
+        sequence: {type: integer, minimum: 0}
+        boot_id: {type: string, format: uuid}
+        timestamp_utc: {type: string, format: date-time}
+        timestamp_trusted: {type: boolean}
+        voltage_v: {type: number}
+        current_a: {type: number}
+        active_power_w: {type: number}
+        meter_energy_total_wh: {type: integer}
+        device_lifetime_energy_wh: {type: integer}
+        frequency_hz: {type: number}
+        power_factor: {type: number}
+        ct_rating_a: {type: number}
+        quality: {type: object}
+    Page:
+      type: object
+      required: [first_sequence, last_sequence, has_more, next_after_sequence, records]
+      properties:
+        first_sequence: {type: integer}
+        last_sequence: {type: integer}
+        has_more: {type: boolean}
+        next_after_sequence: {type: integer}
+        records: {type: array, maxItems: 500, items: {type: object}}
+    ReadingPage:
+      allOf:
+        - {$ref: '#/components/schemas/Page'}
