@@ -7,7 +7,6 @@ Use --cert/--key to exercise firmware TLS validation with a locally trusted CA.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import secrets
 import ssl
@@ -71,30 +70,57 @@ class ServerState:
     token_used: bool = False
     devices: dict[str, DeviceState] = field(default_factory=dict)
     desired_config: dict[str, Any] = field(
-        default_factory=lambda: {"schema_version": 1, "config_version": 1}
+        default_factory=lambda: {
+            "version": 1,
+            "settings": {
+                "heartbeat_interval_seconds": 15,
+                "durable_log_interval_seconds": 60,
+                "live_update_interval_seconds": 5,
+                "ct_rating_amps": "100",
+            },
+            "sha256": "0" * 64,
+        }
     )
 
     def enroll(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        if payload.get("protocol") != PROTOCOL:
+        if payload.get("protocol_version") != PROTOCOL:
             return 409, problem(409, "protocol_mismatch", "Only pm-protocol/1.0.0 is supported.", "/api/v1/device-enrollment/claim")
         if self.token_used or not secrets.compare_digest(
-            str(payload.get("enrollment_token", "")), self.enrollment_token
+            str(payload.get("token", "")), self.enrollment_token
         ):
             return 401, problem(401, "enrollment_rejected", "The enrollment token is invalid, expired, or already used.", "/api/v1/device-enrollment/claim")
-        if not payload.get("hardware_id") or not payload.get("local_instance_id"):
-            return 422, problem(422, "claim_invalid", "hardware_id and local_instance_id are required.", "/api/v1/device-enrollment/claim")
+        capabilities = payload.get("capabilities")
+        if (
+            not payload.get("hardware_id")
+            or not isinstance(capabilities, dict)
+            or not str(capabilities.get("pzem_model", "")).startswith("PZEM-004T V4")
+            or capabilities.get("sd_present") is not True
+        ):
+            return 422, problem(422, "claim_invalid", "Hardware identity, PZEM model, and microSD capability are required.", "/api/v1/device-enrollment/claim")
         device_id = str(uuid.uuid4())
-        secret = secrets.token_bytes(32)
+        secret_text = secrets.token_urlsafe(48)
+        secret = secret_text.encode("ascii")
         self.devices[device_id] = DeviceState(secret=secret)
         self.token_used = True
-        return 200, {
+        return 201, {
+            "protocol_version": PROTOCOL,
             "device_id": device_id,
-            "friendly_name": payload.get("friendly_name", "Unassigned Power Monitor"),
-            "enrollment_secret": base64.b64encode(secret).decode("ascii"),
-            "protocol": PROTOCOL,
-            "config_version": 1,
-            "policy": {"heartbeat_interval_seconds": 15, "connection_mode": "hybrid", "batch_maximum": 500},
-            "ota_signing_public_key": "not-configured-in-simulator",
+            "enrollment_secret": secret_text,
+            "credential_fingerprint": "simulator-only",
+            "effective_metadata": {
+                "name": payload.get("requested_name") or "Unassigned Power Monitor",
+                "site_id": "simulator-site",
+                "circuit_id": None,
+                "measurement_role": "submeter",
+                "cost_scope": "energy_only",
+                "ct_rating_amps": "100",
+            },
+            "server_ota_signing_public_key": None,
+            "heartbeat_policy": {"expected_seconds": 15},
+            "sync_policy": {
+                "maximum_batch_records": MAX_BATCH_RECORDS,
+                "durable_interval_seconds": 60,
+            },
         }
 
 
@@ -157,11 +183,18 @@ class SimulatorHandler(BaseHTTPRequestHandler):
         authenticated = self._authenticate(b"")
         if authenticated is None:
             return
-        _, _device = authenticated
+        device_id, _device = authenticated
         if self.path.startswith("/api/v1/device-config/effective"):
-            self._send(200, self.state.desired_config)
+            self._send(
+                200,
+                {
+                    "protocol_version": PROTOCOL,
+                    "device_id": device_id,
+                    **self.state.desired_config,
+                },
+            )
         elif self.path.startswith("/api/v1/device-firmware/manifest"):
-            self._send(204)
+            self._send(200, {"available": False, "protocol_version": PROTOCOL})
         else:
             self._send(404, problem(404, "not_found", "Simulator endpoint not found.", self.path), "application/problem+json")
 
@@ -176,27 +209,48 @@ class SimulatorHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/v1/device-enrollment/claim":
             status, response = self.state.enroll(payload)
-            self._send(status, response, "application/json" if status == 200 else "application/problem+json")
+            self._send(status, response, "application/json" if status == 201 else "application/problem+json")
             return
         authenticated = self._authenticate(body)
         if authenticated is None:
             return
         device_id, device = authenticated
         if self.path == "/api/v1/device-heartbeats":
-            if payload.get("protocol") != PROTOCOL or payload.get("device_id") != device_id:
+            if (
+                payload.get("protocol_version") != PROTOCOL
+                or payload.get("schema_version") != "heartbeat/1.0.0"
+                or payload.get("device_id") != device_id
+                or not isinstance(payload.get("pzem"), dict)
+                or not isinstance(payload.get("sd"), dict)
+                or not isinstance(payload.get("time"), dict)
+            ):
                 self._send(422, problem(422, "heartbeat_invalid", "Protocol or device identity does not match.", self.path), "application/problem+json")
                 return
             device.last_heartbeat = payload
-            self._send(200, {"accepted_utc": utc_now(), "ack_sequence": device.acknowledged_sequence, "recommended_heartbeat_interval_seconds": 15, "synchronize_now": False, "desired_config_version": self.state.desired_config["config_version"], "server_time": utc_now()})
+            self._send(200, {
+                "server_receive_time": utc_now(),
+                "highest_contiguous_accepted_sequence": device.acknowledged_sequence,
+                "gap_ranges": [],
+                "desired_configuration_version": self.state.desired_config["version"],
+                "firmware_release_available": False,
+                "recommended_heartbeat_interval_seconds": 15,
+                "immediate_sync_requested": False,
+            })
         elif self.path == "/api/v1/device-readings/batch":
-            records = payload.get("records")
+            records = payload.get("readings")
             if not isinstance(records, list) or not 1 <= len(records) <= MAX_BATCH_RECORDS:
-                self._send(422, problem(422, "batch_invalid", "records must contain 1 through 500 readings.", self.path), "application/problem+json")
+                self._send(422, problem(422, "batch_invalid", "readings must contain 1 through 500 readings.", self.path), "application/problem+json")
                 return
+            if (
+                payload.get("protocol_version") != PROTOCOL
+                or payload.get("schema_version") != "reading-batch/1.0.0"
+                or payload.get("device_id") != device_id
+            ):
+                self._send(422, problem(422, "reading_invalid", "Batch identity or protocol does not match.", self.path), "application/problem+json")
+                return
+            accepted: list[int] = []
+            duplicates: list[int] = []
             for record in records:
-                if record.get("device_id") != device_id or record.get("protocol") != PROTOCOL:
-                    self._send(422, problem(422, "reading_invalid", "Reading identity or protocol does not match.", self.path), "application/problem+json")
-                    return
                 sequence = int(record.get("sequence", 0))
                 if sequence <= 0:
                     self._send(422, problem(422, "sequence_invalid", "Reading sequence must be positive.", self.path), "application/problem+json")
@@ -205,19 +259,44 @@ class SimulatorHandler(BaseHTTPRequestHandler):
                 if existing is not None and existing != record:
                     self._send(409, problem(409, "idempotency_conflict", "Sequence was previously stored with different content.", self.path), "application/problem+json")
                     return
-                device.records[sequence] = record
+                if existing is not None:
+                    duplicates.append(sequence)
+                else:
+                    device.records[sequence] = record
+                    accepted.append(sequence)
             while device.acknowledged_sequence + 1 in device.records:
                 device.acknowledged_sequence += 1
-            self._send(200, {"ack_sequence": device.acknowledged_sequence, "accepted_count": len(records)})
+            self._send(200, {
+                "accepted": accepted,
+                "duplicates": duplicates,
+                "rejected": [],
+                "highest_contiguous_accepted_sequence": device.acknowledged_sequence,
+                "missing_ranges": [],
+            })
         elif self.path == "/api/v1/device-events/batch":
             events = payload.get("events", [])
-            if not isinstance(events, list) or len(events) > MAX_BATCH_RECORDS:
+            if (
+                payload.get("protocol_version") != PROTOCOL
+                or payload.get("device_id") != device_id
+                or not isinstance(events, list)
+                or not 1 <= len(events) <= MAX_BATCH_RECORDS
+            ):
                 self._send(422, problem(422, "events_invalid", "events must be a bounded array.", self.path), "application/problem+json")
                 return
             device.events.extend(events)
-            self._send(200, {"accepted_count": len(events)})
+            self._send(200, {
+                "accepted": [event.get("event_id") for event in events],
+                "duplicates": [],
+            })
         elif self.path == "/api/v1/device-config/report":
-            self._send(204)
+            if (
+                payload.get("protocol_version") != PROTOCOL
+                or payload.get("device_id") != device_id
+                or int(payload.get("version", 0)) <= 0
+            ):
+                self._send(422, problem(422, "config_report_invalid", "Configuration report identity or version is invalid.", self.path), "application/problem+json")
+                return
+            self._send(200, {"recorded": True})
         else:
             self._send(404, problem(404, "not_found", "Simulator endpoint not found.", self.path), "application/problem+json")
 

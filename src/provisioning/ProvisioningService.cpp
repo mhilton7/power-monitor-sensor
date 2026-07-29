@@ -33,8 +33,10 @@ ProvisioningResult ProvisioningService::apply(const std::string& json) {
   const std::string server_fingerprint = document["server_fingerprint"] | "";
   const std::string friendly_name = document["friendly_name"] | "Unassigned Power Monitor";
   const float ct_rating_a = document["ct_rating_a"] | 0.0F;
-  if (ssid.empty() || ssid.size() > 32 || wifi_password.size() > 63) {
-    return {false, "wifi_credentials_invalid", "Wi-Fi SSID is required and credential lengths are invalid."};
+  if (ssid.empty() || ssid.size() > 32 || wifi_password.size() < 8 ||
+      wifi_password.size() > 63) {
+    return {false, "wifi_credentials_invalid",
+            "Wi-Fi SSID is required and the WPA/WPA2 password must contain 8 through 63 characters."};
   }
   if (enrollment_token.empty() || enrollment_token.size() > 256) {
     return {false, "enrollment_token_invalid", "A bounded one-time enrollment token is required."};
@@ -45,8 +47,9 @@ ProvisioningResult ProvisioningService::apply(const std::string& json) {
   if (server_url.rfind("https://", 0) != 0 || server_url.size() > 256) {
     return {false, "server_url_invalid", "Central server URL must be bounded HTTPS."};
   }
-  if (server_ca_pem.empty() && server_fingerprint.empty()) {
-    return {false, "tls_trust_required", "A private CA PEM or certificate fingerprint is required."};
+  if (server_ca_pem.empty()) {
+    return {false, "server_ca_required",
+            "A public server CA PEM is required; fingerprint-only TLS is not supported safely."};
   }
   if (server_ca_pem.size() > 8192 || server_fingerprint.size() > 128) {
     return {false, "tls_trust_too_large", "TLS trust material exceeds device limits."};

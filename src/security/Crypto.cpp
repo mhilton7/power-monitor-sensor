@@ -17,6 +17,22 @@ const mbedtls_md_info_t* sha256Info() {
   return mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
 }
 
+bool derivePasswordHash(const std::string& password,
+                        const std::array<std::uint8_t, 16>& salt,
+                        const std::uint32_t iterations, Key32& output) {
+  mbedtls_md_context_t context;
+  mbedtls_md_init(&context);
+  const bool ready = mbedtls_md_setup(&context, sha256Info(), 1) == 0;
+  const bool derived =
+      ready &&
+      mbedtls_pkcs5_pbkdf2_hmac(
+          &context, reinterpret_cast<const std::uint8_t*>(password.data()),
+          password.size(), salt.data(), salt.size(), iterations, output.size(),
+          output.data()) == 0;
+  mbedtls_md_free(&context);
+  return derived;
+}
+
 std::uint8_t hexNibble(const char character) {
   if (character >= '0' && character <= '9') {
     return static_cast<std::uint8_t>(character - '0');
@@ -193,15 +209,9 @@ Key32 passwordHash(const std::string& password,
                    const std::array<std::uint8_t, 16>& salt,
                    const std::uint32_t iterations) {
   Key32 output{};
-  mbedtls_md_context_t context;
-  mbedtls_md_init(&context);
-  if (mbedtls_md_setup(&context, sha256Info(), 1) == 0) {
-    mbedtls_pkcs5_pbkdf2_hmac(
-        &context, reinterpret_cast<const std::uint8_t*>(password.data()),
-        password.size(), salt.data(), salt.size(), iterations, output.size(),
-        output.data());
+  if (!derivePasswordHash(password, salt, iterations, output)) {
+    output.fill(0);
   }
-  mbedtls_md_free(&context);
   return output;
 }
 

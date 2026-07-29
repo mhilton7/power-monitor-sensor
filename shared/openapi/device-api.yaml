@@ -86,6 +86,34 @@ paths:
       responses:
         '200': {description: Validated or committed configuration, content: {application/json: {schema: {type: object}}}}
         '422': {$ref: '#/components/responses/Problem'}
+  /api/v1/network-settings:
+    put:
+      operationId: updateNetworkSettings
+      description: Atomically replaces selected Wi-Fi, IPv4, central server, and TLS trust settings, then requests a live network reconfiguration without a reboot. Omitted Wi-Fi passwords and a keep trust action preserve existing write-only secrets.
+      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NetworkSettingsUpdate'}
+      responses:
+        '200': {description: Settings committed with network-apply status, content: {application/json: {schema: {type: object}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+  /api/v1/setup/apply:
+    post:
+      operationId: applyFirstRunSetup
+      description: Atomically commits first-run Wi-Fi, server trust, enrollment, administrator, and meter settings, then applies the network configuration without a reboot.
+      security: [{localSessionCsrf: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FirstRunSetup'}
+      responses:
+        '202': {description: Bounded password/setup job queued, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
   /api/v1/metrics:
     get:
       operationId: getMetrics
@@ -96,6 +124,15 @@ paths:
           content:
             application/json: {schema: {type: object}}
             text/plain: {schema: {type: string}}
+  /api/v1/diagnostics/recent-errors:
+    get:
+      operationId: getRecentDiagnosticErrors
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200':
+          description: Bounded redacted in-memory warning/error ring
+          content: {application/json: {schema: {type: array, maxItems: 32, items: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/ota/status:
     get:
       operationId: getOtaStatus
@@ -161,9 +198,28 @@ paths:
       security: []
       requestBody: {required: true, content: {application/json: {schema: {type: object, required: [password], properties: {password: {type: string, maxLength: 128}}}}}}
       responses:
-        '200': {description: Short-lived session and CSRF token}
+        '202': {description: Bounded password-verification job queued, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
         '401': {$ref: '#/components/responses/Problem'}
         '429': {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/password-jobs:
+    get:
+      operationId: getPasswordJobResult
+      description: Polls an opaque short-lived job. A completed login creates the session; a completed setup returns its apply status.
+      security: []
+      parameters:
+        - {name: job_id, in: query, required: true, schema: {type: string, pattern: '^[0-9a-f]{32}$'}}
+      responses:
+        '200': {description: Completed password operation}
+        '202': {description: Operation remains pending}
+        '404': {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/session:
+    post:
+      operationId: createLocalSession
+      description: Creates a short-lived same-origin browser session without displaying a login screen.
+      security: []
+      responses:
+        '200': {description: Short-lived session and CSRF token}
+        '403': {$ref: '#/components/responses/Problem'}
   /api/v1/auth/logout:
     post:
       operationId: logout
@@ -255,6 +311,49 @@ components:
         ota_update_window_enabled: {type: boolean}
         ota_update_window_start_hour: {type: integer, minimum: 0, maximum: 23}
         ota_update_window_end_hour: {type: integer, minimum: 0, maximum: 23}
+        diagnostic_log_level: {type: integer, minimum: 0, maximum: 5}
+    NetworkSettingsUpdate:
+      type: object
+      additionalProperties: false
+      required: [wifi_ssid, static_network_enabled, static_ip, static_gateway, static_subnet, static_dns, server_url, tls_trust_action, connection_mode]
+      properties:
+        wifi_ssid: {type: string, minLength: 1, maxLength: 32}
+        wifi_password: {type: string, minLength: 8, maxLength: 63, writeOnly: true, description: Omit to retain the existing password; required when changing SSID.}
+        static_network_enabled: {type: boolean}
+        static_ip: {type: string, maxLength: 15}
+        static_gateway: {type: string, maxLength: 15}
+        static_subnet: {type: string, maxLength: 15}
+        static_dns: {type: string, maxLength: 15}
+        server_url: {type: string, maxLength: 256, pattern: '^https://'}
+        tls_trust_action: {enum: [keep, replace_ca, replace_fingerprint], description: replace_fingerprint is retained for v1 compatibility but rejected because the platform cannot perform fingerprint-only TLS without an insecure handshake.}
+        server_ca_pem: {type: string, minLength: 1, maxLength: 8192, writeOnly: true}
+        server_fingerprint: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
+        connection_mode: {enum: [pull, push, hybrid]}
+    FirstRunSetup:
+      type: object
+      required: [friendly_name, wifi_ssid, wifi_password, static_network_enabled, static_ip, static_gateway, static_subnet, static_dns, server_url, server_ca_pem, server_fingerprint, enrollment_token, admin_password, connection_mode, ct_rating_a]
+      properties:
+        friendly_name: {type: string, minLength: 1, maxLength: 64}
+        wifi_ssid: {type: string, minLength: 1, maxLength: 32}
+        wifi_password: {type: string, minLength: 8, maxLength: 63, writeOnly: true}
+        static_network_enabled: {type: boolean}
+        static_ip: {type: string, maxLength: 15}
+        static_gateway: {type: string, maxLength: 15}
+        static_subnet: {type: string, maxLength: 15}
+        static_dns: {type: string, maxLength: 15}
+        server_url: {type: string, maxLength: 256, pattern: '^https://'}
+        server_ca_pem: {type: string, maxLength: 8192, writeOnly: true}
+        server_fingerprint: {type: string, maxLength: 128, writeOnly: true}
+        enrollment_token: {type: string, minLength: 1, maxLength: 256, writeOnly: true}
+        admin_password: {type: string, minLength: 12, maxLength: 128, writeOnly: true}
+        connection_mode: {enum: [pull, push, hybrid]}
+        ct_rating_a: {type: number, minimum: 1, maximum: 1000}
+    PasswordJob:
+      type: object
+      required: [status, job_id]
+      properties:
+        status: {const: queued}
+        job_id: {type: string, pattern: '^[0-9a-f]{32}$'}
     Health:
       type: object
       required: [schema_version, protocol, device_id, friendly_name, status, uptime_seconds, boot_id, firmware_version, api_version, wifi, time, meter, storage, server]

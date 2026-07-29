@@ -5,6 +5,7 @@
 #include <ESP.h>
 
 #include "build_config.h"
+#include "diagnostics/SerialLogger.h"
 #include "version.h"
 
 namespace pm {
@@ -274,12 +275,20 @@ std::string Diagnostics::redactedBundle(const ConfigService& config,
   JsonDocument health;
   JsonDocument metrics;
   JsonDocument redacted_config;
+  JsonDocument recent_errors;
   deserializeJson(health, healthJson(config, network, clock, storage, meter));
   deserializeJson(metrics, metricsJson(storage, meter));
   deserializeJson(redacted_config, config.redactedJson());
+  deserializeJson(recent_errors,
+                  diag::SerialLogger::instance().recentErrorsJson());
   document["health"] = health.as<JsonVariantConst>();
   document["metrics"] = metrics.as<JsonVariantConst>();
   document["config"] = redacted_config.as<JsonVariantConst>();
+  document["recent_errors"] = recent_errors.as<JsonVariantConst>();
+  document["serial_log_level"] =
+      diag::levelName(diag::SerialLogger::instance().level());
+  document["serial_log_dropped"] =
+      diag::SerialLogger::instance().dropped();
   document["redaction"] = "Wi-Fi passwords, enrollment material, HMAC keys, session tokens, setup credentials, and signatures are excluded.";
   std::string output;
   serializeJson(document, output);

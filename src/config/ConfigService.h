@@ -6,6 +6,7 @@
 
 #include <Preferences.h>
 
+#include "build_config.h"
 #include "security/Crypto.h"
 
 namespace pm {
@@ -58,7 +59,7 @@ struct RuntimeConfig {
   bool ota_update_window_enabled{false};
   std::uint8_t ota_update_window_start_hour{2};
   std::uint8_t ota_update_window_end_hour{5};
-  std::uint8_t diagnostic_log_level{1};
+  std::uint8_t diagnostic_log_level{PM_RELEASE_BUILD ? 2U : 1U};
 };
 
 struct DeviceIdentity {
@@ -93,6 +94,10 @@ class ConfigService {
   bool hasWifiCredentials() const;
   std::string wifiPassword() const;
   bool setWifiCredentials(const std::string& ssid, const std::string& password);
+  bool updateNetworkSettings(const RuntimeConfig& candidate,
+                             const std::string& wifi_password,
+                             bool replace_wifi_password,
+                             ConfigValidation& result);
   std::string enrollmentToken() const;
   bool setEnrollmentToken(const std::string& token);
   void clearEnrollmentToken();
@@ -120,10 +125,13 @@ class ConfigService {
 
   std::uint64_t serverAckSequence() const;
   bool setServerAckSequence(std::uint64_t sequence);
+  std::uint32_t serverConfigVersion() const;
+  bool setServerConfigVersion(std::uint32_t version);
   std::uint64_t energyOffsetWh() const;
   bool setEnergyOffsetWh(std::uint64_t offset);
   bool recordBootStarted();
   bool recordBootHealthy();
+  bool setDiagnosticLogLevel(std::uint8_t level);
   bool safeMode() const;
   std::string safeModeReason() const;
 

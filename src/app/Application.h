@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <string>
 
 #include <HardwareSerial.h>
 
@@ -33,12 +34,18 @@ class Application {
   static void syncTaskEntry(void* context);
   static void healthTaskEntry(void* context);
   static void maintenanceTaskEntry(void* context);
+  static void serialCommandTaskEntry(void* context);
   void meterTask();
   void aggregationTask();
   void networkTask();
   void syncTask();
   void healthTask();
   void maintenanceTask();
+  void serialCommandTask();
+  void handleSerialCommand(const std::string& command);
+  void reportStatus() const;
+  void reportTasks() const;
+  void reportMemory() const;
   void executeMaintenance(const MaintenanceMessage& message);
   bool createTasks();
 
@@ -56,6 +63,14 @@ class Application {
   QueueHandle_t sample_queue_{nullptr};
   QueueHandle_t maintenance_queue_{nullptr};
   SemaphoreHandle_t meter_mutex_{nullptr};
+  TaskHandle_t meter_task_{nullptr};
+  TaskHandle_t aggregation_task_{nullptr};
+  TaskHandle_t storage_task_{nullptr};
+  TaskHandle_t network_task_{nullptr};
+  TaskHandle_t sync_task_{nullptr};
+  TaskHandle_t health_task_{nullptr};
+  TaskHandle_t maintenance_task_{nullptr};
+  TaskHandle_t serial_command_task_{nullptr};
   std::atomic<std::uint64_t> meter_progress_{0};
   std::atomic<std::uint64_t> aggregation_progress_{0};
   std::atomic<std::uint64_t> network_progress_{0};
@@ -65,4 +80,3 @@ class Application {
 };
 
 }  // namespace pm
-

@@ -2,7 +2,7 @@
 
 Assets include Wi-Fi credentials, enrollment secret, directional keys, local password verifier, setup credential, OTA key, history, config, and cursor. Threats include impersonation, replay, CSRF, brute force, malicious OTA, media tampering, leakage, and resource exhaustion.
 
-- Outbound HTTPS requires CA PEM or SHA-256 fingerprint. No production `insecure=true` exists; fingerprint-only mode permits a handshake solely to compare the peer before sending HTTP.
+- Outbound HTTPS requires a CA PEM with certificate-chain and hostname validation. The legacy fingerprint field is retained for protocol/configuration compatibility but fingerprint-only operation fails closed; no production path calls `setInsecure()`.
 - Single-use enrollment and at least 256 random secret bits feed separate RFC 5869 directional keys.
 - HMAC binds protocol, method, canonical target, timestamp, nonce, and body hash; comparisons, time window, and replay cache are hardened.
 - Passwords use PBKDF2-HMAC-SHA256, random 128-bit salts, and 120,000 iterations. Sessions/CSRF are random, short, same-origin, and throttled.

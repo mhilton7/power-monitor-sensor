@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import shutil
 import subprocess
 from pathlib import Path
@@ -39,10 +40,19 @@ def main() -> None:
     for _, _, path, _ in paths:
         if not path.is_file():
             raise SystemExit(f"missing built UI asset: {path}")
+    index = paths[0][2].read_text(encoding="utf-8")
+    for uri, _, path, _ in paths[1:]:
+        revision = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        index = index.replace(uri, f"{uri}?v={revision}")
+    payloads = {
+        "INDEX_HTML": index.encode("utf-8"),
+        "APP_JS": paths[1][2].read_bytes(),
+        "STYLE_CSS": paths[2][2].read_bytes(),
+    }
     sections = []
     assets = []
     for uri, content_type, path, symbol in paths:
-        compressed = gzip.compress(path.read_bytes(), compresslevel=9, mtime=0)
+        compressed = gzip.compress(payloads[symbol], compresslevel=9, mtime=0)
         sections.append(
             f"inline constexpr std::uint8_t {symbol}_GZ[] PROGMEM = {{\n{bytes_literal(compressed)}\n}};"
         )
@@ -66,7 +76,7 @@ struct Asset {
 """ + "\n\n".join(sections) + "\n\ninline constexpr Asset ASSETS[] = {\n" + ",\n".join(assets) + "\n};\n\ninline const Asset* findAsset(const char* path) {\n  for (const auto& asset : ASSETS) {\n    if (std::strcmp(asset.path, path) == 0) return &asset;\n  }\n  return nullptr;\n}\n}  // namespace pm::ui\n"
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(header, encoding="utf-8", newline="\n")
-    total = sum(len(gzip.compress(path.read_bytes(), compresslevel=9, mtime=0)) for _, _, path, _ in paths)
+    total = sum(len(gzip.compress(payloads[symbol], compresslevel=9, mtime=0)) for _, _, _, symbol in paths)
     print(f"embedded 3 gzip assets ({total} bytes) into {OUTPUT.relative_to(ROOT)}")
 
 

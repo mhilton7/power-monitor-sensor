@@ -12,6 +12,7 @@
 #include "board_pins.h"
 #include "build_config.h"
 #include "core/Algorithms.h"
+#include "diagnostics/SerialLogger.h"
 #include "storage/RecordFormat.h"
 #include "version.h"
 
@@ -55,6 +56,21 @@ bool endsWith(const std::string& value, const char* suffix) {
          value.compare(value.size() - suffix_length, suffix_length, suffix) == 0;
 }
 
+const char* cardTypeName(const std::uint8_t type) {
+  switch (type) {
+    case CARD_MMC:
+      return "MMC";
+    case CARD_SD:
+      return "SDSC";
+    case CARD_SDHC:
+      return "SDHC";
+    case CARD_NONE:
+      return "none";
+    default:
+      return "unknown";
+  }
+}
+
 }  // namespace
 
 SdStorage::SdStorage() : spi_(FSPI) {
@@ -64,7 +80,14 @@ SdStorage::SdStorage() : spi_(FSPI) {
 bool SdStorage::begin(const std::uint32_t spi_hz) { return remount(spi_hz); }
 
 bool SdStorage::remount(const std::uint32_t spi_hz) {
+  PM_LOG_INFO(
+      "SD", "MOUNT_BEGIN",
+      "bus=FSPI cs_gpio=%d sck_gpio=%d miso_gpio=%d mosi_gpio=%d requested_hz=%lu",
+      pins::SD_CS, pins::SD_SCK, pins::SD_MISO, pins::SD_MOSI,
+      static_cast<unsigned long>(spi_hz));
   if (!lock()) {
+    PM_LOG_WARN("SD", "MOUNT_LOCK_TIMEOUT",
+                "error=PM-SD-010");
     return false;
   }
   SD.end();
@@ -76,13 +99,31 @@ bool SdStorage::remount(const std::uint32_t spi_hz) {
   ++health_.mount_cycles;
   if (!SD.begin(pins::SD_CS, spi_, health_.spi_hz, "/sd", 8, false)) {
     health_.last_error = "sd_mount_failed";
+    PM_LOG_ERROR(
+        "SD", "MOUNT_FAILED",
+        "error=PM-SD-001 spi_hz=%lu hint=check_card_fat32_wiring_and_power",
+        static_cast<unsigned long>(health_.spi_hz));
     unlock();
     return false;
   }
   health_.present = true;
   health_.mounted = true;
-  health_.writable = initializeLayout() && selfTest() && recover();
+  const bool layout_ok = initializeLayout();
+  const bool self_test_ok = layout_ok && selfTest();
+  const bool recovery_ok = self_test_ok && recover();
+  health_.writable = layout_ok && self_test_ok && recovery_ok;
   updateCapacity();
+  PM_LOG_INFO(
+      "SD", "MOUNT_COMPLETE",
+      "result=%s card_type=%s filesystem=%s spi_hz=%lu capacity=%llu used=%llu free=%llu layout=%s self_test=%s recovery=%s next_sequence=%llu",
+      health_.writable ? "success" : "degraded", cardTypeName(SD.cardType()),
+      health_.filesystem.c_str(), static_cast<unsigned long>(health_.spi_hz),
+      static_cast<unsigned long long>(health_.capacity_bytes),
+      static_cast<unsigned long long>(health_.used_bytes),
+      static_cast<unsigned long long>(health_.free_bytes),
+      layout_ok ? "ok" : "failed", self_test_ok ? "ok" : "failed",
+      recovery_ok ? "ok" : "failed",
+      static_cast<unsigned long long>(next_sequence_));
   unlock();
   return health_.writable;
 }
@@ -94,6 +135,15 @@ bool SdStorage::append(IntervalRecord& record) {
   if (!health_.mounted || !health_.writable || health_.prepared_for_removal) {
     ++health_.write_failures;
     health_.last_error = "sd_not_writable";
+    if (diag::SerialLogger::instance().allow("sd_not_writable", 10'000U)) {
+      PM_LOG_ERROR(
+          "SD", "WRITE_REJECTED",
+          "error=PM-SD-002 mounted=%s writable=%s prepared_for_removal=%s failures=%llu",
+          health_.mounted ? "true" : "false",
+          health_.writable ? "true" : "false",
+          health_.prepared_for_removal ? "true" : "false",
+          static_cast<unsigned long long>(health_.write_failures));
+    }
     unlock();
     return false;
   }
@@ -105,6 +155,9 @@ bool SdStorage::append(IntervalRecord& record) {
   if (slash == std::string::npos || !ensureDirectory(path.substr(0, slash))) {
     ++health_.write_failures;
     health_.last_error = "record_directory_failed";
+    PM_LOG_ERROR("SD", "RECORD_DIRECTORY_FAILED",
+                 "error=PM-SD-003 sequence=%llu",
+                 static_cast<unsigned long long>(record.sequence));
     unlock();
     return false;
   }
@@ -113,6 +166,9 @@ bool SdStorage::append(IntervalRecord& record) {
   if (!file) {
     ++health_.write_failures;
     health_.last_error = "record_open_failed";
+    PM_LOG_ERROR("SD", "RECORD_OPEN_FAILED",
+                 "error=PM-SD-004 sequence=%llu",
+                 static_cast<unsigned long long>(record.sequence));
     unlock();
     return false;
   }
@@ -125,6 +181,12 @@ bool SdStorage::append(IntervalRecord& record) {
     ++health_.write_failures;
     health_.writable = false;
     health_.last_error = "record_write_incomplete";
+    PM_LOG_ERROR(
+        "SD", "RECORD_WRITE_INCOMPLETE",
+        "error=PM-SD-005 sequence=%llu expected_bytes=%u written_bytes=%u",
+        static_cast<unsigned long long>(record.sequence),
+        static_cast<unsigned>(envelope.size()),
+        static_cast<unsigned>(written));
     unlock();
     return false;
   }
@@ -134,10 +196,16 @@ bool SdStorage::append(IntervalRecord& record) {
                    payload_crc)) {
     health_.index_healthy = false;
     health_.last_error = "index_append_failed";
+    PM_LOG_WARN("SD", "INDEX_APPEND_FAILED",
+                "error=PM-SD-006 sequence=%llu recovery=rebuild_indexes",
+                static_cast<unsigned long long>(record.sequence));
   }
   if (!persistSequence(record.sequence)) {
     ++health_.write_failures;
     health_.last_error = "sequence_journal_failed";
+    PM_LOG_ERROR("SD", "SEQUENCE_JOURNAL_FAILED",
+                 "error=PM-SD-007 sequence=%llu",
+                 static_cast<unsigned long long>(record.sequence));
     unlock();
     return false;
   }
@@ -151,6 +219,25 @@ bool SdStorage::append(IntervalRecord& record) {
   health_.last_write_utc_ms = record.end_utc_ms;
   health_.current_file = path;
   updateCapacity();
+  PM_LOG_TRACE(
+      "SD", "RECORD_WRITE_COMPLETE",
+      "sequence=%llu bytes=%u latency_ms=%lu file=%s free=%llu",
+      static_cast<unsigned long long>(record.sequence),
+      static_cast<unsigned>(envelope.size()),
+      static_cast<unsigned long>(health_.last_write_latency_ms),
+      health_.current_file.c_str(),
+      static_cast<unsigned long long>(health_.free_bytes));
+  if (diag::SerialLogger::instance().allow("sd_write_summary", 60'000U)) {
+    PM_LOG_INFO(
+        "SD", "WRITE_SUMMARY",
+        "writes=%llu failures=%llu last_latency_ms=%lu newest_sequence=%llu free=%llu index_healthy=%s",
+        static_cast<unsigned long long>(health_.writes),
+        static_cast<unsigned long long>(health_.write_failures),
+        static_cast<unsigned long>(health_.last_write_latency_ms),
+        static_cast<unsigned long long>(health_.newest_sequence),
+        static_cast<unsigned long long>(health_.free_bytes),
+        health_.index_healthy ? "true" : "false");
+  }
   unlock();
   return true;
 }
@@ -258,6 +345,13 @@ bool SdStorage::selfTest() {
   SD.remove(path.c_str());
   health_.writable = ok;
   health_.last_error = ok ? "" : "sd_self_test_failed";
+  if (ok) {
+    PM_LOG_INFO("SD", "SELF_TEST_COMPLETE",
+                "result=success readback=verified");
+  } else {
+    PM_LOG_ERROR("SD", "SELF_TEST_FAILED",
+                 "error=PM-SD-008 hint=check_card_write_protection_and_fat32");
+  }
   unlock();
   return ok;
 }
@@ -270,6 +364,7 @@ bool SdStorage::rebuildIndexes() {
     unlock();
     return false;
   }
+  PM_LOG_INFO("SD", "INDEX_REBUILD_BEGIN", "reason=authorized_or_recovery");
   std::vector<std::string> files;
   collectFiles("/POWERMON/records", ".pmr", files);
   bool ok = true;
@@ -319,6 +414,10 @@ bool SdStorage::rebuildIndexes() {
   if (ok) {
     ++health_.repair_count;
   }
+  PM_LOG_INFO("SD", "INDEX_REBUILD_COMPLETE",
+              "result=%s files=%u repair_count=%lu",
+              ok ? "success" : "failed", static_cast<unsigned>(files.size()),
+              static_cast<unsigned long>(health_.repair_count));
   unlock();
   return ok;
 }
@@ -327,6 +426,12 @@ bool SdStorage::applyRetention(const std::uint64_t server_ack_sequence,
                                const std::uint64_t now_utc_ms,
                                const std::uint16_t retention_days) {
   if (!lock()) return false;
+  PM_LOG_INFO(
+      "SD", "RETENTION_BEGIN",
+      "server_ack_sequence=%llu now_utc_ms=%llu retention_days=%u",
+      static_cast<unsigned long long>(server_ack_sequence),
+      static_cast<unsigned long long>(now_utc_ms),
+      static_cast<unsigned>(retention_days));
   if (!health_.mounted || retention_days == 0 || now_utc_ms == 0) {
     unlock();
     return false;
@@ -386,6 +491,10 @@ bool SdStorage::applyRetention(const std::uint64_t server_ack_sequence,
     ok = recover() && ok;
     updateCapacity();
   }
+  PM_LOG_INFO("SD", "RETENTION_COMPLETE",
+              "result=%s removed=%s scanned_files=%u",
+              ok ? "success" : "failed", removed ? "true" : "false",
+              static_cast<unsigned>(files.size()));
   unlock();
   return ok;
 }
@@ -399,6 +508,8 @@ bool SdStorage::prepareRemoval() {
   SD.end();
   spi_.end();
   health_.mounted = false;
+  PM_LOG_INFO("SD", "CARD_REMOVAL_READY",
+              "buffers_flushed=true mounted=false");
   unlock();
   return true;
 }
@@ -436,6 +547,8 @@ bool SdStorage::recover() {
   std::vector<std::string> files;
   collectFiles("/POWERMON/records", ".pmr", files);
   std::sort(files.begin(), files.end());
+  PM_LOG_INFO("SD", "RECOVERY_SCAN_BEGIN", "record_files=%u",
+              static_cast<unsigned>(files.size()));
   bool all_valid = true;
   for (const auto& path : files) {
     all_valid = recoverFile(path, maximum_sequence) && all_valid;
@@ -459,6 +572,16 @@ bool SdStorage::recover() {
     health_.oldest_sequence = first.first_sequence;
   }
   health_.index_healthy = all_valid;
+  PM_LOG_INFO(
+      "SD", "RECOVERY_SCAN_COMPLETE",
+      "result=%s files=%u oldest_sequence=%llu newest_sequence=%llu journal_sequence=%llu next_sequence=%llu repairs=%lu",
+      all_valid ? "success" : "corruption_detected",
+      static_cast<unsigned>(files.size()),
+      static_cast<unsigned long long>(health_.oldest_sequence),
+      static_cast<unsigned long long>(health_.newest_sequence),
+      static_cast<unsigned long long>(journal_sequence),
+      static_cast<unsigned long long>(next_sequence_),
+      static_cast<unsigned long>(health_.repair_count));
   return all_valid;
 }
 
@@ -513,6 +636,16 @@ bool SdStorage::recoverFile(const std::string& path,
       }
       if (repaired) {
         ++health_.repair_count;
+        PM_LOG_WARN(
+            "SD", "PARTIAL_RECORD_REPAIRED",
+            "error=PM-SD-009 file=%s valid_bytes=%llu repair_count=%lu",
+            path.c_str(), static_cast<unsigned long long>(valid_end),
+            static_cast<unsigned long>(health_.repair_count));
+      } else {
+        PM_LOG_ERROR(
+            "SD", "PARTIAL_RECORD_REPAIR_FAILED",
+            "error=PM-SD-009 file=%s valid_bytes=%llu",
+            path.c_str(), static_cast<unsigned long long>(valid_end));
       }
       return repaired;
     }
@@ -534,6 +667,8 @@ bool SdStorage::recoverFile(const std::string& path,
   file.close();
   if (complete_corruption) {
     health_.last_error = "complete_record_corruption_detected";
+    PM_LOG_ERROR("SD", "RECORD_CORRUPTION",
+                 "error=PM-SD-009 file=%s", path.c_str());
   }
   return !complete_corruption;
 }

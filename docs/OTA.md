@@ -18,6 +18,6 @@ sha256(release_notes)
 true|false
 ```
 
-Firmware validates policy/public key before download, restricts manifest/image hosts when a server allowlist is configured, enforces the optional UTC update window, uses configured CA/fingerprint, streams to inactive flash with size/time bounds, hashes during write, and finalizes only on exact match. Unsigned, invalid, cross-target/protocol, truncated, oversized, hash-mismatched, out-of-window, and unauthorized downgrade updates fail.
+Firmware validates policy/public key before download, restricts manifest/image hosts when a server allowlist is configured, enforces the optional UTC update window, requires the configured CA with hostname validation, streams to inactive flash with size/time bounds, hashes during write, and finalizes only on exact match. Unsigned, invalid, cross-target/protocol, truncated, oversized, hash-mismatched, out-of-window, fingerprint-only, and unauthorized downgrade updates fail.
 
 Generate/sign per [BUILD_AND_FLASH.md](BUILD_AND_FLASH.md). Protect and back up the external private key; rotate through an independently authenticated process, never an untrusted manifest.

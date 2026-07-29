@@ -7,9 +7,12 @@
 #include <vector>
 
 #include <ArduinoJson.h>
+#include <ESP.h>
 
 #include "board_pins.h"
 #include "build_config.h"
+#include "diagnostics/SerialLogger.h"
+#include "security/Crypto.h"
 #include "ui/embedded_assets.h"
 #include "version.h"
 
@@ -32,6 +35,21 @@ HttpApi::HttpApi(ConfigService& config, NetworkService& network,
       maintenance_queue_(maintenance_queue) {}
 
 void HttpApi::begin() {
+  password_job_queue_ = xQueueCreate(4, sizeof(PasswordJob*));
+  password_result_mutex_ = xSemaphoreCreateMutex();
+  const bool worker_started =
+      password_job_queue_ != nullptr && password_result_mutex_ != nullptr &&
+      xTaskCreatePinnedToCore(passwordJobTaskEntry, "PasswordJobTask", 8192,
+                              this, 1, &password_job_task_, 1) == pdPASS;
+  if (!worker_started) {
+    PM_LOG_ERROR("PASSWORD", "WORKER_INIT_FAILED",
+                 "error=PM-PASSWORD-001 queue=%s mutex=%s",
+                 password_job_queue_ == nullptr ? "failed" : "ready",
+                 password_result_mutex_ == nullptr ? "failed" : "ready");
+  } else {
+    PM_LOG_INFO("PASSWORD", "WORKER_READY",
+                "queue_capacity=4 core=1 priority=1 stack_words=8192 watchdog=false");
+  }
   registerReadRoutes();
   registerMutationRoutes();
   server_.on("/", HTTP_GET, [this](AsyncWebServerRequest* request) {
@@ -81,9 +99,262 @@ void HttpApi::begin() {
     sendProblem(request, 404, "not_found", "The requested local API or UI resource does not exist.");
   });
   server_.begin();
+  PM_LOG_INFO("WEB", "SERVER_STARTED",
+              "port=80 tls=false local_only=true ui=embedded authentication=session_or_hmac");
+}
+
+void HttpApi::passwordJobTaskEntry(void* context) {
+  static_cast<HttpApi*>(context)->passwordJobTask();
+}
+
+void HttpApi::passwordJobTask() {
+  PM_LOG_INFO(
+      "TASK", "TASK_STARTED",
+      "name=PasswordJobTask core=%d priority=%u stack_words=%u watchdog=false",
+      xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
+      8192U);
+  PasswordJob* job = nullptr;
+  for (;;) {
+    if (xQueueReceive(password_job_queue_, &job, pdMS_TO_TICKS(1000)) !=
+            pdTRUE ||
+        job == nullptr) {
+      continue;
+    }
+    const std::uint64_t started = clock_.monotonicMs();
+    PM_LOG_INFO(
+        "PASSWORD", "JOB_STARTED",
+        "kind=%s queue_wait_ms=%llu core=%d priority=%u heap_free=%lu",
+        job->kind == PasswordJobKind::Login ? "login" : "setup",
+        static_cast<unsigned long long>(started - job->queued_ms),
+        xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
+        static_cast<unsigned long>(ESP.getFreeHeap()));
+    bool success = false;
+    std::string code;
+    std::string detail;
+    if (job->kind == PasswordJobKind::Login) {
+      JsonDocument document;
+      if (deserializeJson(document, job->body) ||
+          !document["password"].is<const char*>()) {
+        code = "login_json_invalid";
+        detail = "Login body is invalid.";
+      } else {
+        const std::string password =
+            document["password"].as<const char*>();
+        success = config_.hasAdminPassword()
+                      ? config_.verifyAdminPassword(password)
+                      : config_.verifySetupPassword(password);
+        code = success ? "ok" : "login_rejected";
+        detail = success
+                     ? "Administrator credentials were accepted."
+                     : "Administrator credentials were rejected.";
+      }
+    } else {
+      const ProvisioningResult result = provisioning_.apply(job->body);
+      success = result.ok;
+      code = result.code;
+      detail = result.detail;
+      if (success) {
+        network_.requestConfigurationApply();
+      }
+    }
+    const std::uint64_t duration = clock_.monotonicMs() - started;
+    if (duration > 15'000U) {
+      success = false;
+      code = "password_job_timeout";
+      detail = "The bounded password operation exceeded its time budget.";
+    }
+    std::fill(job->body.begin(), job->body.end(), '\0');
+    job->body.clear();
+    if (password_result_mutex_ != nullptr &&
+        xSemaphoreTake(password_result_mutex_, pdMS_TO_TICKS(100)) ==
+            pdTRUE) {
+      for (auto& result : password_results_) {
+        if (result.used && result.id == job->id) {
+          result.complete = true;
+          result.success = success;
+          result.code = code;
+          result.detail = detail;
+          result.duration_ms = duration;
+          result.expires_ms = clock_.monotonicMs() + 60'000U;
+          break;
+        }
+      }
+      xSemaphoreGive(password_result_mutex_);
+    }
+    PM_LOG_INFO(
+        "PASSWORD", "JOB_COMPLETE",
+        "kind=%s result=%s duration_ms=%llu timeout=%s high_water_words=%u heap_free=%lu",
+        job->kind == PasswordJobKind::Login ? "login" : "setup",
+        success ? "success" : "failed",
+        static_cast<unsigned long long>(duration),
+        duration > 15'000U ? "true" : "false",
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+        static_cast<unsigned long>(ESP.getFreeHeap()));
+    if (duration > 2'000U) {
+      PM_LOG_WARN(
+          "PASSWORD", "JOB_SLOW",
+          "error=PM-PASSWORD-002 kind=%s duration_ms=%llu budget_ms=15000",
+          job->kind == PasswordJobKind::Login ? "login" : "setup",
+          static_cast<unsigned long long>(duration));
+    }
+    delete job;
+    job = nullptr;
+  }
+}
+
+std::string HttpApi::queuePasswordJob(const PasswordJobKind kind,
+                                      const std::string& body) {
+  if (password_job_queue_ == nullptr || password_result_mutex_ == nullptr) {
+    return {};
+  }
+  const std::uint64_t now = clock_.monotonicMs();
+  const std::string id = crypto::randomHex(16);
+  if (xSemaphoreTake(password_result_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
+    return {};
+  }
+  PasswordJobResult* slot = nullptr;
+  for (auto& result : password_results_) {
+    if (!result.used || result.expires_ms <= now) {
+      slot = &result;
+      break;
+    }
+  }
+  if (slot != nullptr) {
+    *slot = {};
+    slot->used = true;
+    slot->kind = kind;
+    slot->id = id;
+    slot->expires_ms = now + 60'000U;
+  }
+  xSemaphoreGive(password_result_mutex_);
+  if (slot == nullptr) {
+    PM_LOG_WARN("PASSWORD", "RESULT_TABLE_FULL",
+                "error=PM-PASSWORD-003 capacity=%u",
+                static_cast<unsigned>(password_results_.size()));
+    return {};
+  }
+  auto* job = new (std::nothrow) PasswordJob{kind, id, body, now};
+  if (job == nullptr ||
+      xQueueSend(password_job_queue_, &job, 0) != pdTRUE) {
+    delete job;
+    if (xSemaphoreTake(password_result_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
+      slot->used = false;
+      slot->id.clear();
+      xSemaphoreGive(password_result_mutex_);
+    }
+    PM_LOG_WARN(
+        "PASSWORD", "JOB_QUEUE_FULL",
+        "error=PM-PASSWORD-004 capacity=4 depth=%lu dropped=true",
+        static_cast<unsigned long>(
+            uxQueueMessagesWaiting(password_job_queue_)));
+    return {};
+  }
+  PM_LOG_INFO(
+      "PASSWORD", "JOB_QUEUED",
+      "kind=%s queue_depth=%lu capacity=4 body=redacted",
+      kind == PasswordJobKind::Login ? "login" : "setup",
+      static_cast<unsigned long>(
+          uxQueueMessagesWaiting(password_job_queue_)));
+  return id;
+}
+
+bool HttpApi::passwordJobResult(const std::string& id,
+                                PasswordJobResult& result,
+                                const bool consume) {
+  if (password_result_mutex_ == nullptr ||
+      xSemaphoreTake(password_result_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
+    return false;
+  }
+  const std::uint64_t now = clock_.monotonicMs();
+  bool found = false;
+  for (auto& candidate : password_results_) {
+    if (candidate.used && candidate.expires_ms <= now) {
+      candidate = {};
+      continue;
+    }
+    if (candidate.used && candidate.id == id) {
+      result = candidate;
+      found = true;
+      if (consume && candidate.complete) candidate = {};
+      break;
+    }
+  }
+  xSemaphoreGive(password_result_mutex_);
+  return found;
 }
 
 void HttpApi::registerReadRoutes() {
+  server_.on("/api/v1/auth/password-jobs", HTTP_GET,
+             [this](AsyncWebServerRequest* request) {
+    network_.touchSetupActivity();
+    if (!sameOrigin(request) || !request->hasParam("job_id")) {
+      sendProblem(request, 400, "password_job_request_invalid",
+                  "A same-origin password job identifier is required.");
+      return;
+    }
+    PasswordJobResult result;
+    const std::string id =
+        request->getParam("job_id")->value().c_str();
+    if (!passwordJobResult(id, result, false)) {
+      sendProblem(request, 404, "password_job_not_found",
+                  "The password job is unknown or expired.");
+      return;
+    }
+    if (result.kind == PasswordJobKind::Setup &&
+        !localSession(request, false)) {
+      sendProblem(request, 403, "setup_not_authorized",
+                  "The setup session is required.");
+      return;
+    }
+    if (!result.complete) {
+      sendJson(request, 202, "{\"status\":\"pending\"}");
+      return;
+    }
+    passwordJobResult(id, result, true);
+    if (result.kind == PasswordJobKind::Login) {
+      if (!result.success) {
+        ++login_failures_;
+        const std::uint32_t exponent =
+            std::min<std::uint32_t>(login_failures_, 8);
+        login_allowed_at_ms_ =
+            clock_.monotonicMs() + (250U << exponent);
+        PM_LOG_WARN(
+            "AUTH", "LOGIN_REJECTED",
+            "error=PM-AUTH-001 failures=%lu next_allowed_in_ms=%lu duration_ms=%llu",
+            static_cast<unsigned long>(login_failures_),
+            static_cast<unsigned long>(250U << exponent),
+            static_cast<unsigned long long>(result.duration_ms));
+        sendProblem(request, 401, "login_rejected",
+                    "Administrator credentials were rejected.");
+        return;
+      }
+      login_failures_ = 0;
+      login_allowed_at_ms_ = 0;
+      PM_LOG_INFO("AUTH", "LOGIN_ACCEPTED",
+                  "duration_ms=%llu session=creating",
+                  static_cast<unsigned long long>(result.duration_ms));
+      createLocalSession(request);
+      return;
+    }
+    if (!result.success) {
+      sendProblem(request, 422, result.code.c_str(),
+                  result.detail.c_str());
+      return;
+    }
+    JsonDocument response_document;
+    response_document["status"] = "setup_applied";
+    response_document["network_apply_queued"] = true;
+    response_document["reboot_queued"] = false;
+    std::string response;
+    serializeJson(response_document, response);
+    sendJson(request, 200, response);
+  });
+  server_.on("/api/v1/diagnostics/recent-errors", HTTP_GET,
+             [this](AsyncWebServerRequest* request) {
+    if (!authorize(request, "", false)) return;
+    sendJson(request, 200,
+             diag::SerialLogger::instance().recentErrorsJson());
+  });
   server_.on("/api/v1/health", HTTP_GET, [this](AsyncWebServerRequest* request) {
     if (!authorize(request, "", false)) return;
     sendJson(request, 200,
@@ -240,6 +511,17 @@ void HttpApi::registerReadRoutes() {
 }
 
 void HttpApi::registerMutationRoutes() {
+  registerBodyRoute("/api/v1/auth/session", HTTP_POST,
+                    [this](AsyncWebServerRequest* request) {
+    network_.touchSetupActivity();
+    takeBody(request);
+    if (!sameOrigin(request)) {
+      sendProblem(request, 403, "origin_rejected",
+                  "Cross-origin session creation is not allowed.");
+      return;
+    }
+    createLocalSession(request);
+  });
   registerBodyRoute("/api/v1/auth/login", HTTP_POST,
                     [this](AsyncWebServerRequest* request) {
     network_.touchSetupActivity();
@@ -253,39 +535,24 @@ void HttpApi::registerMutationRoutes() {
       return;
     }
     JsonDocument document;
-    if (body.size() > 1024 || deserializeJson(document, body)) {
+    if (body.size() > 1024 || deserializeJson(document, body) ||
+        !document["password"].is<const char*>()) {
       sendProblem(request, 400, "login_json_invalid", "Login body is invalid.");
       return;
     }
-    const std::string password = document["password"] | "";
-    const bool accepted = config_.hasAdminPassword()
-                              ? config_.verifyAdminPassword(password)
-                              : config_.verifySetupPassword(password);
-    if (!accepted) {
-      ++login_failures_;
-      const std::uint32_t exponent = std::min<std::uint32_t>(login_failures_, 8);
-      login_allowed_at_ms_ = clock_.monotonicMs() + (250U << exponent);
-      sendProblem(request, 401, "login_rejected", "Administrator credentials were rejected.");
+    const std::string job_id =
+        queuePasswordJob(PasswordJobKind::Login, body);
+    if (job_id.empty()) {
+      sendProblem(request, 503, "password_worker_busy",
+                  "The bounded password worker queue is busy.");
       return;
     }
-    login_failures_ = 0;
-    login_allowed_at_ms_ = 0;
-    const SessionManager::Session session = sessions_.create(
-        clock_.monotonicMs(), config_.config().local_session_timeout_seconds);
     JsonDocument response_document;
-    response_document["csrf"] = session.csrf;
-    response_document["expires_in_seconds"] = config_.config().local_session_timeout_seconds;
-    response_document["setup_required"] = !config_.hasAdminPassword();
-    std::string response_body;
-    serializeJson(response_document, response_body);
-    AsyncWebServerResponse* response = request->beginResponse(200, "application/json", response_body.c_str());
-    const std::string cookie = "pm_session=" + session.token +
-                               "; HttpOnly; SameSite=Strict; Path=/; Max-Age=" +
-                               std::to_string(config_.config().local_session_timeout_seconds);
-    response->addHeader("Set-Cookie", cookie.c_str());
-    response->addHeader("Cache-Control", "no-store");
-    diagnostics_.recordHttpStatus(200);
-    request->send(response);
+    response_document["status"] = "queued";
+    response_document["job_id"] = job_id;
+    std::string response;
+    serializeJson(response_document, response);
+    sendJson(request, 202, response);
   });
   registerBodyRoute("/api/v1/auth/logout", HTTP_POST,
                     [this](AsyncWebServerRequest* request) {
@@ -324,6 +591,115 @@ void HttpApi::registerMutationRoutes() {
     serializeJson(document, response);
     sendJson(request, 200, response);
   });
+  registerBodyRoute("/api/v1/network-settings", HTTP_PUT,
+                    [this](AsyncWebServerRequest* request) {
+    const std::string body = takeBody(request);
+    if (!authorize(request, body, true)) return;
+    JsonDocument document;
+    if (deserializeJson(document, body) ||
+        !document["wifi_ssid"].is<const char*>() ||
+        !document["static_network_enabled"].is<bool>() ||
+        !document["static_ip"].is<const char*>() ||
+        !document["static_gateway"].is<const char*>() ||
+        !document["static_subnet"].is<const char*>() ||
+        !document["static_dns"].is<const char*>() ||
+        !document["server_url"].is<const char*>() ||
+        !document["tls_trust_action"].is<const char*>() ||
+        !document["connection_mode"].is<const char*>()) {
+      sendProblem(request, 400, "network_settings_json_invalid",
+                  "Network settings are missing required fields or use invalid types.");
+      return;
+    }
+
+    const std::string mode = document["connection_mode"].as<const char*>();
+    if (mode != "pull" && mode != "push" && mode != "hybrid") {
+      sendProblem(request, 422, "connection_mode_invalid",
+                  "Connection mode must be pull, push, or hybrid.");
+      return;
+    }
+    const bool replace_wifi_password =
+        !document["wifi_password"].isNull();
+    if (replace_wifi_password &&
+        !document["wifi_password"].is<const char*>()) {
+      sendProblem(request, 400, "wifi_password_invalid",
+                  "The replacement Wi-Fi password must be a string.");
+      return;
+    }
+
+    RuntimeConfig candidate = config_.config();
+    candidate.wifi_ssid = document["wifi_ssid"].as<const char*>();
+    candidate.static_network_enabled =
+        document["static_network_enabled"].as<bool>();
+    candidate.static_ip = document["static_ip"].as<const char*>();
+    candidate.static_gateway = document["static_gateway"].as<const char*>();
+    candidate.static_subnet = document["static_subnet"].as<const char*>();
+    candidate.static_dns = document["static_dns"].as<const char*>();
+    candidate.server_url = document["server_url"].as<const char*>();
+    candidate.connection_mode =
+        mode == "pull" ? ConnectionMode::Pull
+                       : (mode == "push" ? ConnectionMode::Push
+                                         : ConnectionMode::Hybrid);
+
+    const std::string trust_action =
+        document["tls_trust_action"].as<const char*>();
+    if (trust_action == "keep") {
+      if (!document["server_ca_pem"].isNull() ||
+          !document["server_fingerprint"].isNull()) {
+        sendProblem(request, 422, "tls_trust_action_invalid",
+                    "Keep trust must not include replacement trust material.");
+        return;
+      }
+      if (candidate.server_ca_pem.empty()) {
+        sendProblem(
+            request, 422, "server_ca_required",
+            "Fingerprint-only TLS is not supported safely; replace trust with a CA PEM.");
+        return;
+      }
+    } else if (trust_action == "replace_ca") {
+      if (!document["server_ca_pem"].is<const char*>() ||
+          !document["server_fingerprint"].isNull()) {
+        sendProblem(request, 422, "server_ca_required",
+                    "Replacing TLS trust with a CA requires only a PEM certificate.");
+        return;
+      }
+      candidate.server_ca_pem = document["server_ca_pem"].as<const char*>();
+      candidate.server_fingerprint.clear();
+    } else if (trust_action == "replace_fingerprint") {
+      sendProblem(
+          request, 422, "server_ca_required",
+          "Fingerprint-only TLS is rejected because secure CA and hostname validation are mandatory.");
+      return;
+    } else {
+      sendProblem(request, 422, "tls_trust_action_invalid",
+                  "TLS trust action must keep or replace the configured trust.");
+      return;
+    }
+
+    const std::string wifi_password =
+        replace_wifi_password
+            ? document["wifi_password"].as<const char*>()
+            : std::string{};
+    ConfigValidation result;
+    if (!config_.updateNetworkSettings(candidate, wifi_password,
+                                       replace_wifi_password, result)) {
+      sendProblem(request, 422, result.code.c_str(), result.detail.c_str());
+      return;
+    }
+    coordinator_.enqueueEvent(
+        "EVT_NETWORK_SETTINGS_CHANGED", "warning",
+        "Authorized Wi-Fi or central server settings changed; live network "
+        "reconfiguration requested.",
+        clock_.utcMs(), config_.identity().boot_id);
+    network_.requestConfigurationApply();
+    JsonDocument response_document;
+    response_document["status"] = "network_settings_applied";
+    response_document["config_version"] = config_.config().config_version;
+    response_document["network_apply_queued"] = true;
+    response_document["reboot_queued"] = false;
+    std::string response;
+    serializeJson(response_document, response);
+    sendJson(request, 200, response);
+  });
   registerBodyRoute("/api/v1/setup/apply", HTTP_POST,
                     [this](AsyncWebServerRequest* request) {
     network_.touchSetupActivity();
@@ -332,13 +708,19 @@ void HttpApi::registerMutationRoutes() {
       sendProblem(request, 403, "setup_not_authorized", "First-run setup requires the setup session and closes after administrator creation.");
       return;
     }
-    const ProvisioningResult result = provisioning_.apply(body);
-    if (!result.ok) {
-      sendProblem(request, 422, result.code.c_str(), result.detail.c_str());
+    const std::string job_id =
+        queuePasswordJob(PasswordJobKind::Setup, body);
+    if (job_id.empty()) {
+      sendProblem(request, 503, "password_worker_busy",
+                  "The bounded password worker queue is busy.");
       return;
     }
-    sendJson(request, 200, "{\"status\":\"setup_applied\"}");
-    queueMaintenance(MaintenanceAction::Reboot);
+    JsonDocument response_document;
+    response_document["status"] = "queued";
+    response_document["job_id"] = job_id;
+    std::string response;
+    serializeJson(response_document, response);
+    sendJson(request, 202, response);
   });
   registerBodyRoute("/api/v1/sync/ack", HTTP_POST,
                     [this](AsyncWebServerRequest* request) {
@@ -439,6 +821,8 @@ void HttpApi::registerAction(const char* path, const MaintenanceAction action,
 
 void HttpApi::registerBodyRoute(const char* path, const WebRequestMethod method,
                                 ArRequestHandlerFunction handler) {
+  PM_LOG_DEBUG("WEB", "ROUTE_REGISTERED", "path=%s method_mask=%u",
+               path, static_cast<unsigned>(method));
   server_.on(path, method, std::move(handler), nullptr,
              [](AsyncWebServerRequest* request, std::uint8_t* data,
                 const std::size_t length, const std::size_t index,
@@ -454,6 +838,13 @@ void HttpApi::registerBodyRoute(const char* path, const WebRequestMethod method,
     if (buffer == nullptr) return;
     if (total > build::MAX_JSON_BODY || buffer->body.size() + length > build::MAX_JSON_BODY) {
       buffer->overflow = true;
+      if (diag::SerialLogger::instance().allow("http_body_overflow",
+                                                10'000U)) {
+        PM_LOG_WARN(
+            "HTTP", "BODY_REJECTED",
+            "error=PM-HTTP-002 maximum_bytes=%u body=redacted",
+            static_cast<unsigned>(build::MAX_JSON_BODY));
+      }
       return;
     }
     buffer->body.append(reinterpret_cast<const char*>(data), length);
@@ -480,6 +871,9 @@ bool HttpApi::authorize(AsyncWebServerRequest* request, const std::string& body,
     api_requests_in_window_ = 0;
   }
   if (api_requests_in_window_ >= 60U) {
+    PM_LOG_WARN("AUTH", "API_RATE_LIMITED",
+                "error=PM-AUTH-002 window_ms=1000 limit=60 route=%s",
+                request->url().c_str());
     sendProblem(request, 429, "api_rate_limited",
                 "The authenticated API request rate exceeded the bounded limit.",
                 false, true);
@@ -487,13 +881,25 @@ bool HttpApi::authorize(AsyncWebServerRequest* request, const std::string& body,
   }
   ++api_requests_in_window_;
   if (!sameOrigin(request)) {
+    PM_LOG_WARN("AUTH", "ORIGIN_REJECTED",
+                "error=PM-AUTH-003 route=%s method=%s",
+                request->url().c_str(), request->methodToString());
     sendProblem(request, 403, "origin_rejected", "Cross-origin API access is not allowed.");
     return false;
   }
-  if (localSession(request, mutation)) return true;
+  if (localSession(request, mutation)) {
+    PM_LOG_DEBUG("AUTH", "LOCAL_SESSION_ACCEPTED",
+                 "route=%s method=%s mutation=%s",
+                 request->url().c_str(), request->methodToString(),
+                 mutation ? "true" : "false");
+    return true;
+  }
   crypto::Key32 outbound{};
   crypto::Key32 inbound{};
   if (!config_.directionalKeys(outbound, inbound)) {
+    PM_LOG_WARN("AUTH", "AUTHENTICATION_REQUIRED",
+                "error=PM-AUTH-004 route=%s local_session=false enrolled_keys=false",
+                request->url().c_str());
     sendProblem(request, 401, "authentication_required", "A local session or enrolled server signature is required.", true);
     return false;
   }
@@ -520,10 +926,18 @@ bool HttpApi::authorize(AsyncWebServerRequest* request, const std::string& body,
       config_.identity().device_id, inbound, std::time(nullptr),
       clock_.synchronized());
   if (result != AuthResult::Ok) {
+    PM_LOG_WARN(
+        "AUTH", "SERVER_SIGNATURE_REJECTED",
+        "error=PM-AUTH-005 route=%s method=%s reason=%s signature=redacted",
+        request->url().c_str(), request->methodToString(),
+        authResultCode(result));
     sendProblem(request, result == AuthResult::ProtocolMismatch ? 409 : 401,
                 authResultCode(result), "Server-to-device signature verification failed.", true);
     return false;
   }
+  PM_LOG_INFO("AUTH", "SERVER_SIGNATURE_ACCEPTED",
+              "route=%s method=%s nonce=redacted",
+              request->url().c_str(), request->methodToString());
   return true;
 }
 
@@ -543,6 +957,33 @@ bool HttpApi::sameOrigin(AsyncWebServerRequest* request) const {
   const String origin = request->getHeader("Origin")->value();
   const String host = request->host();
   return origin == "http://" + host || origin == "https://" + host;
+}
+
+void HttpApi::createLocalSession(AsyncWebServerRequest* request) {
+  const SessionManager::Session session = sessions_.create(
+      clock_.monotonicMs(), config_.config().local_session_timeout_seconds);
+  JsonDocument document;
+  document["csrf"] = session.csrf;
+  document["expires_in_seconds"] =
+      config_.config().local_session_timeout_seconds;
+  document["setup_required"] = !config_.hasAdminPassword();
+  std::string body;
+  serializeJson(document, body);
+  AsyncWebServerResponse* response =
+      request->beginResponse(200, "application/json", body.c_str());
+  const std::string cookie =
+      "pm_session=" + session.token +
+      "; HttpOnly; SameSite=Strict; Path=/; Max-Age=" +
+      std::to_string(config_.config().local_session_timeout_seconds);
+  response->addHeader("Set-Cookie", cookie.c_str());
+  response->addHeader("Cache-Control", "no-store");
+  diagnostics_.recordHttpStatus(200);
+  request->send(response);
+  PM_LOG_INFO("AUTH", "SESSION_CREATED",
+              "expires_in_seconds=%lu setup_required=%s token=redacted csrf=redacted",
+              static_cast<unsigned long>(
+                  config_.config().local_session_timeout_seconds),
+              config_.hasAdminPassword() ? "false" : "true");
 }
 
 std::string HttpApi::cookieValue(AsyncWebServerRequest* request,
@@ -568,6 +1009,11 @@ void HttpApi::sendJson(AsyncWebServerRequest* request, const int status,
   response->addHeader("X-Content-Type-Options", "nosniff");
   diagnostics_.recordHttpStatus(status);
   request->send(response);
+  PM_LOG_DEBUG(
+      "HTTP", "LOCAL_RESPONSE",
+      "method=%s route=%s status=%d category=%s response_bytes=%u",
+      request->methodToString(), request->url().c_str(), status,
+      diag::httpStatusCategory(status), static_cast<unsigned>(body.size()));
 }
 
 void HttpApi::sendProblem(AsyncWebServerRequest* request, const int status,
@@ -588,6 +1034,13 @@ void HttpApi::sendProblem(AsyncWebServerRequest* request, const int status,
       status, "application/problem+json", body.c_str());
   response->addHeader("Cache-Control", "no-store");
   request->send(response);
+  PM_LOG_WARN(
+      "HTTP", "LOCAL_PROBLEM",
+      "method=%s route=%s status=%d category=%s error=%s signature_rejected=%s rate_limited=%s",
+      request->methodToString(), request->url().c_str(), status,
+      diag::httpStatusCategory(status), code,
+      rejected_signature ? "true" : "false",
+      rate_limited ? "true" : "false");
 }
 
 void HttpApi::sendPage(AsyncWebServerRequest* request, const HistoryPage& page,
@@ -659,11 +1112,25 @@ HistoryQuery HttpApi::parseHistoryQuery(AsyncWebServerRequest* request) const {
 bool HttpApi::queueMaintenance(const MaintenanceAction action,
                                const std::string& argument) {
   MaintenanceMessage message;
-  if (maintenance_queue_ == nullptr || argument.size() >= sizeof(message.argument)) return false;
+  if (maintenance_queue_ == nullptr ||
+      argument.size() >= sizeof(message.argument)) {
+    PM_LOG_WARN("QUEUE", "MAINTENANCE_REJECTED",
+                "error=PM-QUEUE-004 reason=unavailable_or_argument_too_large argument=redacted");
+    return false;
+  }
   message.action = action;
   std::memcpy(message.argument, argument.c_str(), argument.size());
   message.argument[argument.size()] = '\0';
-  return xQueueSend(maintenance_queue_, &message, 0) == pdTRUE;
+  const bool queued =
+      xQueueSend(maintenance_queue_, &message, 0) == pdTRUE;
+  PM_LOG_INFO(
+      "QUEUE", "MAINTENANCE_QUEUED",
+      "action=%u result=%s depth=%lu capacity=%u argument=redacted",
+      static_cast<unsigned>(action), queued ? "success" : "full",
+      static_cast<unsigned long>(
+          uxQueueMessagesWaiting(maintenance_queue_)),
+      static_cast<unsigned>(build::ACTION_QUEUE_DEPTH));
+  return queued;
 }
 
 std::uint64_t HttpApi::parseUtc(const String& value) {

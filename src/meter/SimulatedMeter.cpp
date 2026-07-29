@@ -12,7 +12,11 @@ bool SimulatedMeter::begin() {
 
 MeasurementSnapshot SimulatedMeter::poll(const std::uint64_t utc_ms,
                                          const std::uint64_t monotonic_ms,
-                                         const bool time_trusted) {
+                                         const bool time_trusted,
+                                         const MeterWatchdogCallback watchdog_callback) {
+  if (watchdog_callback != nullptr) {
+    watchdog_callback();
+  }
   ++metrics_.requests;
   ++poll_number_;
   MeasurementSnapshot sample;

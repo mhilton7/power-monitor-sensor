@@ -9,3 +9,8 @@ All automated tests are host/low-voltage only. Never connect live mains for them
 - `tools/check_repo.py`: JSON/OpenAPI, partitions, embedded UI, simulator guard, unfinished markers, and secret patterns.
 
 The simulator is loopback and volatile. `simulator/scenarios/` describes nominal, outage/backfill, and faults. Physical validation remains required for the exact N16R8 board, translator, purchased PZEM, card, enclosure, real CA, and signed OTA/rollback.
+
+The safe target-device serial verification matrix, including the former
+`PasswordHash`/`async_tcp` watchdog reproduction, is in
+[SERIAL_DIAGNOSTICS.md](SERIAL_DIAGNOSTICS.md). Software fault tests must use
+the simulated meter and server; do not connect live mains equipment.

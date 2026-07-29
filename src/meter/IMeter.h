@@ -6,6 +6,8 @@
 
 namespace pm {
 
+using MeterWatchdogCallback = void (*)();
+
 struct MeterMetrics {
   std::uint64_t requests{0};
   std::uint64_t successes{0};
@@ -23,10 +25,11 @@ class IMeter {
   virtual bool begin() = 0;
   virtual MeasurementSnapshot poll(std::uint64_t utc_ms,
                                    std::uint64_t monotonic_ms,
-                                   bool time_trusted) = 0;
+                                   bool time_trusted,
+                                   MeterWatchdogCallback watchdog_callback =
+                                       nullptr) = 0;
   virtual MeterMetrics metrics() const = 0;
   virtual const char* methodName() const = 0;
 };
 
 }  // namespace pm
-

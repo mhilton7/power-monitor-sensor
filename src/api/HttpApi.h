@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -33,6 +34,33 @@ class HttpApi {
     bool overflow{false};
   };
 
+  enum class PasswordJobKind : std::uint8_t { Login, Setup };
+
+  struct PasswordJob {
+    PasswordJobKind kind{PasswordJobKind::Login};
+    std::string id;
+    std::string body;
+    std::uint64_t queued_ms{0};
+  };
+
+  struct PasswordJobResult {
+    bool used{false};
+    bool complete{false};
+    bool success{false};
+    PasswordJobKind kind{PasswordJobKind::Login};
+    std::string id;
+    std::string code;
+    std::string detail;
+    std::uint64_t expires_ms{0};
+    std::uint64_t duration_ms{0};
+  };
+
+  static void passwordJobTaskEntry(void* context);
+  void passwordJobTask();
+  std::string queuePasswordJob(PasswordJobKind kind,
+                               const std::string& body);
+  bool passwordJobResult(const std::string& id, PasswordJobResult& result,
+                         bool consume);
   void registerReadRoutes();
   void registerMutationRoutes();
   void registerAction(const char* path, MaintenanceAction action,
@@ -44,6 +72,7 @@ class HttpApi {
                  bool mutation);
   bool localSession(AsyncWebServerRequest* request, bool mutation) const;
   bool sameOrigin(AsyncWebServerRequest* request) const;
+  void createLocalSession(AsyncWebServerRequest* request);
   std::string cookieValue(AsyncWebServerRequest* request, const char* name) const;
   void sendJson(AsyncWebServerRequest* request, int status,
                 const std::string& body, const char* content_type = "application/json");
@@ -67,6 +96,10 @@ class HttpApi {
   OtaService& ota_;
   ProvisioningService provisioning_;
   QueueHandle_t maintenance_queue_;
+  QueueHandle_t password_job_queue_{nullptr};
+  SemaphoreHandle_t password_result_mutex_{nullptr};
+  TaskHandle_t password_job_task_{nullptr};
+  std::array<PasswordJobResult, 6> password_results_{};
   AsyncWebServer server_{80};
   RequestAuthenticator authenticator_;
   SessionManager sessions_;

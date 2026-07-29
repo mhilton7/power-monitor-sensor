@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Power Monitor central server device-ingest API
+  title: Power Monitor central server device API
   version: 1.0.0
-  description: Contract implemented by the separate fleet server and exercised by this repository's simulator.
+  description: Current pm-protocol/1.0.0 wire contract implemented by the Power Monitor Server.
 servers:
   - url: https://power-monitor-server.example
 paths:
@@ -12,18 +12,31 @@ paths:
       security: []
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/EnrollmentClaim'}}}
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EnrollmentClaim'}
       responses:
-        '200': {description: Unique device credentials and policy, content: {application/json: {schema: {$ref: '#/components/schemas/EnrollmentResponse'}}}}
-        '401': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
+        '201':
+          description: Unique device credentials and effective policy
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EnrollmentResponse'}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/device-heartbeats:
     post:
       operationId: postHeartbeat
       security: [{deviceHmac: []}]
-      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Heartbeat'}}}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Heartbeat'}
       responses:
-        '200': {description: Heartbeat acceptance and synchronization policy, content: {application/json: {schema: {type: object}}}}
+        '200':
+          description: Heartbeat acknowledgement and synchronization policy
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HeartbeatResponse'}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/device-readings/batch:
     post:
@@ -33,23 +46,23 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [schema_version, protocol, device_id, records]
-              properties:
-                schema_version: {const: 1}
-                protocol: {const: pm-protocol/1.0.0}
-                device_id: {type: string, format: uuid}
-                records: {type: array, minItems: 1, maxItems: 500, items: {$ref: '#/components/schemas/Reading'}}
+            schema: {$ref: '#/components/schemas/ReadingBatch'}
       responses:
-        '200': {description: Idempotent highest contiguous acknowledgement, content: {application/json: {schema: {type: object, required: [ack_sequence], properties: {ack_sequence: {type: integer}}}}}}
-        '409': {$ref: '#/components/responses/Problem'}
-        '422': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Idempotent contiguous acknowledgement
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReadingBatchResponse'}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/device-events/batch:
     post:
       operationId: postEventBatch
       security: [{deviceHmac: []}]
-      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [device_id, events], properties: {device_id: {type: string, format: uuid}, events: {type: array, maxItems: 500, items: {type: object}}}}}}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EventBatch'}
       responses:
         '200': {description: Events accepted idempotently}
         default: {$ref: '#/components/responses/Problem'}
@@ -58,41 +71,48 @@ paths:
       operationId: getEffectiveConfig
       security: [{deviceHmac: []}]
       responses:
-        '200': {description: Desired versioned configuration, content: {application/json: {schema: {type: object}}}}
+        '200':
+          description: Desired server configuration version
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EffectiveConfig'}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/device-config/report:
     post:
       operationId: reportConfigResult
       security: [{deviceHmac: []}]
-      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [config_version, status], properties: {config_version: {type: integer}, status: {enum: [applied, rejected, rolled_back]}, detail: {type: string}}}}}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ConfigReport'}
       responses:
-        '204': {description: Report stored}
+        '200': {description: Report recorded}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/device-firmware/manifest:
     get:
       operationId: getFirmwareManifest
       security: [{deviceHmac: []}]
       responses:
-        '200': {description: Allowed signed OTA manifest, content: {application/json: {schema: {type: object}}}}
-        '204': {description: No update available}
+        '200':
+          description: Update availability and signed release metadata
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FirmwareManifest'}
         default: {$ref: '#/components/responses/Problem'}
-  /api/v1/time:
-    get:
-      operationId: getServerTime
-      security: []
-      responses:
-        '200': {description: TLS-protected UTC hint, content: {application/json: {schema: {type: object, required: [utc], properties: {utc: {type: string, format: date-time}}}}}}
 components:
   securitySchemes:
     deviceHmac:
       type: apiKey
       in: header
       name: X-PM-Signature
-      description: Complete X-PM-* header set using directional HKDF key.
+      description: Complete X-PM-* header set using the device-to-server HKDF key.
   responses:
     Problem:
       description: RFC 9457 problem details
-      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
   schemas:
     Problem:
       type: object
@@ -104,61 +124,206 @@ components:
         detail: {type: string}
         instance: {type: string}
         code: {type: string}
+    DeviceCapabilities:
+      type: object
+      required: [hardware_target, pzem_model, sd_present, sd_required, supported_endpoints]
+      properties:
+        hardware_target: {type: string}
+        pzem_model: {type: string, pattern: '^PZEM-004T V4'}
+        sd_present: {type: boolean}
+        sd_required: {const: true}
+        supported_endpoints:
+          type: array
+          items: {type: string}
     EnrollmentClaim:
       type: object
-      required: [schema_version, protocol, enrollment_token, local_instance_id, hardware_id, capabilities]
+      required: [token, protocol_version, hardware_id, capabilities]
       properties:
-        schema_version: {const: 1}
-        protocol: {const: pm-protocol/1.0.0}
-        enrollment_token: {type: string, maxLength: 256}
-        local_instance_id: {type: string, format: uuid}
-        hardware_id: {type: string, maxLength: 64}
-        capabilities: {type: object}
+        token: {type: string, minLength: 32, maxLength: 256}
+        protocol_version: {const: pm-protocol/1.0.0}
+        hardware_id: {type: string, minLength: 8, maxLength: 128}
+        requested_name: {type: [string, 'null'], maxLength: 160}
+        capabilities: {$ref: '#/components/schemas/DeviceCapabilities'}
     EnrollmentResponse:
       type: object
-      required: [device_id, enrollment_secret, protocol, config_version, policy, ota_signing_public_key]
+      required: [protocol_version, device_id, enrollment_secret, credential_fingerprint, effective_metadata, heartbeat_policy, sync_policy]
       properties:
+        protocol_version: {const: pm-protocol/1.0.0}
         device_id: {type: string, format: uuid}
-        enrollment_secret: {type: string, description: Base64 high-entropy secret returned exactly once.}
-        friendly_name: {type: string}
-        protocol: {const: pm-protocol/1.0.0}
-        config_version: {type: integer}
-        policy: {type: object}
-        ota_signing_public_key: {type: string}
+        enrollment_secret:
+          type: string
+          description: High-entropy URL-safe secret returned exactly once and stored as UTF-8 bytes.
+        credential_fingerprint: {type: string}
+        effective_metadata: {type: object}
+        server_ota_signing_public_key: {type: [string, 'null']}
+        heartbeat_policy: {type: object}
+        sync_policy: {type: object}
+    SubsystemHealth:
+      type: object
+      required: [ok, status]
+      properties:
+        ok: {type: boolean}
+        status: {type: string}
+        error_count: {type: integer, minimum: 0}
+        details: {type: object}
+    TimeHealth:
+      type: object
+      required: [trusted, source]
+      properties:
+        trusted: {type: boolean}
+        source: {type: string}
+        offset_ms: {type: [integer, 'null']}
+        last_sync_at: {type: [string, 'null'], format: date-time}
+    LiveMeasurement:
+      type: object
+      required: [measured_at, voltage_v, current_a, power_w, power_factor, frequency_hz, energy_wh]
+      properties:
+        measured_at: {type: string, format: date-time}
+        voltage_v: {type: number, minimum: 0, maximum: 400}
+        current_a: {type: number, minimum: 0, maximum: 5000}
+        power_w: {type: number, minimum: 0}
+        power_factor: {type: number, minimum: 0, maximum: 1}
+        frequency_hz: {type: number, minimum: 40, maximum: 70}
+        energy_wh: {type: number, minimum: 0}
     Heartbeat:
       type: object
-      required: [schema_version, protocol, device_id, boot_id, firmware_version, uptime_seconds, wifi, meter, storage, sync, resources]
+      required: [protocol_version, schema_version, device_id, boot_id, firmware_version, firmware_build_hash, uptime_seconds, reboot_reason, connection_mode, pzem, sd, oldest_stored_sequence, newest_stored_sequence, server_ack_sequence, backlog_estimate, configuration_version, time, resources, queue]
       properties:
-        schema_version: {const: 1}
-        protocol: {const: pm-protocol/1.0.0}
+        protocol_version: {const: pm-protocol/1.0.0}
+        schema_version: {const: heartbeat/1.0.0}
         device_id: {type: string, format: uuid}
-        boot_id: {type: string, format: uuid}
+        boot_id: {type: string}
         firmware_version: {type: string}
-        uptime_seconds: {type: integer}
-        wifi: {type: object}
-        meter: {type: object}
-        storage: {type: object}
-        sync: {type: object}
+        firmware_build_hash: {type: string}
+        uptime_seconds: {type: integer, minimum: 0}
+        reboot_reason: {type: string}
+        current_ip: {type: [string, 'null']}
+        hostname: {type: [string, 'null']}
+        rssi_dbm: {type: [integer, 'null'], minimum: -127, maximum: 0}
+        connection_mode: {enum: [pull, push, hybrid]}
+        latest:
+          oneOf:
+            - {$ref: '#/components/schemas/LiveMeasurement'}
+            - {type: 'null'}
+        pzem: {$ref: '#/components/schemas/SubsystemHealth'}
+        sd: {$ref: '#/components/schemas/SubsystemHealth'}
+        oldest_stored_sequence: {type: integer, minimum: 0}
+        newest_stored_sequence: {type: integer, minimum: 0}
+        server_ack_sequence: {type: integer, minimum: 0}
+        backlog_estimate: {type: integer, minimum: 0}
+        configuration_version: {type: integer, minimum: 0}
+        time: {$ref: '#/components/schemas/TimeHealth'}
         resources: {type: object}
+        queue: {type: object}
+    HeartbeatResponse:
+      type: object
+      required: [server_receive_time, highest_contiguous_accepted_sequence, gap_ranges, desired_configuration_version, firmware_release_available, recommended_heartbeat_interval_seconds, immediate_sync_requested]
+      properties:
+        server_receive_time: {type: string, format: date-time}
+        highest_contiguous_accepted_sequence: {type: integer, minimum: 0}
+        gap_ranges: {type: array}
+        desired_configuration_version: {type: integer, minimum: 0}
+        firmware_release_available: {type: boolean}
+        recommended_heartbeat_interval_seconds: {type: integer}
+        immediate_sync_requested: {type: boolean}
     Reading:
       type: object
-      required: [schema_version, protocol, device_id, sequence, boot_id, start_utc, end_utc, time_trusted, sample_count, valid_sample_count, active_power_w, raw_energy_start_wh, raw_energy_end_wh, interval_energy_wh, energy_method, ct_rating_a, quality_flags, firmware_version]
+      required: [sequence, boot_id, interval_start, interval_end, time_trusted, energy_method, ct_rating_amps, quality_flags, firmware_version]
       properties:
-        schema_version: {const: 1}
-        protocol: {const: pm-protocol/1.0.0}
-        device_id: {type: string, format: uuid}
         sequence: {type: integer, minimum: 1}
-        boot_id: {type: string, format: uuid}
-        start_utc: {type: string, format: date-time}
-        end_utc: {type: string, format: date-time}
+        boot_id: {type: string}
+        interval_start: {type: string, format: date-time}
+        interval_end: {type: string, format: date-time}
         time_trusted: {type: boolean}
-        sample_count: {type: integer}
-        valid_sample_count: {type: integer}
-        active_power_w: {type: object}
-        raw_energy_start_wh: {type: integer}
-        raw_energy_end_wh: {type: integer}
-        interval_energy_wh: {type: number}
-        energy_method: {type: string}
-        ct_rating_a: {type: number}
-        quality_flags: {type: integer}
+        voltage_avg: {type: [number, 'null']}
+        voltage_min: {type: [number, 'null']}
+        voltage_max: {type: [number, 'null']}
+        current_avg: {type: [number, 'null']}
+        current_min: {type: [number, 'null']}
+        current_max: {type: [number, 'null']}
+        power_avg: {type: [number, 'null']}
+        power_min: {type: [number, 'null']}
+        power_max: {type: [number, 'null']}
+        power_factor: {type: [number, 'null']}
+        frequency_hz: {type: [number, 'null']}
+        pzem_energy_start_wh: {type: [number, 'null']}
+        pzem_energy_end_wh: {type: [number, 'null']}
+        device_lifetime_energy_wh: {type: [number, 'null']}
+        interval_energy_wh: {type: [number, 'null']}
+        energy_method: {type: string, maxLength: 40}
+        ct_rating_amps: {type: number, exclusiveMinimum: 0}
+        quality_flags:
+          type: array
+          items: {type: string}
         firmware_version: {type: string}
+        record_hash: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+    ReadingBatch:
+      type: object
+      required: [protocol_version, schema_version, device_id, readings]
+      properties:
+        protocol_version: {const: pm-protocol/1.0.0}
+        schema_version: {const: reading-batch/1.0.0}
+        device_id: {type: string, format: uuid}
+        readings:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: {$ref: '#/components/schemas/Reading'}
+    ReadingBatchResponse:
+      type: object
+      required: [accepted, duplicates, rejected, highest_contiguous_accepted_sequence, missing_ranges]
+      properties:
+        accepted: {type: array, items: {type: integer}}
+        duplicates: {type: array, items: {type: integer}}
+        rejected: {type: array}
+        highest_contiguous_accepted_sequence: {type: integer, minimum: 0}
+        missing_ranges: {type: array}
+    Event:
+      type: object
+      required: [event_id, occurred_at, category, severity, evidence]
+      properties:
+        event_id: {type: string, minLength: 1, maxLength: 80}
+        occurred_at: {type: string, format: date-time}
+        category: {enum: [boot, pzem, ct_limit, sd, network, time, configuration, ota, security]}
+        severity: {enum: [info, warning, error, critical]}
+        evidence: {type: object}
+    EventBatch:
+      type: object
+      required: [protocol_version, device_id, events]
+      properties:
+        protocol_version: {const: pm-protocol/1.0.0}
+        device_id: {type: string, format: uuid}
+        events:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: {$ref: '#/components/schemas/Event'}
+    EffectiveConfig:
+      type: object
+      required: [protocol_version, device_id, version, settings, sha256]
+      properties:
+        protocol_version: {const: pm-protocol/1.0.0}
+        device_id: {type: string, format: uuid}
+        version: {type: integer, minimum: 1}
+        settings: {type: object}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    ConfigReport:
+      type: object
+      required: [protocol_version, device_id, version, status, applied, rejected]
+      properties:
+        protocol_version: {const: pm-protocol/1.0.0}
+        device_id: {type: string, format: uuid}
+        version: {type: integer, minimum: 1}
+        status: {enum: [applied, partially_applied, rejected, rolled_back]}
+        applied: {type: array, items: {type: string}}
+        rejected: {type: object}
+    FirmwareManifest:
+      type: object
+      required: [available]
+      properties:
+        available: {type: boolean}
+        protocol_version: {const: pm-protocol/1.0.0}
+        version: {type: string}
+        download_path: {type: string}
+        sha256: {type: string}
+        signature: {type: string}

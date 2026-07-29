@@ -25,7 +25,11 @@ export interface Health {
     newest_sequence: number;
     server_ack_sequence: number;
   };
-  server: { configured: boolean; reachable: boolean; last_heartbeat_utc: number };
+  server: {
+    configured: boolean;
+    reachable: boolean;
+    last_heartbeat_utc: number;
+  };
 }
 
 export interface LiveReading {
@@ -48,6 +52,11 @@ export interface EffectiveConfig {
   friendly_name: string;
   hostname: string;
   wifi_ssid: string;
+  static_network_enabled: boolean;
+  static_ip: string;
+  static_gateway: string;
+  static_subnet: string;
+  static_dns: string;
   server_url: string;
   server_ca_configured: boolean;
   server_fingerprint_configured: boolean;
@@ -61,6 +70,22 @@ export interface EffectiveConfig {
   ct_fault_fraction?: number;
   timezone: string;
   sd_spi_hz: number;
+  diagnostic_log_level: number;
+}
+
+export interface NetworkSettingsPayload {
+  wifi_ssid: string;
+  wifi_password?: string;
+  static_network_enabled: boolean;
+  static_ip: string;
+  static_gateway: string;
+  static_subnet: string;
+  static_dns: string;
+  server_url: string;
+  tls_trust_action: "keep" | "replace_ca";
+  server_ca_pem?: string;
+  server_fingerprint?: string;
+  connection_mode: "pull" | "push" | "hybrid";
 }
 
 export interface SetupPayload {

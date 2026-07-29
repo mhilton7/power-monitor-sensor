@@ -10,7 +10,9 @@ class SimulatedMeter final : public IMeter {
  public:
   bool begin() override;
   MeasurementSnapshot poll(std::uint64_t utc_ms, std::uint64_t monotonic_ms,
-                           bool time_trusted) override;
+                           bool time_trusted,
+                           MeterWatchdogCallback watchdog_callback =
+                               nullptr) override;
   MeterMetrics metrics() const override;
   const char* methodName() const override;
   void injectFault(SimulatedFault fault, std::uint32_t polls = 1);
@@ -25,4 +27,3 @@ class SimulatedMeter final : public IMeter {
 };
 
 }  // namespace pm
-

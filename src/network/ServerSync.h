@@ -55,7 +55,9 @@ class ServerSync {
   std::uint64_t next_config_poll_ms_{0};
   std::uint64_t next_manifest_poll_ms_{0};
   std::uint64_t next_event_push_ms_{0};
+  std::uint64_t offline_since_ms_{0};
   std::uint64_t event_cursor_{0};
+  std::uint32_t request_sequence_{0};
   std::uint32_t retry_attempt_{0};
   std::uint32_t heartbeat_interval_override_seconds_{0};
   std::uint32_t pending_config_version_{0};

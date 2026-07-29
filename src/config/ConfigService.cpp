@@ -10,6 +10,8 @@
 #include <ESP.h>
 
 #include "build_config.h"
+#include "diagnostics/DiagnosticCore.h"
+#include "diagnostics/SerialLogger.h"
 
 namespace pm {
 namespace {
@@ -60,16 +62,23 @@ const char* connectionModeName(const ConnectionMode mode) {
 }
 
 bool ConfigService::begin() {
+  PM_LOG_INFO("CONFIG", "NVS_OPEN_BEGIN", "namespace=pm-agent");
   if (!preferences_.begin("pm-agent", false)) {
+    PM_LOG_FATAL("CONFIG", "NVS_OPEN_FAILED",
+                 "error=PM-CONFIG-001 namespace=pm-agent");
     return false;
   }
   initializeIdentity();
+  bool defaults_created = false;
   if (!loadConfig("cfg", config_)) {
     config_ = RuntimeConfig{};
     config_.hostname = defaultHostname(identity_);
     if (!saveConfig("cfg", config_)) {
+      PM_LOG_FATAL("CONFIG", "DEFAULT_SAVE_FAILED",
+                   "error=PM-CONFIG-003");
       return false;
     }
+    defaults_created = true;
   }
   if (config_.hostname.empty()) {
     config_.hostname = defaultHostname(identity_);
@@ -77,6 +86,13 @@ bool ConfigService::begin() {
   const std::uint32_t boot_failures = preferences_.getUInt("boot_fail", 0);
   safe_mode_ = boot_failures >= 3;
   safe_mode_reason_ = safe_mode_ ? "three_consecutive_incomplete_boots" : "";
+  PM_LOG_INFO(
+      "CONFIG", "NVS_OPEN_COMPLETE",
+      "source=%s config_version=%lu boot_failures=%lu safe_mode=%s",
+      defaults_created ? "defaults" : "persisted",
+      static_cast<unsigned long>(config_.config_version),
+      static_cast<unsigned long>(boot_failures),
+      safe_mode_ ? "true" : "false");
   return true;
 }
 
@@ -120,7 +136,7 @@ ConfigValidation ConfigService::validate(const RuntimeConfig& candidate,
   }
   if (!candidate.server_url.empty() && candidate.server_ca_pem.empty() &&
       candidate.server_fingerprint.empty()) {
-    return {false, "tls_trust_required", "A private CA PEM or certificate fingerprint is required for the central server."};
+    return {false, "tls_trust_required", "A public server CA PEM or certificate fingerprint is required for the central server."};
   }
   if (candidate.static_network_enabled &&
       (!validIpv4(candidate.static_ip) || !validIpv4(candidate.static_gateway) ||
@@ -219,18 +235,34 @@ ConfigValidation ConfigService::validate(const RuntimeConfig& candidate,
 
 bool ConfigService::stage(const RuntimeConfig& candidate,
                           const bool ct_change_acknowledged) {
-  if (!validate(candidate, ct_change_acknowledged).valid) {
+  const ConfigValidation validation =
+      validate(candidate, ct_change_acknowledged);
+  if (!validation.valid) {
+    PM_LOG_WARN("CONFIG", "STAGE_REJECTED",
+                "error=PM-CONFIG-004 validation=%s",
+                validation.code.c_str());
     return false;
   }
   staged_ = candidate;
   staged_.config_version = std::max(config_.config_version + 1,
                                     candidate.config_version);
   staged_valid_ = saveConfig("cfg_stage", staged_);
+  PM_LOG_INFO(
+      "CONFIG", "STAGE_COMPLETE",
+      "result=%s from_version=%lu to_version=%lu friendly_name=%s wifi_ssid=%s server_configured=%s",
+      staged_valid_ ? "success" : "failed",
+      static_cast<unsigned long>(config_.config_version),
+      static_cast<unsigned long>(staged_.config_version),
+      staged_.friendly_name.c_str(),
+      diag::maskSsid(staged_.wifi_ssid).c_str(),
+      staged_.server_url.empty() ? "false" : "true");
   return staged_valid_;
 }
 
 bool ConfigService::commitStaged() {
   if (!staged_valid_) {
+    PM_LOG_WARN("CONFIG", "COMMIT_REJECTED",
+                "error=PM-CONFIG-005 staged=false");
     return false;
   }
   if (!saveConfig("cfg_prev", config_) || !saveConfig("cfg", staged_)) {
@@ -241,6 +273,10 @@ bool ConfigService::commitStaged() {
   preferences_.remove("server_ca_stage");
   preferences_.remove("server_fp_stage");
   staged_valid_ = false;
+  PM_LOG_INFO("CONFIG", "COMMIT_COMPLETE",
+              "version=%lu friendly_name=%s",
+              static_cast<unsigned long>(config_.config_version),
+              config_.friendly_name.c_str());
   return true;
 }
 
@@ -293,7 +329,8 @@ std::string ConfigService::wifiPassword() const {
 
 bool ConfigService::setWifiCredentials(const std::string& ssid,
                                        const std::string& password) {
-  if (ssid.empty() || ssid.size() > 32 || password.size() > 63) {
+  if (ssid.empty() || ssid.size() > 32 || password.size() < 8 ||
+      password.size() > 63) {
     return false;
   }
   RuntimeConfig candidate = config_;
@@ -307,6 +344,66 @@ bool ConfigService::setWifiCredentials(const std::string& ssid,
   }
   config_ = candidate;
   return true;
+}
+
+bool ConfigService::updateNetworkSettings(
+    const RuntimeConfig& candidate, const std::string& wifi_password,
+    const bool replace_wifi_password, ConfigValidation& result) {
+  result = validate(candidate, true);
+  if (!result.valid) {
+    return false;
+  }
+  if (candidate.wifi_ssid.empty()) {
+    result = {false, "wifi_ssid_required",
+              "A Wi-Fi network name is required."};
+    return false;
+  }
+  if (!replace_wifi_password && candidate.wifi_ssid != config_.wifi_ssid) {
+    result = {false, "wifi_password_required",
+              "Enter the password when changing the Wi-Fi network."};
+    return false;
+  }
+  if (!replace_wifi_password && !hasWifiCredentials()) {
+    result = {false, "wifi_credentials_missing",
+              "The existing Wi-Fi password is unavailable; enter it again."};
+    return false;
+  }
+  if (replace_wifi_password &&
+      (wifi_password.size() < 8 || wifi_password.size() > 63)) {
+    result = {false, "wifi_password_invalid",
+              "Wi-Fi passwords must contain 8 through 63 characters."};
+    return false;
+  }
+
+  const RuntimeConfig previous_config = config_;
+  const std::string previous_password = wifiPassword();
+  if (!stage(candidate, true)) {
+    result = {false, "network_settings_stage_failed",
+              "The network settings could not be staged in persistent storage."};
+    return false;
+  }
+
+  const bool password_saved =
+      !replace_wifi_password ||
+      preferences_.putBytes("wifi_pwd", wifi_password.data(),
+                            wifi_password.size()) == wifi_password.size();
+  if (password_saved && commitStaged()) {
+    result = {true, "ok", "Network and server settings were committed."};
+    return true;
+  }
+
+  config_ = previous_config;
+  saveConfig("cfg", previous_config);
+  if (previous_password.empty()) {
+    preferences_.remove("wifi_pwd");
+  } else {
+    preferences_.putBytes("wifi_pwd", previous_password.data(),
+                          previous_password.size());
+  }
+  rollbackStaged();
+  result = {false, "network_settings_commit_failed",
+            "The network settings could not be committed; the previous settings were restored."};
+  return false;
 }
 
 std::string ConfigService::enrollmentToken() const {
@@ -336,7 +433,8 @@ bool ConfigService::saveEnrollment(const std::string& device_id,
   }
   const bool saved = preferences_.putString("device_id", device_id.c_str()) == device_id.size() &&
                      preferences_.putBytes("enroll_sec", enrollment_secret, secret_length) == secret_length &&
-                     preferences_.putString("ota_pub", ota_public_key.c_str()) == ota_public_key.size();
+                     preferences_.putString("ota_pub", ota_public_key.c_str()) == ota_public_key.size() &&
+                     preferences_.putUInt("server_cfg", 0) == sizeof(std::uint32_t);
   if (!saved) {
     return false;
   }
@@ -466,6 +564,8 @@ bool ConfigService::beginReenrollment(const std::string& token) {
   const bool removed_device = preferences_.remove("device_id");
   const bool removed_secret = preferences_.remove("enroll_sec");
   preferences_.remove("ota_pub");
+  preferences_.remove("server_ack");
+  preferences_.remove("server_cfg");
   if (!removed_device || !removed_secret) {
     preferences_.remove("enroll_tok");
     return false;
@@ -497,6 +597,16 @@ bool ConfigService::setServerAckSequence(const std::uint64_t sequence) {
   return sequence >= current && preferences_.putULong64("server_ack", sequence) == sizeof(sequence);
 }
 
+std::uint32_t ConfigService::serverConfigVersion() const {
+  return preferences_.getUInt("server_cfg", 0);
+}
+
+bool ConfigService::setServerConfigVersion(const std::uint32_t version) {
+  const std::uint32_t current = serverConfigVersion();
+  return version >= current &&
+         preferences_.putUInt("server_cfg", version) == sizeof(version);
+}
+
 std::uint64_t ConfigService::energyOffsetWh() const {
   return preferences_.getULong64("energy_off", 0);
 }
@@ -515,6 +625,15 @@ bool ConfigService::recordBootHealthy() {
   safe_mode_ = false;
   safe_mode_reason_.clear();
   return preferences_.putUInt("boot_fail", 0) == sizeof(std::uint32_t);
+}
+
+bool ConfigService::setDiagnosticLogLevel(const std::uint8_t level) {
+  if (level > 5 || config_.diagnostic_log_level == level) {
+    return level <= 5;
+  }
+  RuntimeConfig candidate = config_;
+  candidate.diagnostic_log_level = level;
+  return stage(candidate, true) && commitStaged();
 }
 
 bool ConfigService::safeMode() const { return safe_mode_; }

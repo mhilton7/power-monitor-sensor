@@ -1,6 +1,6 @@
 {
   "ota_slot_bytes": 6291456,
-  "firmware_bytes": 1177840,
-  "margin_bytes": 5113616,
-  "utilization_percent": 18.72
+  "firmware_bytes": 1265120,
+  "margin_bytes": 5026336,
+  "utilization_percent": 20.11
 }

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <ArduinoJson.h>
+#include <ESP.h>
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
@@ -16,6 +17,7 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 
+#include "diagnostics/SerialLogger.h"
 #include "security/Crypto.h"
 #include "version.h"
 
@@ -36,16 +38,6 @@ bool parseHttpsTarget(const std::string& url, std::string& host,
              : static_cast<std::uint16_t>(std::strtoul(
                    authority.substr(colon + 1).c_str(), nullptr, 10));
   return !host.empty() && port != 0;
-}
-
-bool verifyPinnedPeer(WiFiClientSecure& client, const std::string& url,
-                      const std::string& fingerprint) {
-  if (fingerprint.empty()) return true;
-  std::string host;
-  std::uint16_t port = 443;
-  return parseHttpsTarget(url, host, port) &&
-         client.connect(host.c_str(), port, 5000) &&
-         client.verify(fingerprint.c_str(), host.c_str());
 }
 
 bool hostAllowed(const RuntimeConfig& config, const std::string& url) {
@@ -94,14 +86,30 @@ bool OtaService::checkRunningImage(const bool health_checks_passed) {
     return false;
   }
   if (state == ESP_OTA_IMG_PENDING_VERIFY) {
-    return health_checks_passed &&
-           esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
+    const bool valid =
+        health_checks_passed &&
+        esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
+    PM_LOG_INFO("OTA", "RUNNING_IMAGE_VALIDATION",
+                "health_checks=%s result=%s rollback_cancelled=%s",
+                health_checks_passed ? "passed" : "failed",
+                valid ? "success" : "failed", valid ? "true" : "false");
+    return valid;
   }
+  PM_LOG_DEBUG("OTA", "RUNNING_IMAGE_STATE",
+               "state=%d pending_verification=false", static_cast<int>(state));
   return true;
 }
 
 bool OtaService::applyFromManifestUrl(const std::string& manifest_url) {
+  PM_LOG_INFO(
+      "OTA", "UPDATE_REQUESTED",
+      "safe_mode=%s update_window=%s heap_free=%lu psram_free=%lu",
+      config_.safeMode() ? "true" : "false",
+      withinUpdateWindow(config_.config()) ? "open" : "closed",
+      static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(ESP.getFreePsram()));
   if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
+    PM_LOG_WARN("OTA", "STATUS_LOCK_BUSY", "error=PM-OTA-001");
     return false;
   }
   if (status_.in_progress || config_.safeMode() ||
@@ -111,6 +119,12 @@ bool OtaService::applyFromManifestUrl(const std::string& manifest_url) {
       status_.last_error = config_.safeMode() ? "ota_disabled_in_safe_mode"
                                               : "outside_ota_update_window";
     }
+    PM_LOG_WARN("OTA", "UPDATE_REJECTED",
+                "error=PM-OTA-002 reason=%s",
+                status_.in_progress
+                    ? "already_in_progress"
+                    : (config_.safeMode() ? "safe_mode"
+                                          : "outside_update_window"));
     xSemaphoreGive(mutex_);
     return false;
   }
@@ -132,6 +146,16 @@ bool OtaService::applyFromManifestUrl(const std::string& manifest_url) {
   status_.last_error = error;
   status_.pending_reboot = ok;
   xSemaphoreGive(mutex_);
+  PM_LOG_INFO(
+      "OTA", "UPDATE_COMPLETE",
+      "result=%s target_version=%s bytes_received=%lu image_size=%lu error=%s heap_free=%lu",
+      ok ? "verified_pending_reboot" : "failed",
+      manifest.firmware_version.empty() ? "unknown"
+                                        : manifest.firmware_version.c_str(),
+      static_cast<unsigned long>(status_.bytes_received),
+      static_cast<unsigned long>(status_.image_size),
+      error.empty() ? "none" : error.c_str(),
+      static_cast<unsigned long>(ESP.getFreeHeap()));
   if (ok) {
     delay(100);
     ESP.restart();
@@ -145,6 +169,8 @@ bool OtaService::parseManifest(const std::string& json, OtaManifest& manifest,
   const DeserializationError parse_error = deserializeJson(document, json);
   if (parse_error) {
     error = "ota_manifest_json_invalid";
+    PM_LOG_ERROR("OTA", "MANIFEST_PARSE_FAILED",
+                 "error=PM-OTA-003 category=json_invalid");
     return false;
   }
   manifest.schema_version = document["schema_version"] | 0;
@@ -164,8 +190,17 @@ bool OtaService::parseManifest(const std::string& json, OtaManifest& manifest,
       manifest.image_url.empty() || manifest.image_size == 0 ||
       manifest.image_sha256.size() != 64 || manifest.signature_base64.empty()) {
     error = "ota_manifest_required_field_missing";
+    PM_LOG_ERROR("OTA", "MANIFEST_REJECTED",
+                 "error=PM-OTA-003 category=required_field_missing");
     return false;
   }
+  PM_LOG_INFO(
+      "OTA", "MANIFEST_PARSED",
+      "target_version=%s protocol=%s hardware=%s image_size=%lu algorithm=%s",
+      manifest.firmware_version.c_str(), manifest.protocol.c_str(),
+      manifest.hardware_target.c_str(),
+      static_cast<unsigned long>(manifest.image_size),
+      manifest.signature_algorithm.c_str());
   return true;
 }
 
@@ -173,10 +208,14 @@ bool OtaService::verifyManifest(const OtaManifest& manifest,
                                 std::string& error) const {
   if (manifest.protocol != version::PROTOCOL) {
     error = "ota_protocol_incompatible";
+    PM_LOG_ERROR("OTA", "POLICY_REJECTED",
+                 "error=PM-OTA-004 reason=protocol_incompatible");
     return false;
   }
   if (manifest.hardware_target != version::HARDWARE_TARGET) {
     error = "ota_hardware_incompatible";
+    PM_LOG_ERROR("OTA", "POLICY_REJECTED",
+                 "error=PM-OTA-004 reason=hardware_incompatible");
     return false;
   }
   if (manifest.signature_algorithm != "ecdsa-p256-sha256") {
@@ -227,6 +266,12 @@ bool OtaService::verifyManifest(const OtaManifest& manifest,
   mbedtls_pk_free(&key);
   if (!valid) {
     error = "ota_signature_invalid";
+    PM_LOG_ERROR("OTA", "SIGNATURE_INVALID",
+                 "error=PM-OTA-005 algorithm=ecdsa-p256-sha256");
+  } else {
+    PM_LOG_INFO("OTA", "SIGNATURE_VERIFIED",
+                "algorithm=ecdsa-p256-sha256 target_version=%s",
+                manifest.firmware_version.c_str());
   }
   return valid;
 }
@@ -255,8 +300,10 @@ OtaStatus OtaService::status() const {
 }
 
 bool OtaService::rollbackAndReboot() {
-  return esp_ota_check_rollback_is_possible() &&
-         esp_ota_mark_app_invalid_rollback_and_reboot() == ESP_OK;
+  const bool possible = esp_ota_check_rollback_is_possible();
+  PM_LOG_WARN("OTA", "ROLLBACK_REQUESTED", "possible=%s",
+              possible ? "true" : "false");
+  return possible && esp_ota_mark_app_invalid_rollback_and_reboot() == ESP_OK;
 }
 
 bool OtaService::fetchText(const std::string& url, std::string& body,
@@ -272,7 +319,13 @@ bool OtaService::fetchText(const std::string& url, std::string& body,
   }
   WiFiClientSecure client;
   if (!configureTls(client)) {
-    error = "tls_trust_not_configured";
+    error = config_.config().server_ca_pem.empty()
+                ? "tls_ca_not_configured"
+                : "tls_configuration_failed";
+    PM_LOG_ERROR(
+        "TLS", "OTA_TLS_REJECTED",
+        "error=PM-TLS-001 category=CA_MISSING fingerprint_configured=%s insecure_mode=false",
+        config_.config().server_fingerprint.empty() ? "false" : "true");
     return false;
   }
   HTTPClient http;
@@ -282,13 +335,9 @@ bool OtaService::fetchText(const std::string& url, std::string& body,
     error = "ota_manifest_http_begin_failed";
     return false;
   }
-  if (config_.config().server_ca_pem.empty() &&
-      !verifyPinnedPeer(client, url, config_.config().server_fingerprint)) {
-    client.stop();
-    http.end();
-    error = "tls_fingerprint_verification_failed";
-    return false;
-  }
+  PM_LOG_INFO("OTA", "MANIFEST_DOWNLOAD_BEGIN",
+              "maximum_bytes=%u tls_validation=ca_and_hostname",
+              static_cast<unsigned>(maximum_bytes));
   const int status = http.GET();
   if (status != 200) {
     error = "ota_manifest_download_failed";
@@ -303,6 +352,9 @@ bool OtaService::fetchText(const std::string& url, std::string& body,
   }
   body = response.c_str();
   http.end();
+  PM_LOG_INFO("OTA", "MANIFEST_DOWNLOAD_COMPLETE",
+              "status=200 bytes=%u",
+              static_cast<unsigned>(body.size()));
   return true;
 }
 
@@ -314,7 +366,7 @@ bool OtaService::downloadAndApply(const OtaManifest& manifest,
   }
   WiFiClientSecure client;
   if (!configureTls(client)) {
-    error = "tls_trust_not_configured";
+    error = "tls_ca_not_configured";
     return false;
   }
   HTTPClient http;
@@ -324,14 +376,12 @@ bool OtaService::downloadAndApply(const OtaManifest& manifest,
     error = "ota_image_http_begin_failed";
     return false;
   }
-  if (config_.config().server_ca_pem.empty() &&
-      !verifyPinnedPeer(client, manifest.image_url,
-                        config_.config().server_fingerprint)) {
-    client.stop();
-    http.end();
-    error = "tls_fingerprint_verification_failed";
-    return false;
-  }
+  PM_LOG_INFO(
+      "OTA", "IMAGE_DOWNLOAD_BEGIN",
+      "target_version=%s expected_bytes=%lu heap_free=%lu tls_validation=ca_and_hostname",
+      manifest.firmware_version.c_str(),
+      static_cast<unsigned long>(manifest.image_size),
+      static_cast<unsigned long>(ESP.getFreeHeap()));
   const int status = http.GET();
   const int content_length = http.getSize();
   if (status != 200 || content_length != static_cast<int>(manifest.image_size)) {
@@ -351,6 +401,7 @@ bool OtaService::downloadAndApply(const OtaManifest& manifest,
   std::array<std::uint8_t, 4096> buffer{};
   std::uint32_t received = 0;
   std::uint64_t last_progress_ms = millis();
+  std::uint8_t last_progress_percent = 0;
   while (received < manifest.image_size) {
     const int available = stream->available();
     if (available <= 0) {
@@ -382,6 +433,19 @@ bool OtaService::downloadAndApply(const OtaManifest& manifest,
     status_.image_size = manifest.image_size;
     status_.target_version = manifest.firmware_version;
     xSemaphoreGive(mutex_);
+    const std::uint8_t progress = static_cast<std::uint8_t>(
+        (static_cast<std::uint64_t>(received) * 100U) / manifest.image_size);
+    if (progress >= last_progress_percent + 10U || progress == 100U) {
+      last_progress_percent = static_cast<std::uint8_t>(
+          (progress / 10U) * 10U);
+      PM_LOG_INFO(
+          "OTA", "DOWNLOAD_PROGRESS",
+          "percent=%u bytes_received=%lu image_size=%lu heap_free=%lu",
+          static_cast<unsigned>(progress),
+          static_cast<unsigned long>(received),
+          static_cast<unsigned long>(manifest.image_size),
+          static_cast<unsigned long>(ESP.getFreeHeap()));
+    }
   }
   crypto::Key32 digest{};
   mbedtls_sha256_finish_ret(&hash, digest.data());
@@ -390,13 +454,24 @@ bool OtaService::downloadAndApply(const OtaManifest& manifest,
   if (!crypto::constantTimeEqual(crypto::hexEncode(digest.data(), digest.size()),
                                  manifest.image_sha256)) {
     error = "ota_image_sha256_mismatch";
+    PM_LOG_ERROR("OTA", "IMAGE_HASH_MISMATCH",
+                 "error=PM-OTA-008 bytes=%lu",
+                 static_cast<unsigned long>(received));
     Update.abort();
     return false;
   }
   if (!Update.end(true) || !Update.isFinished()) {
     error = "ota_finalize_failed";
+    PM_LOG_ERROR("OTA", "PARTITION_FINALIZE_FAILED",
+                 "error=PM-OTA-009 update_error=%u",
+                 static_cast<unsigned>(Update.getError()));
     return false;
   }
+  PM_LOG_INFO(
+      "OTA", "IMAGE_VERIFIED",
+      "sha256_match=true bytes=%lu target_version=%s pending_reboot=true",
+      static_cast<unsigned long>(received),
+      manifest.firmware_version.c_str());
   return true;
 }
 
@@ -404,10 +479,6 @@ bool OtaService::configureTls(WiFiClientSecure& client) const {
   client.setHandshakeTimeout(8);
   if (!config_.config().server_ca_pem.empty()) {
     client.setCACert(config_.config().server_ca_pem.c_str());
-    return true;
-  }
-  if (!config_.config().server_fingerprint.empty()) {
-    client.setInsecure();
     return true;
   }
   return false;

@@ -101,6 +101,100 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertEqual(page["response"]["next_after_sequence"], page["response"]["last_sequence"])
         self.assertEqual(page["gone_problem"]["status"], 410)
 
+    def test_current_power_monitor_server_wire_contract_is_used(self) -> None:
+        contract = yaml.safe_load(
+            (ROOT / "shared/openapi/server-ingest-api.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        claim = contract["components"]["schemas"]["EnrollmentClaim"]
+        self.assertEqual(
+            set(claim["required"]),
+            {"token", "protocol_version", "hardware_id", "capabilities"},
+        )
+        self.assertIn(
+            "201",
+            contract["paths"]["/api/v1/device-enrollment/claim"]["post"][
+                "responses"
+            ],
+        )
+        heartbeat = contract["components"]["schemas"]["Heartbeat"]
+        self.assertEqual(
+            heartbeat["properties"]["schema_version"]["const"],
+            "heartbeat/1.0.0",
+        )
+        batch = contract["components"]["schemas"]["ReadingBatch"]
+        self.assertEqual(
+            batch["properties"]["schema_version"]["const"],
+            "reading-batch/1.0.0",
+        )
+        self.assertIn("readings", batch["required"])
+
+        firmware_source = (ROOT / "src/network/ServerSync.cpp").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            'document["token"]',
+            'document["protocol_version"]',
+            '"heartbeat/1.0.0"',
+            '"reading-batch/1.0.0"',
+            'document["readings"]',
+            'result["highest_contiguous_accepted_sequence"]',
+            'report["version"]',
+        ):
+            self.assertIn(marker, firmware_source)
+
+        server_protocol = ROOT.parent / "power-monitor/shared/protocol-version.txt"
+        if server_protocol.is_file():
+            self.assertEqual(
+                server_protocol.read_text(encoding="utf-8").strip(),
+                "pm-protocol/1.0.0",
+            )
+
+    def test_current_server_hmac_vector_matches_sensor_signer(self) -> None:
+        vector_path = (
+            ROOT.parent
+            / "power-monitor/shared/auth-test-vectors/hmac-sha256-v1.json"
+        )
+        if not vector_path.is_file():
+            self.skipTest("sibling Power Monitor Server repository is not available")
+        document = json.loads(vector_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["protocol"], "pm-protocol/1.0.0")
+        vector = document["vectors"][0]
+        secret = bytes.fromhex(vector["secret"])
+        info = (
+            b"pm-device-to-server-v1"
+            if vector["direction"] == "device-to-server"
+            else b"pm-server-to-device-v1"
+        )
+        key = hkdf_sha256(secret, info)
+        self.assertEqual(key.hex(), vector["derived_key_hex"])
+        body = vector["body_utf8"].encode()
+        self.assertEqual(body_sha256(body), vector["content_sha256"])
+        self.assertEqual(
+            canonical_path_query(vector["target_input"]),
+            vector["canonical_target"],
+        )
+        self.assertEqual(
+            canonical_string(
+                vector["method"],
+                vector["target_input"],
+                vector["timestamp"],
+                vector["nonce"],
+                vector["content_sha256"],
+            ),
+            vector["canonical_string"],
+        )
+        headers = sign(
+            key,
+            vector["method"],
+            vector["target_input"],
+            vector["timestamp"],
+            vector["nonce"],
+            body,
+        )
+        self.assertEqual(headers["X-PM-Signature"], vector["signature"])
+
 
 if __name__ == "__main__":
     unittest.main()
