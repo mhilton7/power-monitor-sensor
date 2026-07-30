@@ -21,18 +21,29 @@ of being repeated as numeric literals:
 | Aggregation | 8 KiB |
 | Storage | 8 KiB |
 | Network | 6 KiB |
-| Server synchronization | 16 KiB |
+| Server synchronization | 24 KiB |
 | Health | 6 KiB |
 | Maintenance | 12 KiB |
-| Serial command | 8 KiB |
+| Serial command | 24 KiB |
 
 `ServerSyncTask` remains on core 0 at priority 2. Before this repair it was
-12 KiB on the same core and priority. The larger 16 KiB allocation is a
+12 KiB on the same core and priority. The larger 24 KiB allocation is a
 measured safety provision for secure-client call depth; it is not the primary
 memory fix. Peak heap ownership was reduced and bounded independently.
-`SerialCommandTask` was increased from 4 KiB to 8 KiB after the baseline
-diagnostic capture proved that formatting a task/memory report could overflow
-that task.
+`SerialCommandTask` was first increased from 4 KiB to 8 KiB after the
+baseline diagnostic capture proved that formatting a task/memory report could
+overflow that task. It is now 24 KiB because configuration-changing serial
+commands atomically persist and re-verify the complete configuration,
+including parsing the configured Caddy CA with mbedTLS. A production trace
+captured a double exception in `mbedtls_pem_read_buffer` while an 8 KiB serial
+task applied `loglevel info`; the larger stack keeps that verified write path
+safe.
+
+Server synchronization does not enumerate or read microSD files directly.
+It submits bounded history jobs to `StorageTask` through
+`StorageCoordinator`, then polls the result from later scheduler ticks. This
+keeps recursive FAT directory scans and SPI reads off the Wi-Fi core, so a
+large offline backlog cannot starve `NetworkTask` or the core idle task.
 
 ## Measurement
 

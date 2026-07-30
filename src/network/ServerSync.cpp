@@ -553,10 +553,12 @@ const char *eventCategory(const std::string &code) {
 
 ServerSync::ServerSync(ConfigService &config, NetworkService &network,
                        ClockService &clock, SdStorage &storage,
+                       StorageCoordinator &storage_coordinator,
                        Diagnostics &diagnostics, IMeter &meter,
                        QueueHandle_t maintenance_queue)
     : config_(config), network_(network), clock_(clock), storage_(storage),
-      diagnostics_(diagnostics), meter_(meter),
+      storage_coordinator_(storage_coordinator), diagnostics_(diagnostics),
+      meter_(meter),
       maintenance_queue_(maintenance_queue) {}
 
 void ServerSync::logTaskCheckpoint(const char *checkpoint) {
@@ -1105,7 +1107,43 @@ bool ServerSync::pushReadings() {
   query.after_sequence = config_.serverAckSequence();
   query.limit = kReadingBatchRecordLimit;
   query.maximum_payload_bytes = sync_policy::kReadingBatchPayloadBytes;
-  HistoryPage page = storage_.readPage(query);
+  if (reading_page_job_id_.empty()) {
+    reading_page_job_id_ = storage_coordinator_.queueHistory(query, false);
+    if (reading_page_job_id_.empty()) {
+      next_reading_push_ms_ =
+          clock_.monotonicMs() +
+          operationRetryDelayMs(reading_retry_attempt_, 0, "readings");
+      PM_LOG_WARN("SYNC", "READ_BATCH_LOAD_FAILED",
+                  "error=PM-SYNC-001 storage_error=storage_queue_unavailable");
+      return false;
+    }
+    next_reading_push_ms_ = clock_.monotonicMs() + 250U;
+    PM_LOG_DEBUG("SYNC", "READ_BATCH_LOAD_QUEUED",
+                 "job=%s owner=StorageTask", reading_page_job_id_.c_str());
+    return true;
+  }
+  HistoryPage page;
+  bool complete = false;
+  if (!storage_coordinator_.historyResult(reading_page_job_id_, page, complete,
+                                          true)) {
+    PM_LOG_WARN("SYNC", "READ_BATCH_LOAD_FAILED",
+                "error=PM-SYNC-001 storage_error=storage_job_expired job=%s",
+                reading_page_job_id_.c_str());
+    reading_page_job_id_.clear();
+    next_reading_push_ms_ =
+        clock_.monotonicMs() +
+        operationRetryDelayMs(reading_retry_attempt_, 0, "readings");
+    return false;
+  }
+  if (!complete) {
+    next_reading_push_ms_ = clock_.monotonicMs() + 250U;
+    return true;
+  }
+  PM_LOG_DEBUG("SYNC", "READ_BATCH_LOAD_COMPLETE",
+               "job=%s records=%u owner=StorageTask",
+               reading_page_job_id_.c_str(),
+               static_cast<unsigned>(page.records.size()));
+  reading_page_job_id_.clear();
   if (!page.ok || page.records.empty()) {
     if (!page.ok) {
       PM_LOG_WARN("SYNC", "READ_BATCH_LOAD_FAILED",
@@ -1277,7 +1315,43 @@ bool ServerSync::pushEvents() {
   query.after_sequence = event_cursor_;
   query.limit = kEventBatchRecordLimit;
   query.maximum_payload_bytes = sync_policy::kEventBatchPayloadBytes;
-  HistoryPage page = storage_.readEvents(query);
+  if (event_page_job_id_.empty()) {
+    event_page_job_id_ = storage_coordinator_.queueHistory(query, true);
+    if (event_page_job_id_.empty()) {
+      next_event_push_ms_ =
+          clock_.monotonicMs() +
+          operationRetryDelayMs(event_retry_attempt_, 0, "events");
+      PM_LOG_WARN("SYNC", "EVENT_BATCH_LOAD_FAILED",
+                  "error=PM-SYNC-001 storage_error=storage_queue_unavailable");
+      return false;
+    }
+    next_event_push_ms_ = clock_.monotonicMs() + 250U;
+    PM_LOG_DEBUG("SYNC", "EVENT_BATCH_LOAD_QUEUED",
+                 "job=%s owner=StorageTask", event_page_job_id_.c_str());
+    return true;
+  }
+  HistoryPage page;
+  bool complete = false;
+  if (!storage_coordinator_.historyResult(event_page_job_id_, page, complete,
+                                          true)) {
+    PM_LOG_WARN("SYNC", "EVENT_BATCH_LOAD_FAILED",
+                "error=PM-SYNC-001 storage_error=storage_job_expired job=%s",
+                event_page_job_id_.c_str());
+    event_page_job_id_.clear();
+    next_event_push_ms_ =
+        clock_.monotonicMs() +
+        operationRetryDelayMs(event_retry_attempt_, 0, "events");
+    return false;
+  }
+  if (!complete) {
+    next_event_push_ms_ = clock_.monotonicMs() + 250U;
+    return true;
+  }
+  PM_LOG_DEBUG("SYNC", "EVENT_BATCH_LOAD_COMPLETE",
+               "job=%s records=%u owner=StorageTask",
+               event_page_job_id_.c_str(),
+               static_cast<unsigned>(page.records.size()));
+  event_page_job_id_.clear();
   if (!page.ok || page.records.empty()) {
     if (!page.ok) {
       next_event_push_ms_ =
@@ -1866,6 +1940,22 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   if (clock_.monotonicMs() - started_ms >= kOverallRequestTimeoutMs) {
     result.error = "request_overall_timeout";
     result.tls_category = "TIMEOUT";
+    return result;
+  }
+  const std::uint32_t pre_tls_stack_bytes =
+      static_cast<std::uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
+  if (pre_tls_stack_bytes <
+      task_config::kMinimumTlsStackHighWaterBytes) {
+    result.error = "sync_stack_reserve_low";
+    result.tls_category = "MEMORY_EXHAUSTED";
+    PM_LOG_ERROR(
+        "TASK", "TLS_STACK_PREFLIGHT_REJECTED",
+        "error=PM-TASK-003 request_id=%lu high_water_bytes=%lu "
+        "minimum_high_water_bytes=%lu action=request_deferred web_ui_preserved=true",
+        static_cast<unsigned long>(request_id),
+        static_cast<unsigned long>(pre_tls_stack_bytes),
+        static_cast<unsigned long>(
+            task_config::kMinimumTlsStackHighWaterBytes));
     return result;
   }
   WiFiClientSecure client;

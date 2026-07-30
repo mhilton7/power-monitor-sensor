@@ -14,14 +14,17 @@
 #include "network/NetworkService.h"
 #include "network/ServerSyncPolicy.h"
 #include "storage/SdStorage.h"
+#include "storage/StorageCoordinator.h"
 
 namespace pm {
 
 class ServerSync {
 public:
   ServerSync(ConfigService &config, NetworkService &network,
-             ClockService &clock, SdStorage &storage, Diagnostics &diagnostics,
-             IMeter &meter, QueueHandle_t maintenance_queue);
+             ClockService &clock, SdStorage &storage,
+             StorageCoordinator &storage_coordinator,
+             Diagnostics &diagnostics, IMeter &meter,
+             QueueHandle_t maintenance_queue);
   void tick();
   void requestImmediateSync();
   SyncMetrics metrics() const;
@@ -59,6 +62,7 @@ private:
   NetworkService &network_;
   ClockService &clock_;
   SdStorage &storage_;
+  StorageCoordinator &storage_coordinator_;
   Diagnostics &diagnostics_;
   IMeter &meter_;
   QueueHandle_t maintenance_queue_{nullptr};
@@ -72,6 +76,8 @@ private:
   std::uint64_t next_event_push_ms_{0};
   std::uint64_t offline_since_ms_{0};
   std::uint64_t event_cursor_{0};
+  std::string reading_page_job_id_;
+  std::string event_page_job_id_;
   std::uint32_t request_sequence_{0};
   std::uint32_t retry_attempt_{0};
   std::uint32_t reading_retry_attempt_{0};

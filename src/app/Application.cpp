@@ -296,7 +296,8 @@ bool Application::begin() {
   }
   sync_ = std::unique_ptr<ServerSync>(
       new (std::nothrow) ServerSync(config_, network_, clock_, storage_,
-                                    diagnostics_, *meter_, maintenance_queue_));
+                                    storage_coordinator_, diagnostics_, *meter_,
+                                    maintenance_queue_));
   http_ = std::unique_ptr<HttpApi>(new (std::nothrow) HttpApi(
       config_, network_, clock_, storage_, storage_coordinator_, diagnostics_,
       *meter_, ota_, maintenance_queue_));

@@ -13,10 +13,19 @@ inline constexpr std::uint32_t kDiagnosticLoggerStackBytes = 4096U;
 inline constexpr std::uint32_t kAggregationStackBytes = 8192U;
 inline constexpr std::uint32_t kStorageStackBytes = 8192U;
 inline constexpr std::uint32_t kNetworkStackBytes = 6144U;
-inline constexpr std::uint32_t kServerSyncStackBytes = 16U * 1024U;
+// mbedTLS certificate verification and HTTP/HMAC framing share this task.
+// Production traces showed fewer than 1 KiB remaining during a heartbeat at
+// 16 KiB, which could corrupt the AsyncWebServer task instead of returning a
+// recoverable request error.
+inline constexpr std::uint32_t kServerSyncStackBytes = 24U * 1024U;
+inline constexpr std::uint32_t kMinimumTlsStackHighWaterBytes = 12U * 1024U;
 inline constexpr std::uint32_t kHealthStackBytes = 6144U;
 inline constexpr std::uint32_t kMaintenanceStackBytes = 12U * 1024U;
-inline constexpr std::uint32_t kSerialCommandStackBytes = 8192U;
+// Serial configuration commands persist and verify the full atomic
+// configuration, including parsing the private Caddy CA with mbedTLS. An
+// 8 KiB task double-faulted in mbedtls_pem_read_buffer while applying a
+// harmless log-level change on production hardware.
+inline constexpr std::uint32_t kSerialCommandStackBytes = 24U * 1024U;
 
 inline constexpr std::uint32_t kMinimumStackMarginPercent = 25U;
 
