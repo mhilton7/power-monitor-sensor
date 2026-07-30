@@ -1,13 +1,10 @@
 {
-  "schema_version": 1,
-  "firmware_version": "1.0.0",
-  "protocol": "pm-protocol/1.0.0",
+  "version": "1.0.0",
+  "channel": "stable",
   "hardware_target": "esp32-s3-n16r8",
-  "image_url": "https://server.example.invalid/releases/1.0.0/firmware.bin",
-  "image_size": 1265120,
-  "image_sha256": "098b38f95fee3a6bb52b0046354d6a2910cb069728e4885bb8d5abad199f4f61",
-  "minimum_rollback_version": "1.0.0",
-  "release_notes": "Power Monitor Sensor Agent 1.0.0: initial pm-protocol/1.0.0 production release. Physical PZEM, microSD, enclosure, and signed-OTA validation remains required on the target installation.",
-  "signature_algorithm": "ecdsa-p256-sha256",
-  "allow_downgrade": false
+  "protocol_min": "pm-protocol/1.0.0",
+  "protocol_max": "pm-protocol/1.0.0",
+  "sha256": "c2bd1b640b246bf3b2a42f5b94c0befe8bf620ff8a1d38a8478c3b7e52b650e0",
+  "signing_key_id": "power-monitor-release-ed25519-v1",
+  "release_notes": "Power Monitor Sensor Agent 1.0.0: pm-protocol/1.0.0 production firmware with physically validated ESP32-S3 heartbeat, TLS, WebUI isolation, and microSD recovery. PZEM mains and signed OTA deployment remain installation-specific validation."
 }
