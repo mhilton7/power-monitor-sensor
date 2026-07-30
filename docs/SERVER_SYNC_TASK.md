@@ -83,7 +83,10 @@ The repair addresses ownership and peak live memory:
   microSD page is queued or the reading retry deadline is pending, the task
   does not fall through into configuration, firmware, or event HTTPS work.
   This prevents mbedTLS from running concurrently with the page scan.
-- TLS and microSD history scans share a high-memory-operation gate.
+- TLS and microSD history scans share a high-memory-operation gate. Server
+  synchronization waits up to five seconds for an already-running bounded
+  storage scan so a harmless memory-owner race does not turn a due heartbeat
+  into a false server outage.
   Authenticated local history remains available through bounded retry, but it
   cannot overlap an active TLS working set. Primary server-sync history is
   queued ahead of local browser history, and local history is deferred while

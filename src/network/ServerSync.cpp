@@ -1826,7 +1826,13 @@ ServerSync::HttpResult ServerSync::request(const char *method,
       single_flight_, metrics_, diagnostics_, clock_, request_id, method,
       endpoint, result.status, result.error, result.problem_code,
       result.tls_category, result.retry_after_ms, result.body, started_ms);
-  HighMemoryLease high_memory_lease(diagnostics_, 0);
+  // StorageTask bounds and bulk-reads every history page, but it may already
+  // own the shared FATFS/TLS memory gate when a heartbeat becomes due.  The
+  // server-sync task is intentionally excluded from the task watchdog because
+  // a verified TLS transaction can also exceed five seconds.  Wait for the
+  // bounded storage operation instead of reporting a false transport outage
+  // and delaying the authoritative heartbeat behind exponential backoff.
+  HighMemoryLease high_memory_lease(diagnostics_, pdMS_TO_TICKS(5000));
   if (!high_memory_lease) {
     result.error = "high_memory_operation_busy";
     result.tls_category = "MEMORY_EXHAUSTED";
