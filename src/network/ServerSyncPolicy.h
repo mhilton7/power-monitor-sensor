@@ -12,7 +12,7 @@ constexpr std::size_t kMaximumResponseBytes = 24U * 1024U;
 constexpr std::size_t kReadingBatchPayloadBytes = 8U * 1024U;
 constexpr std::size_t kEventBatchPayloadBytes = 16U * 1024U;
 constexpr std::uint32_t kMinimumInternalHeapBytes = 80U * 1024U;
-constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 44U * 1024U;
+constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 42U * 1024U;
 constexpr std::uint32_t kMinimumPostResponseInternalHeapBytes = 24U * 1024U;
 
 enum class QueueResult : std::uint8_t {

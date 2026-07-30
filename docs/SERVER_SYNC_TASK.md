@@ -60,7 +60,7 @@ The repair addresses ownership and peak live memory:
 - HTTP response `Content-Length` is required and capped at 24 KiB.
 - Response bytes are read through a bounded stream loop, not `getString()`.
 - TLS admission requires at least 80 KiB of free internal heap and a largest
-  contiguous internal block of at least 44 KiB.
+  contiguous internal block of at least 42 KiB.
 - Local JSON and embedded-asset responses send `Connection: close`. This
   bounds AsyncTCP connection lifetime under concurrent WebUI/health polling
   instead of weakening the TLS admission reserve when clients retain idle
@@ -89,7 +89,9 @@ The repair addresses ownership and peak live memory:
   queued ahead of local browser history, and local history is deferred while
   the first heartbeat or a durable reading backlog is pending. Local result
   pages are limited to 8 KiB each and the TLS preflight requires 80 KiB free
-  internal RAM plus a 44 KiB contiguous block.
+  internal RAM plus a 42 KiB contiguous block. This admits the measured
+  44,020-byte post-boot ESP32-S3 heap layout without returning to the former
+  unsafe 32 KiB reserve.
 - A successful DNS result is cached for the unchanged host and port. TLS still
   receives the configured hostname for SNI and SAN validation. Two consecutive
   cached-address transport failures invalidate the cache and force a fresh
