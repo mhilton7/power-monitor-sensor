@@ -195,6 +195,7 @@ void HttpApi::begin() {
         "'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     response->addHeader("X-Content-Type-Options", "nosniff");
     response->addHeader("Referrer-Policy", "no-referrer");
+    response->addHeader("Connection", "close", false);
     request->send(response);
   });
   server_.on("/assets/app.js", HTTP_GET,
@@ -210,6 +211,7 @@ void HttpApi::begin() {
                response->addHeader("Content-Encoding", "gzip");
                response->addHeader("Cache-Control",
                                    "public, max-age=31536000, immutable");
+               response->addHeader("Connection", "close", false);
                request->send(response);
              });
   server_.on("/assets/style.css", HTTP_GET,
@@ -225,6 +227,7 @@ void HttpApi::begin() {
                response->addHeader("Content-Encoding", "gzip");
                response->addHeader("Cache-Control",
                                    "public, max-age=31536000, immutable");
+               response->addHeader("Connection", "close", false);
                request->send(response);
              });
   server_.onNotFound([this](AsyncWebServerRequest *request) {
@@ -1224,6 +1227,7 @@ void HttpApi::registerReadRoutes() {
                    "Content-Disposition",
                    "attachment; filename=power-monitor-diagnostics.json");
                response->addHeader("Cache-Control", "no-store");
+               response->addHeader("Connection", "close", false);
                request->send(response);
              });
 }
@@ -1294,6 +1298,7 @@ void HttpApi::registerMutationRoutes() {
         response->addHeader(
             "Set-Cookie",
             "pm_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+        response->addHeader("Connection", "close", false);
         request->send(response);
       });
   registerBodyRoute(
@@ -1727,6 +1732,7 @@ void HttpApi::createLocalSession(AsyncWebServerRequest *request,
       std::to_string(config_.config().local_session_timeout_seconds);
   response->addHeader("Set-Cookie", cookie.c_str());
   response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Connection", "close", false);
   diagnostics_.recordHttpStatus(200);
   request->send(response);
   PM_LOG_INFO(
@@ -1763,6 +1769,7 @@ void HttpApi::sendJson(AsyncWebServerRequest *request, const int status,
       request->beginResponse(status, content_type, body.c_str());
   response->addHeader("Cache-Control", "no-store");
   response->addHeader("X-Content-Type-Options", "nosniff");
+  response->addHeader("Connection", "close", false);
   diagnostics_.recordHttpStatus(status);
   request->send(response);
   PM_LOG_DEBUG("HTTP", "LOCAL_RESPONSE",
@@ -1789,6 +1796,7 @@ void HttpApi::sendProblem(AsyncWebServerRequest *request, const int status,
   AsyncWebServerResponse *response =
       request->beginResponse(status, "application/problem+json", body.c_str());
   response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Connection", "close", false);
   request->send(response);
   PM_LOG_WARN("HTTP", "LOCAL_PROBLEM",
               "method=%s route=%s status=%d category=%s error=%s "
@@ -1886,7 +1894,7 @@ HistoryQuery HttpApi::parseHistoryQuery(AsyncWebServerRequest *request) const {
   // The completed page is retained briefly for polling. Bound each local
   // result below the storage layer's general-purpose limit so two abandoned
   // browser jobs cannot exhaust internal RAM.
-  query.maximum_payload_bytes = 24U * 1024U;
+  query.maximum_payload_bytes = 8U * 1024U;
   if (request->hasParam("after_sequence")) {
     query.after_sequence = std::strtoull(
         request->getParam("after_sequence")->value().c_str(), nullptr, 10);

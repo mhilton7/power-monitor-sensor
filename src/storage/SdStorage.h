@@ -21,6 +21,7 @@ struct StorageHealth {
   std::uint64_t used_bytes{0};
   std::uint64_t free_bytes{0};
   std::uint64_t oldest_sequence{0};
+  std::uint64_t oldest_syncable_sequence{0};
   std::uint64_t newest_sequence{0};
   std::uint64_t writes{0};
   std::uint64_t reads{0};
@@ -42,6 +43,12 @@ struct HistoryQuery {
   std::uint64_t to_utc_ms{0};
   std::uint16_t limit{100};
   std::size_t maximum_payload_bytes{48 * 1024};
+  bool require_syncable{false};
+};
+
+struct SequenceRange {
+  std::uint64_t start_sequence{0};
+  std::uint64_t end_sequence{0};
 };
 
 struct HistoryPage {
@@ -53,6 +60,7 @@ struct HistoryPage {
   std::uint64_t next_after_sequence{0};
   std::vector<std::string> records;
   std::string error_code;
+  std::vector<SequenceRange> unavailable_sequence_ranges;
 };
 
 class SdStorage {

@@ -16,6 +16,26 @@ std::uint64_t monotonicMs() {
   return static_cast<std::uint64_t>(esp_timer_get_time()) / 1000U;
 }
 
+class HighMemoryLease final {
+public:
+  explicit HighMemoryLease(Diagnostics &diagnostics,
+                           const TickType_t timeout = pdMS_TO_TICKS(5000))
+      : diagnostics_(diagnostics),
+        acquired_(diagnostics_.acquireHighMemoryOperation(timeout)) {}
+
+  ~HighMemoryLease() {
+    if (acquired_) {
+      diagnostics_.releaseHighMemoryOperation();
+    }
+  }
+
+  explicit operator bool() const { return acquired_; }
+
+private:
+  Diagnostics &diagnostics_;
+  bool acquired_{false};
+};
+
 } // namespace
 
 StorageCoordinator::StorageCoordinator(SdStorage &storage,
@@ -95,7 +115,8 @@ bool StorageCoordinator::enqueueEvent(const std::string &code,
 }
 
 std::string StorageCoordinator::queueHistory(const HistoryQuery &query,
-                                             const bool events) {
+                                             const bool events,
+                                             const bool primary_sync) {
   if (control_queue_ == nullptr || history_mutex_ == nullptr) {
     return {};
   }
@@ -152,8 +173,12 @@ std::string StorageCoordinator::queueHistory(const HistoryQuery &query,
   request->id = id;
   request->query = query;
   request->events = events;
+  request->primary_sync = primary_sync;
   const Message message{Type::History, request};
-  if (xQueueSend(control_queue_, &message, 0) != pdTRUE) {
+  const BaseType_t queued =
+      primary_sync ? xQueueSendToFront(control_queue_, &message, 0)
+                   : xQueueSend(control_queue_, &message, 0);
+  if (queued != pdTRUE) {
     PM_LOG_WARN(
         "QUEUE", "HISTORY_QUEUE_FULL", "error=PM-QUEUE-003 control_depth=%lu",
         static_cast<unsigned long>(uxQueueMessagesWaiting(control_queue_)));
@@ -221,8 +246,33 @@ void StorageCoordinator::taskLoop() {
     if (xQueueReceive(control_queue_, &message, 0) == pdTRUE) {
       if (message.type == Type::History) {
         auto *request = static_cast<HistoryData *>(message.payload);
-        HistoryPage page = request->events ? storage_.readEvents(request->query)
-                                           : storage_.readPage(request->query);
+        HistoryPage page;
+        const SyncMetrics sync = diagnostics_.syncMetrics();
+        const bool local_deferred =
+            !request->primary_sync &&
+            (sync.last_heartbeat_utc_ms == 0U ||
+             sync.durable_reading_backlog);
+        if (local_deferred) {
+          page.error_code = "primary_sync_has_priority";
+          PM_LOG_INFO(
+              "STORAGE", "LOCAL_HISTORY_DEFERRED",
+              "reason=%s events=%s retryable=true",
+              sync.last_heartbeat_utc_ms == 0U ? "first_heartbeat_pending"
+                                               : "reading_backlog_active",
+              request->events ? "true" : "false");
+        } else {
+          HighMemoryLease memory_lease(diagnostics_);
+          if (memory_lease) {
+            page = request->events ? storage_.readEvents(request->query)
+                                   : storage_.readPage(request->query);
+          } else {
+            page.error_code = "high_memory_operation_busy";
+            PM_LOG_WARN(
+                "STORAGE", "HISTORY_MEMORY_GATE_TIMEOUT",
+                "error=PM-STORAGE-014 events=%s retryable=true",
+                request->events ? "true" : "false");
+          }
+        }
         bool published = false;
         const std::uint64_t publish_deadline = monotonicMs() + 2'000U;
         while (!published && monotonicMs() < publish_deadline) {
@@ -231,7 +281,7 @@ void StorageCoordinator::taskLoop() {
               if (result.used && result.id == request->id) {
                 result.page = std::move(page);
                 result.complete = true;
-                result.expires_ms = monotonicMs() + 60'000U;
+                result.expires_ms = monotonicMs() + 15'000U;
                 published = true;
                 break;
               }

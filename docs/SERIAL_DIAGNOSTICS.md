@@ -140,9 +140,11 @@ contains current/minimum heap, largest block, internal free/largest block, and
 free PSRAM.
 
 `MEMORY/HEAP_LOW` with `PM-TLS-006` means the request was rejected before TLS
-because either free internal heap was below 64 KiB or the largest internal
+because either free internal heap was below 60 KiB or the largest internal
 block was below 40 KiB. This is a safe failure: the transport cleanup and
-normal retry path run while the WebUI remains local and responsive.
+normal retry path run while the WebUI remains local and responsive. Ordinary
+local JSON and embedded-asset responses explicitly close after delivery so
+idle AsyncTCP connections cannot erode that TLS reserve during a long soak.
 
 The unauthenticated `GET /api/local/health` liveness route exposes only safe
 counters and booleans needed by the physical soak. It does not contact the
@@ -315,7 +317,7 @@ disabled.
 | `PM-TLS-002` | TLS | CA PEM parse failed | Export a complete PEM certificate chain/CA |
 | `PM-TLS-003` | TLS | Time is not trusted | Resolve NTP before TLS/signed requests |
 | `PM-TLS-004` | TLS | TLS client/handshake setup failed | Check CA, certificate SAN, server port, and TLS compatibility |
-| `PM-TLS-006` | MEMORY/TLS | Internal heap reserve is unsafe for a TLS attempt | Capture sync stack/heap checkpoints and inspect bounded payload ownership |
+| `PM-TLS-006` | MEMORY/TLS | Internal heap reserve or the physically validated 32 KiB contiguous allocation is unsafe for a TLS attempt | Capture sync stack/heap checkpoints and inspect bounded payload ownership |
 | `PM-HTTP-001` | HTTP | Outbound request transport failed | Use its request ID and DNS/TLS category |
 | `PM-HTTP-002` | HTTP | Local request body exceeded the limit | Send at most the documented bounded JSON size |
 | `PM-HTTP-003` | HTTP | Outbound request body exceeded the 24 KiB safety cap | Reduce the bounded batch; do not raise it without heap measurement |

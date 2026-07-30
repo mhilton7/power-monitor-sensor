@@ -1089,9 +1089,10 @@ void Application::reportTasks() const {
 }
 
 void Application::reportMemory() const {
-  const std::uint32_t heap_free = ESP.getFreeHeap();
+  const std::uint32_t heap_free =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   const std::uint32_t heap_largest =
-      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   const std::uint32_t fragmentation =
       heap_free == 0
           ? 0
@@ -1101,7 +1102,9 @@ void Application::reportMemory() const {
   PM_LOG_INFO("MEMORY", "MEMORY_REPORT",
               "heap_total=%lu heap_free=%lu heap_min=%lu heap_largest=%lu "
               "fragmentation_percent=%lu psram_total=%lu psram_free=%lu",
-              static_cast<unsigned long>(ESP.getHeapSize()),
+              static_cast<unsigned long>(
+                  heap_caps_get_total_size(MALLOC_CAP_INTERNAL |
+                                           MALLOC_CAP_8BIT)),
               static_cast<unsigned long>(heap_free),
               static_cast<unsigned long>(ESP.getMinFreeHeap()),
               static_cast<unsigned long>(heap_largest),

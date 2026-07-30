@@ -19,4 +19,4 @@ python -m platformio run -e native-tests -e esp32-s3-simulated-meter
 python -m simulator.server --port 8088
 ```
 
-See [docs/BUILD_AND_FLASH.md](docs/BUILD_AND_FLASH.md), [docs/FIRST_RUN.md](docs/FIRST_RUN.md), [docs/SERVER_CA_CERTIFICATE.md](docs/SERVER_CA_CERTIFICATE.md), and [docs/API.md](docs/API.md). The source is firmware `1.0.0` and protocol `pm-protocol/1.0.0`. Release artifacts are generated into `release/1.0.0/`; private OTA keys must remain outside this repository.
+See [docs/BUILD_AND_FLASH.md](docs/BUILD_AND_FLASH.md), [docs/FIRST_RUN.md](docs/FIRST_RUN.md), [docs/SERVER_CA_CERTIFICATE.md](docs/SERVER_CA_CERTIFICATE.md), and [docs/API.md](docs/API.md). The source is firmware `1.0.1` and protocol `pm-protocol/1.0.0`. Release artifacts are generated into `release/1.0.1/`; private OTA keys must remain outside this repository.

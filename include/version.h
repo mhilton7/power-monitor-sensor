@@ -3,7 +3,7 @@
 #include <cstdint>
 
 #ifndef PM_FIRMWARE_VERSION
-#define PM_FIRMWARE_VERSION "1.0.0"
+#define PM_FIRMWARE_VERSION "1.0.1"
 #endif
 #ifndef PM_PROTOCOL_VERSION
 #define PM_PROTOCOL_VERSION "pm-protocol/1.0.0"

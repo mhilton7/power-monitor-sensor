@@ -18,7 +18,8 @@ public:
   bool enqueueEvent(const std::string &code, const std::string &severity,
                     const std::string &detail, std::uint64_t utc_ms,
                     const std::string &boot_id);
-  std::string queueHistory(const HistoryQuery &query, bool events = false);
+  std::string queueHistory(const HistoryQuery &query, bool events = false,
+                           bool primary_sync = false);
   bool historyResult(const std::string &id, HistoryPage &page, bool &complete,
                      bool consume = false,
                      TickType_t lock_timeout = pdMS_TO_TICKS(25));
@@ -39,6 +40,7 @@ private:
     std::string id;
     HistoryQuery query;
     bool events{false};
+    bool primary_sync{false};
   };
   struct HistoryResult {
     bool used{false};
@@ -57,7 +59,7 @@ private:
   QueueHandle_t write_queue_{nullptr};
   QueueHandle_t control_queue_{nullptr};
   SemaphoreHandle_t history_mutex_{nullptr};
-  // Each result can contain a bounded 24 KiB local API page. Two slots keep
+  // Each local API result is bounded to 12 KiB. Two slots keep
   // concurrent UI/export work possible without allowing abandoned jobs to
   // retain more payload memory than the ESP32-S3 internal heap can sustain.
   std::array<HistoryResult, 2> history_results_{};

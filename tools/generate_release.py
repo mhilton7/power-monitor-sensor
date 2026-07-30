@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import argparse
 import re
+import secrets
 import shutil
 import subprocess
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,11 +23,23 @@ from release_integrity import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def create_staging_directory(release_root: Path, version: str) -> Path:
+    """Create an exclusive staging directory that inherits the release ACL."""
+    for _ in range(10):
+        staging = release_root / f".{version}.{secrets.token_hex(8)}"
+        try:
+            staging.mkdir()
+        except FileExistsError:
+            continue
+        return staging
+    raise RuntimeError("could not allocate a unique release staging directory")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create unsigned reproducible release inputs and binary hashes"
     )
-    parser.add_argument("--version", default="1.0.0")
+    parser.add_argument("--version", default="1.0.1")
     parser.add_argument(
         "--channel",
         choices=("development", "canary", "stable"),
@@ -72,7 +84,12 @@ def main() -> None:
         ) from error
 
     release_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{args.version}.", dir=release_root))
+    # tempfile.mkdtemp applies a private Windows ACL. Renaming that directory
+    # into release/<version> also renames the ACL, which can make generated
+    # artifacts unreadable to the normal repository user. An ordinary
+    # exclusive mkdir inherits the repository ACL while keeping the same
+    # atomic staging-and-replace behavior.
+    staging = create_staging_directory(release_root, args.version)
     try:
         for name in REQUIRED_BUILD_ARTIFACTS:
             shutil.copy2(build / name, staging / name)
@@ -141,7 +158,10 @@ def main() -> None:
             "utilization_percent": round(firmware.stat().st_size * 100 / slot_size, 2),
         }
         write_json_atomic(staging / "size-margin.json", size_evidence)
-        shutil.copy2(ROOT / "LICENSE", staging / "LICENSE")
+        (staging / "LICENSE").write_text(
+            (ROOT / "LICENSE").read_text(encoding="utf-8").rstrip() + "\n",
+            encoding="utf-8",
+        )
         validate_release_bundle(ROOT, staging)
 
         if release.exists():

@@ -35,11 +35,25 @@ from release_integrity import (  # noqa: E402
     validate_release_bundle,
     write_json_atomic,
 )
+from generate_release import create_staging_directory  # noqa: E402
 from sd_format import decode, encode  # noqa: E402
 from sign_firmware import canonical  # noqa: E402
 
 
 class StorageAndOtaTests(unittest.TestCase):
+    def test_release_staging_directory_is_unique_and_inherits_parent(self) -> None:
+        root = case_directory("release-staging")
+        try:
+            first = create_staging_directory(root, "1.0.1")
+            second = create_staging_directory(root, "1.0.1")
+            self.assertEqual(first.parent, root)
+            self.assertEqual(second.parent, root)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.is_dir())
+            self.assertTrue(second.is_dir())
+        finally:
+            shutil.rmtree(root)
+
     def test_release_provenance_rejects_stale_or_incomplete_builds(self) -> None:
         root = case_directory("release-integrity")
         try:
@@ -79,6 +93,11 @@ class StorageAndOtaTests(unittest.TestCase):
                 release / "flash-layout.json", flash_layout_document(release)
             )
             validate_release_bundle(root, release)
+            (source / "main.cpp").write_text("int main() { return 1; }\n")
+            with self.assertRaisesRegex(ReleaseIntegrityError, "stale"):
+                validate_release_bundle(root, release)
+            validate_release_bundle(root, release, require_current_source=False)
+            (source / "main.cpp").write_text("int main() { return 0; }\n")
             (release / "firmware.bin").write_bytes(b"tampered")
             with self.assertRaisesRegex(ReleaseIntegrityError, "build provenance"):
                 validate_release_bundle(root, release)

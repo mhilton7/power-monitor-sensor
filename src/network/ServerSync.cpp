@@ -38,7 +38,7 @@ constexpr std::uint32_t kHttpResponseTimeoutMs = 10'000U;
 constexpr std::uint32_t kHttpBodyTimeoutMs = 5000U;
 constexpr std::uint32_t kOverallRequestTimeoutMs = 30'000U;
 constexpr std::uint32_t kResponseReadPollMs = 10U;
-constexpr std::size_t kReadingBatchRecordLimit = 32U;
+constexpr std::size_t kReadingBatchRecordLimit = 8U;
 constexpr std::size_t kEventBatchRecordLimit = 24U;
 
 struct TransportConfig {
@@ -234,6 +234,26 @@ private:
   const std::uint32_t &retry_after_ms_;
   const std::string &response_body_;
   std::uint64_t started_ms_;
+};
+
+class HighMemoryLease final {
+public:
+  explicit HighMemoryLease(Diagnostics &diagnostics,
+                           const TickType_t timeout = pdMS_TO_TICKS(5000))
+      : diagnostics_(diagnostics),
+        acquired_(diagnostics_.acquireHighMemoryOperation(timeout)) {}
+
+  ~HighMemoryLease() {
+    if (acquired_) {
+      diagnostics_.releaseHighMemoryOperation();
+    }
+  }
+
+  explicit operator bool() const { return acquired_; }
+
+private:
+  Diagnostics &diagnostics_;
+  bool acquired_{false};
 };
 
 bool readBoundedResponseBody(HTTPClient &http, ClockService &clock,
@@ -584,6 +604,8 @@ void ServerSync::tick() {
     logTaskCheckpoint("TASK_START");
   }
   const std::uint64_t now = clock_.monotonicMs();
+  metrics_.durable_reading_backlog =
+      config_.serverAckSequence() < storage_.health().newest_sequence;
   const std::uint64_t reenrollment_generation =
       config_.reenrollmentGeneration();
   if (reenrollment_generation != observed_reenrollment_generation_) {
@@ -766,10 +788,17 @@ void ServerSync::tick() {
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
-  const bool durable_reading_backlog =
-      config_.serverAckSequence() < storage_.health().newest_sequence;
+  const bool durable_reading_backlog = metrics_.durable_reading_backlog;
   if (now >= next_reading_push_ms_ && durable_reading_backlog) {
     immediate_sync_ = !pushReadings();
+    diagnostics_.setSyncMetrics(metrics_);
+    return;
+  }
+  if (!sync_policy::secondaryOperationsAllowed(durable_reading_backlog)) {
+    // A page load may be executing on StorageTask while this task waits for
+    // its short polling deadline. Do not fall through into another TLS
+    // transaction: FATFS scanning plus mbedTLS fragmented internal RAM and
+    // previously invalidated an active Arduino File handle.
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
@@ -1084,6 +1113,19 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
     return false;
   }
   immediate_sync_ = document["immediate_sync_requested"].as<bool>();
+  if (sync_policy::shouldReleaseReadingBackoff(
+          immediate_sync_, acknowledgement, newest_sequence)) {
+    const bool was_deferred = next_reading_push_ms_ > clock_.monotonicMs();
+    next_reading_push_ms_ = 0;
+    PM_LOG_INFO(
+        "SYNC", "READING_BACKOFF_RELEASED",
+        "source=heartbeat_server_request acknowledgement=%llu newest=%llu "
+        "was_deferred=%s retry_attempt=%lu",
+        static_cast<unsigned long long>(acknowledgement),
+        static_cast<unsigned long long>(newest_sequence),
+        was_deferred ? "true" : "false",
+        static_cast<unsigned long>(reading_retry_attempt_));
+  }
   const std::uint32_t recommended =
       document["recommended_heartbeat_interval_seconds"] | 0U;
   heartbeat_interval_override_seconds_ =
@@ -1113,8 +1155,10 @@ bool ServerSync::pushReadings() {
   query.after_sequence = config_.serverAckSequence();
   query.limit = kReadingBatchRecordLimit;
   query.maximum_payload_bytes = sync_policy::kReadingBatchPayloadBytes;
+  query.require_syncable = true;
   if (reading_page_job_id_.empty()) {
-    reading_page_job_id_ = storage_coordinator_.queueHistory(query, false);
+    reading_page_job_id_ =
+        storage_coordinator_.queueHistory(query, false, true);
     if (reading_page_job_id_.empty()) {
       next_reading_push_ms_ =
           clock_.monotonicMs() +
@@ -1150,7 +1194,8 @@ bool ServerSync::pushReadings() {
                reading_page_job_id_.c_str(),
                static_cast<unsigned>(page.records.size()));
   reading_page_job_id_.clear();
-  if (!page.ok || page.records.empty()) {
+  if (!page.ok ||
+      (page.records.empty() && page.unavailable_sequence_ranges.empty())) {
     if (!page.ok) {
       PM_LOG_WARN("SYNC", "READ_BATCH_LOAD_FAILED",
                   "error=PM-SYNC-001 storage_error=%s",
@@ -1165,8 +1210,11 @@ bool ServerSync::pushReadings() {
     return page.ok;
   }
   PM_LOG_INFO("SYNC", "READ_BATCH_BEGIN",
-              "records=%u first_sequence=%llu last_sequence=%llu has_more=%s",
+              "records=%u unavailable_ranges=%u first_sequence=%llu "
+              "last_sequence=%llu has_more=%s",
               static_cast<unsigned>(page.records.size()),
+              static_cast<unsigned>(
+                  page.unavailable_sequence_ranges.size()),
               static_cast<unsigned long long>(page.first_sequence),
               static_cast<unsigned long long>(page.last_sequence),
               page.has_more ? "true" : "false");
@@ -1179,6 +1227,13 @@ bool ServerSync::pushReadings() {
     document["schema_version"] = "reading-batch/1.0.0";
     document["protocol_version"] = version::PROTOCOL;
     document["device_id"] = enrolledDeviceId(config_);
+    JsonArray unavailable =
+        document["unavailable_sequence_ranges"].to<JsonArray>();
+    for (const auto &range : page.unavailable_sequence_ranges) {
+      JsonObject encoded_range = unavailable.add<JsonObject>();
+      encoded_range["start_sequence"] = range.start_sequence;
+      encoded_range["end_sequence"] = range.end_sequence;
+    }
     JsonArray records = document["readings"].to<JsonArray>();
     for (const auto &encoded : page.records) {
       if (!reading_wire::append(records, encoded)) {
@@ -1322,7 +1377,7 @@ bool ServerSync::pushEvents() {
   query.limit = kEventBatchRecordLimit;
   query.maximum_payload_bytes = sync_policy::kEventBatchPayloadBytes;
   if (event_page_job_id_.empty()) {
-    event_page_job_id_ = storage_coordinator_.queueHistory(query, true);
+    event_page_job_id_ = storage_coordinator_.queueHistory(query, true, true);
     if (event_page_job_id_.empty()) {
       next_event_push_ms_ =
           clock_.monotonicMs() +
@@ -1771,6 +1826,15 @@ ServerSync::HttpResult ServerSync::request(const char *method,
       single_flight_, metrics_, diagnostics_, clock_, request_id, method,
       endpoint, result.status, result.error, result.problem_code,
       result.tls_category, result.retry_after_ms, result.body, started_ms);
+  HighMemoryLease high_memory_lease(diagnostics_, 0);
+  if (!high_memory_lease) {
+    result.error = "high_memory_operation_busy";
+    result.tls_category = "MEMORY_EXHAUSTED";
+    PM_LOG_WARN("MEMORY", "HIGH_MEMORY_GATE_TIMEOUT",
+                "error=PM-TLS-006 request_id=%lu retryable=true",
+                static_cast<unsigned long>(request_id));
+    return result;
+  }
   PM_LOG_INFO(
       "HTTP", "HTTP_BEGIN",
       "request_id=%lu method=%s endpoint=%s authenticated=%s request_bytes=%u",
@@ -2228,6 +2292,7 @@ std::string ServerSync::heartbeatBody() const {
   storage_details["free_bytes"] = storage.free_bytes;
   storage_details["last_error"] = storage.last_error;
   document["oldest_stored_sequence"] = storage.oldest_sequence;
+  document["oldest_syncable_sequence"] = storage.oldest_syncable_sequence;
   document["newest_stored_sequence"] = storage.newest_sequence;
   document["server_ack_sequence"] = config_.serverAckSequence();
   document["backlog_estimate"] =

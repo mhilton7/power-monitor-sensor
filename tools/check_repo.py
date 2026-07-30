@@ -173,6 +173,20 @@ def main() -> None:
     if "!PM_RELEASE_BUILD || !PM_PHYSICAL_ADMIN_RECOVERY" not in build_config:
         fail("release/physical administrator recovery compile guard missing")
     platformio = (ROOT / "platformio.ini").read_text(encoding="utf-8")
+    version_header = (ROOT / "include" / "version.h").read_text(encoding="utf-8")
+    platformio_version_match = re.search(
+        r'-DPM_FIRMWARE_VERSION=\\"([^"]+)\\"',
+        platformio,
+    )
+    header_version_match = re.search(
+        r'#define PM_FIRMWARE_VERSION "([^"]+)"',
+        version_header,
+    )
+    if platformio_version_match is None or header_version_match is None:
+        fail("firmware version is missing from platformio.ini or include/version.h")
+    current_firmware_version = platformio_version_match.group(1)
+    if current_firmware_version != header_version_match.group(1):
+        fail("platformio.ini and include/version.h firmware versions disagree")
     release_environment = platformio[
         platformio.index("[env:esp32-s3-release]") : platformio.index(
             "[env:esp32-s3-debug]"
@@ -237,7 +251,13 @@ def main() -> None:
             if path.is_dir() and (path / "firmware.bin").is_file()
         ):
             try:
-                validate_release_bundle(ROOT, release_directory)
+                validate_release_bundle(
+                    ROOT,
+                    release_directory,
+                    require_current_source=(
+                        release_directory.name == current_firmware_version
+                    ),
+                )
             except ReleaseIntegrityError as error:
                 fail(f"invalid or stale release bundle {release_directory}: {error}")
     print("repository policy, JSON, OpenAPI, partition, UI, and secret checks passed")

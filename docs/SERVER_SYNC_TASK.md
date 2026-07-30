@@ -51,14 +51,20 @@ cyclic mutex wait or credential rejection preceded the failure.
 
 The repair addresses ownership and peak live memory:
 
-- Reading pages are limited to 32 records and 20 KiB of stored payload.
+- Reading pages are limited to 8 records and 8 KiB of stored payload. This
+  leaves enough contiguous internal heap for a fresh validated TLS handshake
+  after the ESP32-S3 heap has reached its normal post-handshake layout.
 - Event pages are limited to 24 records and 16 KiB of stored payload.
 - The ArduinoJson tree is destroyed before TLS starts.
 - The page's raw string vector is released before TLS starts.
 - HTTP response `Content-Length` is required and capped at 24 KiB.
 - Response bytes are read through a bounded stream loop, not `getString()`.
-- TLS admission requires at least 64 KiB of free internal heap and a largest
-  contiguous internal block of at least 40 KiB.
+- TLS admission requires at least 80 KiB of free internal heap and a largest
+  contiguous internal block of at least 44 KiB.
+- Local JSON and embedded-asset responses send `Connection: close`. This
+  bounds AsyncTCP connection lifetime under concurrent WebUI/health polling
+  instead of weakening the TLS admission reserve when clients retain idle
+  HTTP/1.1 connections.
 - One `tick()` performs at most one server operation, leaving an idle/yield
   boundary between heartbeat, backlog, event, configuration, and manifest work.
 - In-progress storage jobs do not expire while `StorageTask` is still scanning.
@@ -68,6 +74,22 @@ The repair addresses ownership and peak live memory:
   Events remain on microSD and are uploaded only after the server has advanced
   the reading acknowledgement cursor. This keeps low-priority evidence scans
   from competing with heartbeat TLS or primary measurements.
+- A heartbeat response with `immediate_sync_requested=true` releases the
+  reading retry deadline when the server acknowledgement is behind the newest
+  stored sequence. The retry counter remains intact, so a persistent local or
+  protocol fault stays observable while a repaired server can recover on the
+  next heartbeat without waiting through a stale backoff window.
+- A durable reading backlog is a strict secondary-work barrier. While a
+  microSD page is queued or the reading retry deadline is pending, the task
+  does not fall through into configuration, firmware, or event HTTPS work.
+  This prevents mbedTLS from running concurrently with the page scan.
+- TLS and microSD history scans share a high-memory-operation gate.
+  Authenticated local history remains available through bounded retry, but it
+  cannot overlap an active TLS working set. Primary server-sync history is
+  queued ahead of local browser history, and local history is deferred while
+  the first heartbeat or a durable reading backlog is pending. Local result
+  pages are limited to 8 KiB each and the TLS preflight requires 80 KiB free
+  internal RAM plus a 44 KiB contiguous block.
 - A successful DNS result is cached for the unchanged host and port. TLS still
   receives the configured hostname for SNI and SAN validation. Two consecutive
   cached-address transport failures invalidate the cache and force a fresh

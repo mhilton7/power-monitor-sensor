@@ -186,11 +186,18 @@ def flash_layout_document(release_directory: Path) -> dict[str, Any]:
     }
 
 
-def validate_release_bundle(root: Path, release_directory: Path) -> None:
+def validate_release_bundle(
+    root: Path,
+    release_directory: Path,
+    *,
+    require_current_source: bool = True,
+) -> None:
     provenance = _load_json_object(release_directory / PROVENANCE_FILENAME)
     if provenance.get("environment") != RELEASE_ENVIRONMENT:
         raise ReleaseIntegrityError("release provenance is not from the release build")
-    if provenance.get("source_sha256") != source_fingerprint(root):
+    if require_current_source and provenance.get("source_sha256") != source_fingerprint(
+        root
+    ):
         raise ReleaseIntegrityError(
             "release bundle is stale relative to the current source tree"
         )

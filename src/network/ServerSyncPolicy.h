@@ -9,10 +9,10 @@ namespace pm {
 namespace sync_policy {
 
 constexpr std::size_t kMaximumResponseBytes = 24U * 1024U;
-constexpr std::size_t kReadingBatchPayloadBytes = 20U * 1024U;
+constexpr std::size_t kReadingBatchPayloadBytes = 8U * 1024U;
 constexpr std::size_t kEventBatchPayloadBytes = 16U * 1024U;
-constexpr std::uint32_t kMinimumInternalHeapBytes = 64U * 1024U;
-constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 40U * 1024U;
+constexpr std::uint32_t kMinimumInternalHeapBytes = 80U * 1024U;
+constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 44U * 1024U;
 constexpr std::uint32_t kMinimumPostResponseInternalHeapBytes = 24U * 1024U;
 
 enum class QueueResult : std::uint8_t {
@@ -77,6 +77,15 @@ bool responseAllocationAvailable(std::uint32_t free_internal_bytes,
                                  std::uint32_t largest_internal_block_bytes,
                                  int response_size);
 HttpDisposition classifyHttpStatus(int status);
+constexpr bool shouldReleaseReadingBackoff(
+    const bool immediate_sync_requested, const std::uint64_t acknowledgement,
+    const std::uint64_t newest_stored_sequence) {
+  return immediate_sync_requested && acknowledgement < newest_stored_sequence;
+}
+constexpr bool secondaryOperationsAllowed(
+    const bool durable_reading_backlog) {
+  return !durable_reading_backlog;
+}
 
 } // namespace sync_policy
 } // namespace pm

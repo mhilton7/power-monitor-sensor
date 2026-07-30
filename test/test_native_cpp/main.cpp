@@ -448,6 +448,14 @@ void testServerSyncPolicy() {
             pm::sync_policy::classifyHttpStatus(-1) ==
                 HttpDisposition::TransportFailure,
         "server sync retry policy classifies HTTP and transport outcomes");
+  check(pm::sync_policy::shouldReleaseReadingBackoff(true, 10U, 11U) &&
+            !pm::sync_policy::shouldReleaseReadingBackoff(false, 10U, 11U) &&
+            !pm::sync_policy::shouldReleaseReadingBackoff(true, 11U, 11U) &&
+            !pm::sync_policy::shouldReleaseReadingBackoff(true, 12U, 11U),
+        "server synchronize-now releases reading backoff only for backlog");
+  check(!pm::sync_policy::secondaryOperationsAllowed(true) &&
+            pm::sync_policy::secondaryOperationsAllowed(false),
+        "durable reading backlog blocks secondary TLS operations");
 
   pm::sync_policy::EndpointAddressCache address_cache;
   std::uint32_t cached_address = 99U;

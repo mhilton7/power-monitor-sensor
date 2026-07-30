@@ -10,7 +10,10 @@
 
 namespace pm {
 
-Diagnostics::Diagnostics() { mutex_ = xSemaphoreCreateMutex(); }
+Diagnostics::Diagnostics() {
+  mutex_ = xSemaphoreCreateMutex();
+  high_memory_mutex_ = xSemaphoreCreateMutex();
+}
 
 void Diagnostics::setLatest(const MeasurementSnapshot &sample) {
   if (lock()) {
@@ -85,6 +88,17 @@ SyncMetrics Diagnostics::syncMetrics() const {
   const SyncMetrics copy = sync_;
   unlock();
   return copy;
+}
+
+bool Diagnostics::acquireHighMemoryOperation(const TickType_t timeout) const {
+  return high_memory_mutex_ != nullptr &&
+         xSemaphoreTake(high_memory_mutex_, timeout) == pdTRUE;
+}
+
+void Diagnostics::releaseHighMemoryOperation() const {
+  if (high_memory_mutex_ != nullptr) {
+    xSemaphoreGive(high_memory_mutex_);
+  }
 }
 
 void Diagnostics::recordHttpStatus(const int status,
@@ -266,6 +280,8 @@ std::string Diagnostics::metricsJson(const StorageHealth &storage,
   sync["transactions_failed"] = sync_metrics.transactions_failed;
   sync["in_progress"] = sync_metrics.sync_in_progress;
   sync["pending"] = sync_metrics.sync_pending;
+  sync["durable_reading_backlog"] =
+      sync_metrics.durable_reading_backlog;
   sync["active_request_id"] = sync_metrics.active_request_id;
   sync["stack_allocated_bytes"] = sync_metrics.stack_allocated_bytes;
   sync["stack_high_water_bytes"] = sync_metrics.stack_high_water_bytes;

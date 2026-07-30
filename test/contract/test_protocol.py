@@ -845,12 +845,14 @@ class ProtocolContractTests(unittest.TestCase):
             heartbeat["properties"]["schema_version"]["const"],
             "heartbeat/1.0.0",
         )
+        self.assertIn("oldest_syncable_sequence", heartbeat["properties"])
         batch = contract["components"]["schemas"]["ReadingBatch"]
         self.assertEqual(
             batch["properties"]["schema_version"]["const"],
             "reading-batch/1.0.0",
         )
         self.assertIn("readings", batch["required"])
+        self.assertIn("unavailable_sequence_ranges", batch["properties"])
 
         firmware_manifest = contract["components"]["schemas"]["FirmwareManifest"]
         available_release = firmware_manifest["oneOf"][1]
@@ -887,6 +889,7 @@ class ProtocolContractTests(unittest.TestCase):
             '"heartbeat/1.0.0"',
             '"reading-batch/1.0.0"',
             'document["readings"]',
+            'document["unavailable_sequence_ranges"]',
             'result["highest_contiguous_accepted_sequence"]',
             'report["version"]',
             "single_flight_.consumePending()",
@@ -935,6 +938,11 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertNotIn("WiFi.setSleep(true)", network_source)
 
         local_api_source = (ROOT / "src/api/HttpApi.cpp").read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            local_api_source.count('addHeader("Connection", "close", false)'),
+            8,
+            "local UI/API responses must bound AsyncTCP connection lifetime",
+        )
         local_health_start = local_api_source.index('"/api/local/health"')
         local_health_end = local_api_source.index(
             'server_.on("/api/v1/info"', local_health_start
@@ -1050,6 +1058,24 @@ class ProtocolContractTests(unittest.TestCase):
             "format_attempted=false",
         ):
             self.assertIn(marker, source)
+
+    def test_sd_history_pages_are_globally_sequence_ordered(self) -> None:
+        source = (ROOT / "src/storage/SdStorage.cpp").read_text(encoding="utf-8")
+        for marker in (
+            "std::lower_bound(",
+            "health_.newest_sequence > page.last_sequence",
+            'page.error_code = "record_exceeds_page_limit"',
+            "query.require_syncable && !syncableDocument(document)",
+            "health_.oldest_syncable_sequence",
+            "vTaskDelay(pdMS_TO_TICKS(1));",
+            "page.unavailable_sequence_ranges",
+        ):
+            self.assertIn(marker, source)
+        server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("query.require_syncable = true", server_sync)
+        self.assertIn('document["oldest_syncable_sequence"]', server_sync)
         self.assertIn(
             'SD.begin(pins::SD_CS, spi_, candidate_hz, "/sd", 8, false)', source
         )

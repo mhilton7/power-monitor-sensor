@@ -33,6 +33,7 @@ struct SyncMetrics {
   std::uint32_t largest_internal_block_bytes{0};
   bool sync_in_progress{false};
   bool sync_pending{false};
+  bool durable_reading_backlog{false};
   std::string last_error;
 };
 
@@ -65,6 +66,9 @@ public:
   QueueMetrics queueMetrics() const;
   void setSyncMetrics(const SyncMetrics &metrics);
   SyncMetrics syncMetrics() const;
+  bool acquireHighMemoryOperation(
+      TickType_t timeout = pdMS_TO_TICKS(5000)) const;
+  void releaseHighMemoryOperation() const;
   void recordHttpStatus(int status, bool rejected_signature = false,
                         bool rate_limited = false);
   HttpMetrics httpMetrics() const;
@@ -88,6 +92,7 @@ private:
   void unlock() const;
 
   mutable SemaphoreHandle_t mutex_{nullptr};
+  mutable SemaphoreHandle_t high_memory_mutex_{nullptr};
   MeasurementSnapshot latest_;
   bool has_latest_{false};
   std::uint64_t committed_sequence_{0};

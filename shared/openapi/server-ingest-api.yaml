@@ -229,6 +229,7 @@ components:
         pzem: {$ref: '#/components/schemas/SubsystemHealth'}
         sd: {$ref: '#/components/schemas/SubsystemHealth'}
         oldest_stored_sequence: {type: integer, minimum: 0}
+        oldest_syncable_sequence: {type: integer, minimum: 0, description: Oldest retained durable interval with trustworthy UTC bounds that can be synchronized.}
         newest_stored_sequence: {type: integer, minimum: 0}
         server_ack_sequence: {type: integer, minimum: 0}
         backlog_estimate: {type: integer, minimum: 0}
@@ -287,9 +288,19 @@ components:
         device_id: {type: string, format: uuid}
         readings:
           type: array
-          minItems: 1
           maxItems: 500
           items: {$ref: '#/components/schemas/Reading'}
+        unavailable_sequence_ranges:
+          type: array
+          maxItems: 500
+          description: HMAC-signed retained sequence ranges that cannot be synchronized because their UTC interval was never trustworthy. They remain immutable on the sensor and are never converted into fabricated readings.
+          items:
+            type: object
+            required: [start_sequence, end_sequence]
+            additionalProperties: false
+            properties:
+              start_sequence: {type: integer, minimum: 1}
+              end_sequence: {type: integer, minimum: 1}
     ReadingBatchResponse:
       type: object
       required: [accepted, duplicates, rejected, highest_contiguous_accepted_sequence, missing_ranges]

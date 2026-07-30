@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <ctime>
+#include <limits>
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -77,6 +78,25 @@ const char *cardTypeName(const std::uint8_t type) {
 constexpr std::uint32_t kSdRecoveryClockHz = 400'000U;
 constexpr std::uint32_t kSdFallbackClockHz = 1'000'000U;
 constexpr std::size_t kSdIdleClockBytes = 10U;
+constexpr std::uint64_t kSyncCoverageWindow = 500U;
+constexpr std::size_t kCooperativeScanRecords = 8U;
+
+bool syncableInterval(const std::uint64_t start_utc_ms,
+                      const std::uint64_t end_utc_ms,
+                      const bool time_trusted) {
+  return time_trusted && start_utc_ms != 0U && end_utc_ms > start_utc_ms;
+}
+
+bool syncableRecord(const IntervalRecord &record) {
+  return syncableInterval(record.start_utc_ms, record.end_utc_ms,
+                          record.time_trusted);
+}
+
+bool syncableDocument(const JsonDocument &document) {
+  return syncableInterval(document["start_utc_ms"] | 0ULL,
+                          document["end_utc_ms"] | 0ULL,
+                          document["time_trusted"] | false);
+}
 
 void prepareSdSpiBus(SPIClass &spi) {
   // A CPU/USB reset does not power-cycle the card. If reset interrupted a
@@ -265,6 +285,12 @@ bool SdStorage::append(IntervalRecord &record) {
       health_.oldest_sequence == 0
           ? record.sequence
           : std::min(health_.oldest_sequence, record.sequence);
+  if (syncableRecord(record)) {
+    health_.oldest_syncable_sequence =
+        health_.oldest_syncable_sequence == 0
+            ? record.sequence
+            : std::min(health_.oldest_syncable_sequence, record.sequence);
+  }
   health_.newest_sequence = record.sequence;
   ++next_sequence_;
   ++health_.writes;
@@ -339,7 +365,7 @@ bool SdStorage::appendEvent(const std::string &code,
 
 HistoryPage SdStorage::readPage(const HistoryQuery &query) {
   if (!lock()) {
-    return {false, false, 0, 0, false, 0, {}, "storage_busy"};
+    return {false, false, 0, 0, false, 0, {}, "storage_busy", {}};
   }
   if (query.after_sequence != 0 && health_.oldest_sequence != 0 &&
       query.after_sequence + 1 < health_.oldest_sequence) {
@@ -361,7 +387,7 @@ HistoryPage SdStorage::readPage(const HistoryQuery &query) {
 
 HistoryPage SdStorage::readEvents(const HistoryQuery &query) {
   if (!lock()) {
-    return {false, false, 0, 0, false, 0, {}, "storage_busy"};
+    return {false, false, 0, 0, false, 0, {}, "storage_busy", {}};
   }
   std::vector<std::string> files;
   collectFiles("/POWERMON/events", ".events", files);
@@ -615,6 +641,7 @@ bool SdStorage::recover() {
   PM_LOG_INFO("SD", "RECOVERY_SCAN_BEGIN", "record_files=%u",
               static_cast<unsigned>(files.size()));
   bool all_valid = true;
+  health_.oldest_syncable_sequence = 0;
   for (const auto &path : files) {
     all_valid = recoverFile(path, maximum_sequence) && all_valid;
   }
@@ -639,11 +666,14 @@ bool SdStorage::recover() {
   health_.index_healthy = all_valid;
   PM_LOG_INFO("SD", "RECOVERY_SCAN_COMPLETE",
               "result=%s files=%u oldest_sequence=%llu newest_sequence=%llu "
-              "journal_sequence=%llu next_sequence=%llu repairs=%lu",
+              "oldest_syncable_sequence=%llu journal_sequence=%llu "
+              "next_sequence=%llu repairs=%lu",
               all_valid ? "success" : "corruption_detected",
               static_cast<unsigned>(files.size()),
               static_cast<unsigned long long>(health_.oldest_sequence),
               static_cast<unsigned long long>(health_.newest_sequence),
+              static_cast<unsigned long long>(
+                  health_.oldest_syncable_sequence),
               static_cast<unsigned long long>(journal_sequence),
               static_cast<unsigned long long>(next_sequence_),
               static_cast<unsigned long>(health_.repair_count));
@@ -730,6 +760,13 @@ bool SdStorage::recoverFile(const std::string &path,
     }
     maximum_sequence =
         std::max(maximum_sequence, document["sequence"].as<std::uint64_t>());
+    if (syncableDocument(document)) {
+      const std::uint64_t sequence = document["sequence"].as<std::uint64_t>();
+      health_.oldest_syncable_sequence =
+          health_.oldest_syncable_sequence == 0
+              ? sequence
+              : std::min(health_.oldest_syncable_sequence, sequence);
+    }
     valid_end += line.size();
   }
   file.close();
@@ -869,6 +906,7 @@ void SdStorage::collectFiles(const std::string &directory, const char *suffix,
   if (!root || !root.isDirectory()) {
     return;
   }
+  std::size_t scanned_entries = 0;
   File entry = root.openNextFile();
   while (entry) {
     const std::string path = entry.path();
@@ -879,6 +917,10 @@ void SdStorage::collectFiles(const std::string &directory, const char *suffix,
     } else if (endsWith(path, suffix)) {
       output.push_back(path);
     }
+    ++scanned_entries;
+    if (scanned_entries % kCooperativeScanRecords == 0U) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
     entry = root.openNextFile();
   }
   root.close();
@@ -887,69 +929,173 @@ void SdStorage::collectFiles(const std::string &directory, const char *suffix,
 HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
                                          const HistoryQuery &query,
                                          const char *sequence_field) {
+  struct Candidate {
+    std::uint64_t sequence{0};
+    std::string payload;
+  };
+
   HistoryPage page;
   const std::size_t limit =
       std::min<std::size_t>(query.limit, build::MAX_HISTORY_PAGE);
+  std::vector<Candidate> candidates;
+  candidates.reserve(limit);
+  std::vector<std::uint64_t> unavailable_sequences;
+  if (query.require_syncable) {
+    unavailable_sequences.reserve(kSyncCoverageWindow);
+  }
   std::size_t payload_bytes = 0;
+  std::size_t eligible_records = 0;
+  std::size_t scanned_records = 0;
+  const std::uint64_t scan_ceiling =
+      query.require_syncable &&
+              query.after_sequence <=
+                  std::numeric_limits<std::uint64_t>::max() -
+                      kSyncCoverageWindow
+          ? query.after_sequence + kSyncCoverageWindow
+          : std::numeric_limits<std::uint64_t>::max();
+
+  const auto process_line = [&](const std::string &line) {
+    std::string payload;
+    std::uint32_t checksum = 0;
+    if (!record::decodeEnvelope(line, payload, checksum)) {
+      ++health_.read_failures;
+      page.error_code = "record_corrupt";
+      return false;
+    }
+    JsonDocument document;
+    if (deserializeJson(document, payload)) {
+      ++health_.read_failures;
+      page.error_code = "record_json_invalid";
+      return false;
+    }
+    const std::uint64_t sequence =
+        document[sequence_field].as<std::uint64_t>();
+    const std::uint64_t start =
+        document["start_utc_ms"].is<std::uint64_t>()
+            ? document["start_utc_ms"].as<std::uint64_t>()
+            : document["timestamp_utc_ms"] | 0ULL;
+    ++scanned_records;
+    if (sequence <= query.after_sequence ||
+        (query.from_utc_ms != 0 && start < query.from_utc_ms) ||
+        (query.to_utc_ms != 0 && start > query.to_utc_ms) ||
+        sequence > scan_ceiling) {
+      return true;
+    }
+    if (query.require_syncable && !syncableDocument(document)) {
+      unavailable_sequences.push_back(sequence);
+      return true;
+    }
+    ++eligible_records;
+    if (payload.size() > query.maximum_payload_bytes) {
+      ++health_.read_failures;
+      page.error_code = "record_exceeds_page_limit";
+      return false;
+    }
+
+    const auto position = std::lower_bound(
+        candidates.begin(), candidates.end(), sequence,
+        [](const Candidate &candidate, const std::uint64_t value) {
+          return candidate.sequence < value;
+        });
+    if (candidates.size() >= limit && position == candidates.end()) {
+      return true;
+    }
+    payload_bytes += payload.size();
+    candidates.insert(position, Candidate{sequence, std::move(payload)});
+    while (candidates.size() > limit ||
+           payload_bytes > query.maximum_payload_bytes) {
+      payload_bytes -= candidates.back().payload.size();
+      candidates.pop_back();
+    }
+    ++health_.reads;
+    return true;
+  };
+
   for (const auto &path : paths) {
     File file = SD.open(path.c_str(), FILE_READ);
     if (!file) {
       ++health_.read_failures;
       continue;
     }
-    while (file.available() > 0) {
-      std::string line;
-      while (file.available() > 0 && line.size() <= 8192) {
-        const char value = static_cast<char>(file.read());
-        line.push_back(value);
-        if (value == '\n') {
-          break;
+    std::array<std::uint8_t, 1024> read_buffer{};
+    std::string line;
+    line.reserve(1024);
+    for (;;) {
+      const int read_count = file.read(read_buffer.data(), read_buffer.size());
+      if (read_count < 0) {
+        ++health_.read_failures;
+        page.error_code = "storage_read_failed";
+        file.close();
+        return page;
+      }
+      if (read_count == 0) {
+        break;
+      }
+      for (int index = 0; index < read_count; ++index) {
+        line.push_back(static_cast<char>(read_buffer[index]));
+        if (line.size() > 8192) {
+          ++health_.read_failures;
+          page.error_code = "record_exceeds_line_limit";
+          file.close();
+          return page;
+        }
+        if (read_buffer[index] == '\n') {
+          if (!process_line(line)) {
+            file.close();
+            return page;
+          }
+          line.clear();
         }
       }
-      std::string payload;
-      std::uint32_t checksum = 0;
-      if (!record::decodeEnvelope(line, payload, checksum)) {
-        ++health_.read_failures;
-        page.error_code = "record_corrupt";
-        file.close();
-        return page;
-      }
-      JsonDocument document;
-      if (deserializeJson(document, payload)) {
-        ++health_.read_failures;
-        page.error_code = "record_json_invalid";
-        file.close();
-        return page;
-      }
-      const std::uint64_t sequence =
-          document[sequence_field].as<std::uint64_t>();
-      const std::uint64_t start =
-          document["start_utc_ms"].is<std::uint64_t>()
-              ? document["start_utc_ms"].as<std::uint64_t>()
-              : document["timestamp_utc_ms"] | 0ULL;
-      if (sequence <= query.after_sequence ||
-          (query.from_utc_ms != 0 && start < query.from_utc_ms) ||
-          (query.to_utc_ms != 0 && start > query.to_utc_ms)) {
-        continue;
-      }
-      if (page.records.size() >= limit ||
-          payload_bytes + payload.size() > query.maximum_payload_bytes) {
-        page.has_more = true;
-        file.close();
-        page.ok = true;
-        page.next_after_sequence = page.last_sequence;
-        return page;
-      }
-      if (page.records.empty()) {
-        page.first_sequence = sequence;
-      }
-      page.last_sequence = sequence;
-      payload_bytes += payload.size();
-      page.records.push_back(std::move(payload));
-      ++health_.reads;
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (!line.empty()) {
+      ++health_.read_failures;
+      page.error_code = "storage_read_incomplete";
+      file.close();
+      return page;
     }
     file.close();
   }
+
+  page.records.reserve(candidates.size());
+  for (auto &candidate : candidates) {
+    if (page.records.empty()) {
+      page.first_sequence = candidate.sequence;
+    }
+    page.last_sequence = candidate.sequence;
+    page.records.push_back(std::move(candidate.payload));
+  }
+  if (query.require_syncable && !unavailable_sequences.empty()) {
+    std::sort(unavailable_sequences.begin(), unavailable_sequences.end());
+    unavailable_sequences.erase(
+        std::unique(unavailable_sequences.begin(), unavailable_sequences.end()),
+        unavailable_sequences.end());
+    SequenceRange current{unavailable_sequences.front(),
+                          unavailable_sequences.front()};
+    for (std::size_t index = 1; index < unavailable_sequences.size();
+         ++index) {
+      const std::uint64_t sequence = unavailable_sequences[index];
+      if (sequence == current.end_sequence + 1U) {
+        current.end_sequence = sequence;
+        continue;
+      }
+      page.unavailable_sequence_ranges.push_back(current);
+      current = {sequence, sequence};
+    }
+    page.unavailable_sequence_ranges.push_back(current);
+    if (page.first_sequence == 0U) {
+      page.first_sequence =
+          page.unavailable_sequence_ranges.front().start_sequence;
+    }
+    page.last_sequence =
+        std::max(page.last_sequence,
+                 page.unavailable_sequence_ranges.back().end_sequence);
+  }
+  page.has_more =
+      query.require_syncable
+          ? (health_.newest_sequence > page.last_sequence)
+          : (eligible_records > page.records.size());
   page.ok = true;
   page.next_after_sequence = page.last_sequence;
   return page;
