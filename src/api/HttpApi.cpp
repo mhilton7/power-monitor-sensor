@@ -1002,6 +1002,21 @@ void HttpApi::registerReadRoutes() {
         document["sync_pending"] = sync.sync_pending;
         document["heartbeat_successes"] = sync.heartbeat_successes;
         document["heartbeat_failures"] = sync.heartbeat_failures;
+        document["reading_batch_successes"] = sync.batch_successes;
+        document["reading_batch_failures"] = sync.batch_failures;
+        document["last_sync_utc_ms"] = sync.last_sync_utc_ms;
+        document["server_ack_sequence"] = config_.serverAckSequence();
+        document["oldest_stored_sequence"] = storage.oldest_sequence;
+        document["oldest_syncable_sequence"] =
+            storage.oldest_syncable_sequence;
+        document["newest_stored_sequence"] = storage.newest_sequence;
+        document["durable_backlog_count"] =
+            storage.newest_sequence >= config_.serverAckSequence()
+                ? storage.newest_sequence - config_.serverAckSequence()
+                : 0;
+        document["durable_reading_backlog"] =
+            sync.durable_reading_backlog;
+        document["last_sync_error"] = sync.last_error;
         document["stack_high_water_bytes"] = sync.stack_high_water_bytes;
         document["stack_margin_percent"] = sync.stack_margin_percent;
         document["free_heap_bytes"] = ESP.getFreeHeap();

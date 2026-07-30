@@ -1095,8 +1095,17 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
       document["highest_contiguous_accepted_sequence"].as<std::uint64_t>();
   const std::uint64_t current_ack = config_.serverAckSequence();
   const std::uint64_t newest_sequence = storage_.health().newest_sequence;
+  const sync_policy::AcknowledgementDisposition acknowledgement_disposition =
+      sync_policy::classifyAcknowledgement(current_ack, newest_sequence,
+                                           acknowledgement);
+  const bool sequence_floor_ready =
+      acknowledgement_disposition !=
+          sync_policy::AcknowledgementDisposition::AdvanceSequenceFloor ||
+      storage_.advanceSequenceFloor(acknowledgement);
   const bool acknowledgement_valid =
-      acknowledgement >= current_ack && acknowledgement <= newest_sequence;
+      acknowledgement_disposition !=
+          sync_policy::AcknowledgementDisposition::Invalid &&
+      sequence_floor_ready;
   const bool acknowledgement_persisted =
       acknowledgement_valid && (acknowledgement == current_ack ||
                                 config_.setServerAckSequence(acknowledgement));
@@ -1218,6 +1227,25 @@ bool ServerSync::pushReadings() {
               static_cast<unsigned long long>(page.first_sequence),
               static_cast<unsigned long long>(page.last_sequence),
               page.has_more ? "true" : "false");
+  PM_LOG_INFO(
+      "HISTORY", "sensor.reading_batch_started",
+      "record_count=%u first_sequence=%llu last_sequence=%llu backlog=%llu",
+      static_cast<unsigned>(page.records.size()),
+      static_cast<unsigned long long>(page.first_sequence),
+      static_cast<unsigned long long>(page.last_sequence),
+      static_cast<unsigned long long>(
+          storage_.health().newest_sequence >= config_.serverAckSequence()
+              ? storage_.health().newest_sequence -
+                    config_.serverAckSequence()
+              : 0));
+  if (page.has_more) {
+    PM_LOG_INFO(
+        "HISTORY", "history.backfill_started",
+        "first_sequence=%llu last_sequence=%llu newest_stored=%llu",
+        static_cast<unsigned long long>(page.first_sequence),
+        static_cast<unsigned long long>(page.last_sequence),
+        static_cast<unsigned long long>(storage_.health().newest_sequence));
+  }
   const std::size_t record_count = page.records.size();
   const bool page_has_more = page.has_more;
   logTaskCheckpoint("BEFORE_JSON_BUILD");
@@ -1276,6 +1304,15 @@ bool ServerSync::pushReadings() {
                 static_cast<unsigned long long>(metrics_.batch_failures),
                 static_cast<unsigned long long>(next_reading_push_ms_ -
                                                 clock_.monotonicMs()));
+    PM_LOG_WARN(
+        "HISTORY", "sensor.reading_batch_failed",
+        "record_count=%u first_sequence=%llu last_sequence=%llu status=%d "
+        "problem=%s",
+        static_cast<unsigned>(record_count),
+        static_cast<unsigned long long>(page.first_sequence),
+        static_cast<unsigned long long>(page.last_sequence), response.status,
+        response.problem_code.empty() ? "none"
+                                      : response.problem_code.c_str());
     return false;
   }
   logTaskCheckpoint("BEFORE_RESPONSE_PARSE");
@@ -1367,6 +1404,34 @@ bool ServerSync::pushReadings() {
               static_cast<unsigned long long>(acknowledgement),
               page_has_more ? "true" : "false",
               static_cast<unsigned long long>(metrics_.batch_successes));
+  PM_LOG_INFO(
+      "HISTORY", "sensor.reading_batch_accepted",
+      "record_count=%u first_sequence=%llu last_sequence=%llu "
+      "acknowledged_sequence=%llu backlog=%llu",
+      static_cast<unsigned>(record_count),
+      static_cast<unsigned long long>(page.first_sequence),
+      static_cast<unsigned long long>(page.last_sequence),
+      static_cast<unsigned long long>(acknowledgement),
+      static_cast<unsigned long long>(
+          newest_sequence >= acknowledgement
+              ? newest_sequence - acknowledgement
+              : 0));
+  PM_LOG_INFO(
+      "HISTORY", "sensor.backlog_updated",
+      "acknowledged_sequence=%llu newest_stored=%llu backlog=%llu",
+      static_cast<unsigned long long>(acknowledgement),
+      static_cast<unsigned long long>(newest_sequence),
+      static_cast<unsigned long long>(
+          newest_sequence >= acknowledgement
+              ? newest_sequence - acknowledgement
+              : 0));
+  if (newest_sequence <= acknowledgement) {
+    PM_LOG_INFO(
+        "HISTORY", "history.backfill_completed",
+        "acknowledged_sequence=%llu newest_stored=%llu backlog=0",
+        static_cast<unsigned long long>(acknowledgement),
+        static_cast<unsigned long long>(newest_sequence));
+  }
   logTaskCheckpoint("AFTER_RESPONSE_PARSE");
   return true;
 }

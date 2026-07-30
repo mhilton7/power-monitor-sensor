@@ -94,6 +94,25 @@ void testEnergyAndRecord() {
   result = normalizer.update(0, 0, false, false, 2.5, true);
   check(result.method == std::string("power_integration"),
         "power integration fallback");
+  pm::EnergyNormalizer low_power;
+  result = low_power.update(100, 100, true, true, 1.0 / 720.0, true);
+  check(result.method == std::string("power_integration") &&
+            std::fabs(result.interval_wh - 0.0013888889) < 0.0000001,
+        "unchanged whole-Wh counter preserves five-second one-watt energy");
+  result = low_power.update(100, 101, true, true, 0.0013888889, true);
+  check(result.method == std::string("power_integration") &&
+            std::fabs(result.interval_wh - 0.0013888889) < 0.0000001,
+        "later whole-Wh counter movement reconciles without a duplicate spike");
+  using pm::sync_policy::AcknowledgementDisposition;
+  check(pm::sync_policy::classifyAcknowledgement(5, 5, 8) ==
+            AcknowledgementDisposition::AdvanceSequenceFloor,
+        "authenticated server cursor can safely advance a regressed sequence floor");
+  check(pm::sync_policy::classifyAcknowledgement(5, 8, 7) ==
+            AcknowledgementDisposition::Advance,
+        "acknowledgement advances within retained history");
+  check(pm::sync_policy::classifyAcknowledgement(5, 8, 4) ==
+            AcknowledgementDisposition::Invalid,
+        "acknowledgement cannot regress");
   pm::EnergyNormalizer rollover;
   result = rollover.update(0xFFFFFFF0ULL, 20, true, true, 0.0, false);
   check(result.method == std::string("pzem_rollover") &&

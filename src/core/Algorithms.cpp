@@ -68,8 +68,32 @@ EnergyResult EnergyNormalizer::update(const std::uint64_t raw_start_wh,
   EnergyResult result;
   result.persisted_offset_wh = offset_wh_;
   if (raw_start_valid && raw_end_valid && raw_end_wh >= raw_start_wh) {
-    result.interval_wh = static_cast<double>(raw_end_wh - raw_start_wh);
-    result.method = "pzem_delta";
+    const double counter_delta =
+        static_cast<double>(raw_end_wh - raw_start_wh);
+    if (integration_complete && integrated_power_wh > 0.0 &&
+        counter_delta == 0.0) {
+      // The PZEM register exposes whole Wh. At low loads it can remain
+      // unchanged for many durable intervals even though the exact
+      // monotonic-time power integral is non-zero. Preserve those sub-Wh
+      // intervals and reconcile them when the coarse counter advances.
+      result.interval_wh = integrated_power_wh;
+      result.method = "power_integration";
+      result.quality_flags |= EnergyIntegrated;
+      unreconciled_integrated_wh_ += integrated_power_wh;
+    } else if (counter_delta > 0.0 && unreconciled_integrated_wh_ > 0.0) {
+      result.interval_wh =
+          integration_complete && integrated_power_wh >= 0.0
+              ? integrated_power_wh
+              : std::max(0.0,
+                         counter_delta - unreconciled_integrated_wh_);
+      result.method = "power_integration";
+      result.quality_flags |= EnergyIntegrated;
+      unreconciled_integrated_wh_ =
+          std::max(0.0, unreconciled_integrated_wh_ - counter_delta);
+    } else {
+      result.interval_wh = counter_delta;
+      result.method = "pzem_delta";
+    }
   } else if (raw_start_valid && raw_end_valid && raw_start_wh > 0xFFF00000ULL &&
              raw_end_wh < 0x00100000ULL) {
     constexpr std::uint64_t counter_range = 0x1'0000'0000ULL;
@@ -80,6 +104,7 @@ EnergyResult EnergyNormalizer::update(const std::uint64_t raw_start_wh,
         static_cast<double>(counter_range - raw_start_wh + raw_end_wh);
     result.method = "pzem_rollover";
     result.quality_flags |= CounterRollover;
+    unreconciled_integrated_wh_ = 0.0;
   } else if (raw_start_valid && raw_end_valid) {
     // A decreasing counter is treated as a reset/replacement. Preserve the
     // lifetime total by adding the previous raw value to the durable offset.
@@ -89,6 +114,7 @@ EnergyResult EnergyNormalizer::update(const std::uint64_t raw_start_wh,
     result.interval_wh = static_cast<double>(raw_end_wh);
     result.method = "pzem_reset";
     result.quality_flags |= CounterReset;
+    unreconciled_integrated_wh_ = 0.0;
   } else if (integration_complete && integrated_power_wh >= 0.0) {
     result.interval_wh = integrated_power_wh;
     result.method = "power_integration";

@@ -613,6 +613,37 @@ StorageHealth SdStorage::health() const {
 
 std::uint64_t SdStorage::nextSequence() const { return next_sequence_; }
 
+bool SdStorage::advanceSequenceFloor(
+    const std::uint64_t acknowledged_sequence) {
+  if (!lock()) {
+    return false;
+  }
+  const bool valid =
+      health_.mounted && health_.writable &&
+      acknowledged_sequence >= health_.newest_sequence &&
+      acknowledged_sequence >= next_sequence_ - 1U;
+  if (!valid || acknowledged_sequence == next_sequence_ - 1U) {
+    unlock();
+    return valid;
+  }
+  const bool persisted = persistSequence(acknowledged_sequence);
+  if (persisted) {
+    next_sequence_ = acknowledged_sequence + 1U;
+    PM_LOG_WARN(
+        "SYNC", "SEQUENCE_FLOOR_ADVANCED",
+        "server_ack=%llu newest_stored=%llu next_sequence=%llu "
+        "reason=server_cursor_ahead",
+        static_cast<unsigned long long>(acknowledged_sequence),
+        static_cast<unsigned long long>(health_.newest_sequence),
+        static_cast<unsigned long long>(next_sequence_));
+  } else {
+    ++health_.write_failures;
+    health_.last_error = "sequence_floor_persist_failed";
+  }
+  unlock();
+  return persisted;
+}
+
 bool SdStorage::initializeLayout() {
   static constexpr const char *directories[] = {"/POWERMON",
                                                 "/POWERMON/records",

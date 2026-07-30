@@ -34,6 +34,7 @@ public:
 private:
   std::uint64_t offset_wh_;
   std::uint64_t last_lifetime_wh_{0};
+  double unreconciled_integrated_wh_{0.0};
 };
 
 class IntervalAggregator {

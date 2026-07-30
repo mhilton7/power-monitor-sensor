@@ -311,10 +311,22 @@ void StorageCoordinator::taskLoop() {
                      "sequence=%llu queue_depth=%lu",
                      static_cast<unsigned long long>(pending_record->sequence),
                      static_cast<unsigned long>(depth()));
+        PM_LOG_INFO(
+            "HISTORY", "sensor.sample_recorded",
+            "sequence=%llu measured_start_ms=%llu measured_end_ms=%llu "
+            "power_w=%.5f interval_energy_wh=%.9f time_trusted=%s",
+            static_cast<unsigned long long>(pending_record->sequence),
+            static_cast<unsigned long long>(pending_record->start_utc_ms),
+            static_cast<unsigned long long>(pending_record->end_utc_ms),
+            static_cast<double>(pending_record->avg_active_power_w),
+            pending_record->interval_energy_wh,
+            pending_record->time_trusted ? "true" : "false");
         delete pending_record;
         pending_record = nullptr;
         next_record_retry_ms = 0;
       } else {
+        PM_LOG_WARN("HISTORY", "sensor.sample_rejected",
+                    "reason=storage_append_failed retry_ms=1000");
         if (now >= next_remount_ms) {
           PM_LOG_WARN("STORAGE", "REMOUNT_SCHEDULED",
                       "error=PM-SD-002 retry_interval_ms=30000");

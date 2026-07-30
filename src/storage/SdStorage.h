@@ -81,6 +81,7 @@ public:
   bool prepareRemoval();
   StorageHealth health() const;
   std::uint64_t nextSequence() const;
+  bool advanceSequenceFloor(std::uint64_t acknowledged_sequence);
 
 private:
   bool initializeLayout();

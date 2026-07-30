@@ -29,6 +29,13 @@ enum class HttpDisposition : std::uint8_t {
   TransportFailure,
 };
 
+enum class AcknowledgementDisposition : std::uint8_t {
+  Invalid,
+  Current,
+  Advance,
+  AdvanceSequenceFloor,
+};
+
 // The server-sync task is the only transport owner, but local actions can ask
 // for work from other tasks. This gate makes that boundary explicit: at most
 // one transport is active and at most one pending request is retained.
@@ -77,6 +84,20 @@ bool responseAllocationAvailable(std::uint32_t free_internal_bytes,
                                  std::uint32_t largest_internal_block_bytes,
                                  int response_size);
 HttpDisposition classifyHttpStatus(int status);
+constexpr AcknowledgementDisposition classifyAcknowledgement(
+    const std::uint64_t current_acknowledgement,
+    const std::uint64_t newest_stored_sequence,
+    const std::uint64_t server_acknowledgement) {
+  if (server_acknowledgement < current_acknowledgement) {
+    return AcknowledgementDisposition::Invalid;
+  }
+  if (server_acknowledgement == current_acknowledgement) {
+    return AcknowledgementDisposition::Current;
+  }
+  return server_acknowledgement <= newest_stored_sequence
+             ? AcknowledgementDisposition::Advance
+             : AcknowledgementDisposition::AdvanceSequenceFloor;
+}
 constexpr bool shouldReleaseReadingBackoff(
     const bool immediate_sync_requested, const std::uint64_t acknowledgement,
     const std::uint64_t newest_stored_sequence) {
