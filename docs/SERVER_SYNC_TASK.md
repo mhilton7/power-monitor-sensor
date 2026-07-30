@@ -24,8 +24,9 @@ Application::serverTask
 
 The application task is the sole caller of `tick()`. Timer and WebUI actions
 only set a bounded pending flag; they never call the transport path. Storage
-pages are copied through the storage coordinator before the transaction, and
-their raw records are released before TLS begins.
+pages are loaded asynchronously by `StorageTask` through the storage
+coordinator before the transaction, and their raw records are released before
+TLS begins. `ServerSyncTask` never enumerates FAT directories directly.
 
 ## Why the task is bounded
 
@@ -60,6 +61,13 @@ The repair addresses ownership and peak live memory:
   contiguous internal block of at least 40 KiB.
 - One `tick()` performs at most one server operation, leaving an idle/yield
   boundary between heartbeat, backlog, event, configuration, and manifest work.
+- In-progress storage jobs do not expire while `StorageTask` is still scanning.
+  Only completed, unconsumed results expire after 60 seconds. This prevents a
+  long scan from losing its result handle and being queued repeatedly.
+- Durable measurement backlog has priority over diagnostic-event uploads.
+  Events remain on microSD and are uploaded only after the server has advanced
+  the reading acknowledgement cursor. This keeps low-priority evidence scans
+  from competing with heartbeat TLS or primary measurements.
 - A successful DNS result is cached for the unchanged host and port. TLS still
   receives the configured hostname for SNI and SAN validation. Two consecutive
   cached-address transport failures invalidate the cache and force a fresh

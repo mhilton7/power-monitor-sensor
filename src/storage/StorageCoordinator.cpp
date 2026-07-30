@@ -107,7 +107,12 @@ std::string StorageCoordinator::queueHistory(const HistoryQuery &query,
   }
   HistoryResult *slot = nullptr;
   for (auto &candidate : history_results_) {
-    if (!candidate.used || candidate.expires_ms <= now) {
+    // A FAT directory scan can legitimately take longer than the completed
+    // result retention window. Never recycle an in-progress slot: doing so
+    // loses the only handle to the running StorageTask job and causes the
+    // caller to queue the same expensive scan again.
+    if (!candidate.used ||
+        (candidate.complete && candidate.expires_ms <= now)) {
       slot = &candidate;
       break;
     }
@@ -128,7 +133,10 @@ std::string StorageCoordinator::queueHistory(const HistoryQuery &query,
   *slot = {};
   slot->used = true;
   slot->id = id;
-  slot->expires_ms = now + 60'000U;
+  // expires_ms applies only after StorageTask publishes a completed result.
+  // In-progress jobs remain addressable for however long the bounded scan
+  // takes.
+  slot->expires_ms = 0;
   xSemaphoreGive(history_mutex_);
 
   auto *request = new (std::nothrow) HistoryData{};
@@ -175,7 +183,8 @@ bool StorageCoordinator::historyResult(const std::string &id, HistoryPage &page,
   const std::uint64_t now = monotonicMs();
   bool found = false;
   for (auto &candidate : history_results_) {
-    if (candidate.used && candidate.expires_ms <= now) {
+    if (candidate.used && candidate.complete &&
+        candidate.expires_ms <= now) {
       candidate = {};
       continue;
     }

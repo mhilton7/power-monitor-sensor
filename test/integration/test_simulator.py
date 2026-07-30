@@ -24,7 +24,7 @@ from simulator.server import (
 )
 
 
-def test_token(label: str) -> str:
+def derive_test_token(label: str) -> str:
     """Derive a non-production test value without committing an enrollment token."""
 
     return hashlib.sha256(f"pm-simulator-test:{label}".encode()).hexdigest()
@@ -34,7 +34,7 @@ class SimulatorIntegrationTests(unittest.TestCase):
     now_seconds = 1_800_000_000
 
     def setUp(self) -> None:
-        self.enrollment_token = test_token("primary")
+        self.enrollment_token = derive_test_token("primary")
         self.state = ServerState(
             enrollment_token=self.enrollment_token,
             enrollment_token_expires_at=self.now_seconds + 300,
@@ -455,7 +455,7 @@ class SimulatorIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(list(self.state.devices), [device_id])
 
-        replacement = test_token("replacement")
+        replacement = derive_test_token("replacement")
         self.enrollment_token = replacement
         self.state.issue_enrollment_token(
             replacement, expires_at=self.now_seconds + 300
@@ -550,7 +550,7 @@ class SimulatorIntegrationTests(unittest.TestCase):
 
 class SimulatorTokenInputTests(unittest.TestCase):
     def test_token_loads_from_environment_or_external_file(self) -> None:
-        from_environment = test_token("environment")
+        from_environment = derive_test_token("environment")
         self.assertEqual(
             load_enrollment_token(
                 None,
@@ -560,7 +560,7 @@ class SimulatorTokenInputTests(unittest.TestCase):
             from_environment,
         )
 
-        from_file = test_token("file")
+        from_file = derive_test_token("file")
         token_path = Path("external-enrollment-token.txt")
         with patch.object(Path, "read_text", return_value=from_file + "\n"):
             self.assertEqual(
@@ -576,7 +576,7 @@ class SimulatorTokenInputTests(unittest.TestCase):
             )
 
     def test_cli_does_not_display_or_persist_token(self) -> None:
-        token = test_token("cli")
+        token = derive_test_token("cli")
 
         class FakeServer:
             server_port = 8088

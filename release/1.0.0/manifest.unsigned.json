@@ -4,7 +4,7 @@
   "hardware_target": "esp32-s3-n16r8",
   "protocol_min": "pm-protocol/1.0.0",
   "protocol_max": "pm-protocol/1.0.0",
-  "sha256": "c2bd1b640b246bf3b2a42f5b94c0befe8bf620ff8a1d38a8478c3b7e52b650e0",
+  "sha256": "e012436d5381a7f808b91e680a3f03eacbdf01cf6697feda6c5f77a2088ddfcf",
   "signing_key_id": "power-monitor-release-ed25519-v1",
   "release_notes": "Power Monitor Sensor Agent 1.0.0: pm-protocol/1.0.0 production firmware with physically validated ESP32-S3 heartbeat, TLS, WebUI isolation, and microSD recovery. PZEM mains and signed OTA deployment remain installation-specific validation."
 }

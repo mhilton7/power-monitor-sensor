@@ -766,13 +766,19 @@ void ServerSync::tick() {
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
-  if (now >= next_reading_push_ms_ &&
-      config_.serverAckSequence() < storage_.health().newest_sequence) {
+  const bool durable_reading_backlog =
+      config_.serverAckSequence() < storage_.health().newest_sequence;
+  if (now >= next_reading_push_ms_ && durable_reading_backlog) {
     immediate_sync_ = !pushReadings();
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
-  if (now >= next_event_push_ms_) {
+  // Diagnostic events remain durable on microSD, but they must not compete
+  // with the primary measurement path. In particular, a server that has not
+  // advanced the reading acknowledgement cursor can otherwise trigger a
+  // long FAT directory scan during reading retry backoff and temporarily
+  // consume the heap needed for heartbeat TLS.
+  if (!durable_reading_backlog && now >= next_event_push_ms_) {
     if (pushEvents()) {
       next_event_push_ms_ = now + 30'000U;
     }

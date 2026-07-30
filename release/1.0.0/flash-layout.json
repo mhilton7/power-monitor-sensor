@@ -23,8 +23,8 @@
     {
       "filename": "firmware.bin",
       "offset": "0x20000",
-      "size_bytes": 1509264,
-      "sha256": "c2bd1b640b246bf3b2a42f5b94c0befe8bf620ff8a1d38a8478c3b7e52b650e0"
+      "size_bytes": 1510688,
+      "sha256": "e012436d5381a7f808b91e680a3f03eacbdf01cf6697feda6c5f77a2088ddfcf"
     }
   ]
 }
