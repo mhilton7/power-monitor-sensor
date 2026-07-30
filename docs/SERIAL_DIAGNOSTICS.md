@@ -24,6 +24,22 @@ PuTTY can also open the board's COM port using a Serial connection, speed
 `115200`, 8-N-1, and no flow control. Close PlatformIO, PuTTY, and other serial
 programs before flashing because only one program can own the port.
 
+For a timestamped support capture that redacts sensitive key/value fields
+before both display and storage:
+
+```powershell
+.\tools\diagnostics\Capture-SensorSerial.ps1 `
+  -Port COM6 `
+  -DurationSeconds 180 `
+  -ResetDevice
+```
+
+Omit `-Port` when only one likely ESP32 serial interface is attached. The
+helper returns nonzero when the port cannot be opened or no lines arrive.
+Firmware never prints the setup-AP password, so neither direct consoles nor
+support captures contain it. `SETUP_AP_READY` contains only the non-secret SSID
+and directs the installer to the secure helper described below.
+
 `platformio.ini` enables the supported `time` and
 `esp32_exception_decoder` monitor filters. The exception decoder must use the
 ELF produced by the exact build that was flashed.
@@ -75,16 +91,24 @@ Related stable events include:
   `ASSOCIATED`, `IP_ACQUIRED`, `DISCONNECTED`, `RECONNECT_SCHEDULED`,
   `RECONNECT_SUCCESS`, `SCAN_STARTED`, `SCAN_COMPLETE`,
   `SETUP_AP_DRIVER_STARTED`, `SETUP_AP_DRIVER_STOPPED`,
-  `SETUP_CLIENT_JOINED`, `SETUP_CLIENT_LEFT`, `STATE_TRANSITION`.
-- Network services: `LOOKUP_BEGIN`, `LOOKUP_COMPLETE`, `LOOKUP_FAILED`,
+  `SETUP_AP_READY`, `SETUP_AP_PASSWORD_APPLIED`,
+  `SETUP_AP_PASSWORD_REJECTED`, `SETUP_CLIENT_JOINED`,
+  `SETUP_CLIENT_LEFT`, `STATE_TRANSITION`.
+- Network services: `DNS_BEGIN`, `DNS_SUCCESS`, `DNS_FAILED`,
+  `DNS_CACHE_UPDATED`, `DNS_CACHE_INVALIDATED`,
   `NTP_CONFIGURE`, `TIME_TRUSTED`, `TIME_TRUST_LOST`, `MDNS_START_BEGIN`,
   `MDNS_READY`, `MDNS_START_FAILED`.
-- Server: `REQUEST_BEGIN`, `HANDSHAKE_BEGIN`, `HANDSHAKE_VERIFIED`,
-  `REQUEST_COMPLETE`, `REQUEST_FAILED`, `RETRY_SCHEDULED`,
+- Server transport: `SYNC_BEGIN`, `TCP_BEGIN`, `TCP_CONNECTED`, `TCP_FAILED`,
+  `TLS_BEGIN`, `TLS_SUCCESS`, `TLS_FAILED`, `HTTP_BEGIN`,
+  `HTTP_HEADERS_RECEIVED`, `HTTP_COMPLETE`, `HTTP_FAILED`,
+  `RESPONSE_PARSE_BEGIN`, `RESPONSE_PARSE_COMPLETE`,
+  `SYNC_CLEANUP_BEGIN`, `SYNC_CLEANUP_COMPLETE`, `SYNC_COMPLETE`,
+  `SYNC_FAILED`, `SYNC_TIMEOUT`, `SYNC_RETRY_SCHEDULED`,
   `OFFLINE_SUMMARY`, `SYNC_RESUMED`.
 - Enrollment and synchronization: `ENROLLMENT_BEGIN`,
   `ENROLLMENT_REJECTED`, `CREDENTIAL_SAVE_FAILED`,
-  `ENROLLMENT_COMPLETE`, `HEARTBEAT_BEGIN`, `HEARTBEAT_COMPLETE`,
+  `ENROLLMENT_COMPLETE`, `HEARTBEAT_SCHEDULED`, `HEARTBEAT_BEGIN`,
+  `HEARTBEAT_COMPLETE`, `SYNC_QUEUED`, `SYNC_STARTED`, `SYNC_COALESCED`,
   `READ_BATCH_BEGIN`, `READ_BATCH_COMPLETE`, `EVENT_BATCH_BEGIN`,
   `EVENT_BATCH_COMPLETE`.
 - Local web/authentication: `SERVER_STARTED`, `ROUTE_REGISTERED`,
@@ -93,8 +117,9 @@ Related stable events include:
   `SESSION_CREATED`.
 - Password work: `WORKER_READY`, `JOB_QUEUED`, `JOB_STARTED`,
   `JOB_COMPLETE`, `JOB_SLOW`, `JOB_QUEUE_FULL`.
-- Storage/PZEM: `MOUNT_BEGIN`, `MOUNT_COMPLETE`, `SELF_TEST_COMPLETE`,
-  `RECOVERY_SCAN_BEGIN`, `RECOVERY_SCAN_COMPLETE`, `WRITE_SUMMARY`,
+- Storage/PZEM: `MOUNT_BEGIN`, `MOUNT_ATTEMPT`, `MOUNT_COMPLETE`,
+  `MOUNT_FAILED`, `SELF_TEST_COMPLETE`, `RECOVERY_SCAN_BEGIN`,
+  `RECOVERY_SCAN_COMPLETE`, `WRITE_SUMMARY`,
   `UART_INIT_BEGIN`, `UART_READY`, `READ_FAILED`, `METER_RECOVERED`,
   `PERIODIC_SUMMARY`.
 - Runtime/OTA: `TASK_STARTED`, `TASK_REPORT`, `LOW_STACK`,
@@ -104,6 +129,36 @@ Related stable events include:
 
 Event names are intended to remain stable within firmware 1.x. Additive events
 do not alter `pm-protocol/1.0.0`.
+
+## Server-sync stack and memory checkpoints
+
+`TASK/SYNC_TASK_STACK` is emitted at task startup and around JSON, DNS, TLS,
+HMAC, HTTP, response parsing, and cleanup. `stack_high_water_bytes` is the
+minimum unused stack measured by the pinned ESP-IDF port; it is not a word
+count. `stack_margin_percent` must remain at or above 25. The same record
+contains current/minimum heap, largest block, internal free/largest block, and
+free PSRAM.
+
+`MEMORY/HEAP_LOW` with `PM-TLS-006` means the request was rejected before TLS
+because either free internal heap was below 64 KiB or the largest internal
+block was below 40 KiB. This is a safe failure: the transport cleanup and
+normal retry path run while the WebUI remains local and responsive.
+
+The unauthenticated `GET /api/local/health` liveness route exposes only safe
+counters and booleans needed by the physical soak. It does not contact the
+server, read history, hash a password, or expose identity. See
+`SERVER_SYNC_TASK.md` for the 100-heartbeat monitor command.
+
+The monitor fails if any valid health sample reports disconnected Wi-Fi or
+non-writable storage. It bypasses host HTTP proxies for LAN probes and uses the
+.NET ICMP implementation because Windows PowerShell 5 `Test-Connection` can
+incorrectly report false for this ESP32 even while `ping.exe` succeeds.
+
+After a CPU or USB reset, firmware deasserts the SD chip-select line, sends 80
+idle SPI clocks, and makes at most three non-formatting mount attempts at
+bounded clock rates. This recovers a card left mid-transaction without erasing
+history. `format_on_failure=false` and `format_attempted=false` are deliberate
+diagnostic guarantees, not suggestions to format the card.
 
 ## Serial commands
 
@@ -132,6 +187,12 @@ loglevel fatal
 reconnect
 ```
 
+The provisioning-only command
+`setup-password <16-hex-request-id> <password>` is intentionally
+omitted from the interactive command examples. Never type it into PuTTY,
+PlatformIO Monitor, a shell command, or a transcript. Use the secure helper
+below so the value is hidden and does not enter command history or logs.
+
 `wifi` also starts one asynchronous diagnostic scan. It reports a masked
 configured SSID, match count, strongest RSSI/channel, security code, and
 duplicate BSSID count. It does not continuously scan.
@@ -150,6 +211,45 @@ Restore the production threshold after temporary diagnosis:
 loglevel info
 ```
 
+## Supplying the setup-AP password
+
+On an unconfigured device, wait for:
+
+```text
+[........][INFO ][CONTROL  ][SETUP_AP_READY] ssid="PowerMonitor-Setup-xxxxxx" authentication=wpa2 credential_output=disabled action=run_Set-SensorSetupPassword.ps1_over_physical_usb
+```
+
+The event contains no credential. Close the monitor so only one process owns
+the port, then run from the repository root:
+
+Setup control events use a dedicated bounded serial write path, so persisted
+diagnostic level and a full diagnostic queue cannot suppress the provisioning
+acknowledgment. That path accepts only the generated setup SSID, a random
+16-hex request ID, and fixed status fields; it cannot receive a password.
+
+```powershell
+.\tools\diagnostics\Set-SensorSetupPassword.ps1 -Port COM6
+```
+
+Replace `COM6` with the current ESP32-S3 USB serial port. The script accepts no
+password argument. It prompts twice with `SecureString`, requires 12-63
+printable ASCII characters without whitespace, sends
+`setup-password <request-id> <password>` directly at 115200, and never
+displays or logs the line. The random non-secret request ID binds the reply to
+that submission and prevents stale output from being accepted. The helper
+clears temporary BSTR and mutable character buffers as practical.
+
+The script succeeds only after it sees:
+
+```text
+SETUP_AP_PASSWORD_APPLIED
+```
+
+That event means firmware saved and read-back verified the new password and
+requested an AP restart. `SETUP_AP_PASSWORD_REJECTED`, an unavailable port, or
+a 30-second acknowledgment timeout produces a nonzero exit. Use the password
+you entered to join the non-secret SSID from `SETUP_AP_READY`.
+
 ## Redaction and security
 
 All formatted details pass through one redaction policy before being queued.
@@ -163,8 +263,12 @@ api_key session credential csrf
 
 SSIDs, device identifiers, and MAC addresses are masked by dedicated helpers.
 Request/response bodies, authorization headers, cookies, CSRF values, session
-IDs, enrollment material, HMAC keys, password hashes, salts, and plaintext
-passwords are never logged. TRACE does not relax this policy.
+IDs, enrollment material, HMAC keys, password hashes, salts, administrator
+passwords, station Wi-Fi passwords, and setup-AP passwords are never logged.
+TRACE does not relax this policy. The setup flow exposes only the non-secret
+SSID and state events. The secure Windows helper writes the password directly
+to the serial stream, discards received characters without printing them, and
+reports only the verified applied/rejected event.
 
 Outbound TLS requires a configured CA PEM and normal hostname validation.
 The ESP32 Arduino TLS client cannot implement fingerprint-only validation
@@ -173,12 +277,16 @@ configuration fails closed as `PM-TLS-001`. No firmware path calls
 `setInsecure()`.
 
 Password creation and verification run in `PasswordJobTask`, not in
-`async_tcp`. The web callback copies the bounded request into a four-entry
-queue, returns HTTP 202, and retains no `AsyncWebServerRequest*`. The browser
-polls an opaque 32-hex-character job ID. Results expire after 60 seconds. A
-logical 15-second budget fails closed, jobs slower than 2 seconds produce a
-warning, and queue exhaustion returns HTTP 503. The worker is not registered
-with the task watchdog and the watchdog is never disabled.
+`async_tcp`. The web callback copies the bounded request into an eight-entry
+queue and retains no `AsyncWebServerRequest*`. A client that sends
+`Prefer: respond-async` receives HTTP 202 and polls an opaque
+32-hex-character job ID; compatibility clients that omit the preference
+receive the final response. Results expire after 300 seconds. Only one login
+hash may be pending at a time, so repeated login attempts cannot starve
+configuration work. A logical 15-second budget fails closed, jobs slower than
+2 seconds produce a warning, and queue exhaustion returns HTTP 503. The
+worker is not registered with the task watchdog and the watchdog is never
+disabled.
 
 ## Stable error-code catalog
 
@@ -187,6 +295,10 @@ with the task watchdog and the watchdog is never disabled.
 | `PM-BOOT-001` | BOOT | Repeated abnormal startup resets | Capture the full boot and exact ELF; inspect the prior subsystem/event |
 | `PM-CONFIG-001` | CONFIG | NVS could not open | Check flash/partition integrity; do not erase configuration without a backup |
 | `PM-CONFIG-004` | CONFIG | Configuration validation rejected staging | Correct the named validation category |
+| `PM-CONFIG-006` | CONFIG | Previous configuration was found but could not be restored | Preserve power and capture the full boot log before changing settings |
+| `PM-CONFIG-007` | CONFIG | A valid previous configuration was automatically recovered | Confirm the masked SSID, reconnect, and save settings again only if they need changing |
+| `PM-CONFIG-008` | CONFIG | A persisted configuration failed validation | Use the reported validation category; firmware attempts bounded recovery before defaults |
+| `PM-CONFIG-009` | CONFIG | First-run provisioning failed before durable verification and was rolled back | Read `failed_step`, correct the rejected field or storage condition, and submit again |
 | `PM-WIFI-001` | WIFI | Wi-Fi initialization degraded | Inspect the following driver event and memory state |
 | `PM-WIFI-002` | WIFI | Configured AP not found | Verify the masked SSID and enable 2.4 GHz |
 | `PM-WIFI-003` | WIFI | Authentication/security handshake failed | Re-enter the password and use WPA2-AES or WPA2/WPA3 transition mode |
@@ -203,10 +315,13 @@ with the task watchdog and the watchdog is never disabled.
 | `PM-TLS-002` | TLS | CA PEM parse failed | Export a complete PEM certificate chain/CA |
 | `PM-TLS-003` | TLS | Time is not trusted | Resolve NTP before TLS/signed requests |
 | `PM-TLS-004` | TLS | TLS client/handshake setup failed | Check CA, certificate SAN, server port, and TLS compatibility |
+| `PM-TLS-006` | MEMORY/TLS | Internal heap reserve is unsafe for a TLS attempt | Capture sync stack/heap checkpoints and inspect bounded payload ownership |
 | `PM-HTTP-001` | HTTP | Outbound request transport failed | Use its request ID and DNS/TLS category |
 | `PM-HTTP-002` | HTTP | Local request body exceeded the limit | Send at most the documented bounded JSON size |
+| `PM-HTTP-003` | HTTP | Outbound request body exceeded the 24 KiB safety cap | Reduce the bounded batch; do not raise it without heap measurement |
 | `PM-SERVER-001` | HEARTBEAT | Heartbeat failed | Inspect HTTP status/category and scheduled retry |
 | `PM-SERVER-003` | SERVER | URL/host is invalid or not allowlisted | Correct HTTPS URL or allowlist |
+| `PM-SERVER-004` | SERVER | Unsupported pull/hybrid mode blocked synchronization | Save network settings with outbound push; do not expose the port-80 local API for central polling |
 | `PM-ENROLL-001` | ENROLL | Enrollment was rejected/unreachable | Verify token on the server without printing it |
 | `PM-ENROLL-002` | ENROLL | Enrollment response/protocol invalid | Validate the shared simulator contract |
 | `PM-SYNC-001` | SYNC | Stored batch could not be loaded | Inspect microSD recovery and index state |
@@ -279,9 +394,11 @@ Ambiguous reasons are described as possibilities, not definite root causes.
 
 1. Confirm `time` reports `trusted=true`.
 2. Run `tls` and `server`.
-3. Trigger **Test server TLS** in the local interface.
-4. Capture the matching `request_id` from `DNS/LOOKUP_BEGIN` through
-   `HTTP/REQUEST_COMPLETE` or `HTTP/REQUEST_FAILED`.
+3. Trigger **Test server TLS** in the local interface. The action clears any
+   scheduled server backoff and logs `SERVER/RETRY_BYPASSED` before the new
+   request begins.
+4. Capture the matching `request_id` from `DNS/DNS_BEGIN` through
+   `HTTP/HTTP_COMPLETE` or `HTTP/HTTP_FAILED`, including cleanup.
 5. Do not paste CA private keys; this firmware accepts CA certificates only.
 
 ## Representative output
@@ -296,7 +413,7 @@ Successful boot:
 [000000529][INFO ][PZEM     ][UART_READY] uart=1 protocol=modbus-rtu address=248
 [000003182][INFO ][WIFI     ][STATION_ONLINE] ip=192.168.1.44 rssi_dbm=-57 channel=6
 [000004106][INFO ][TIME     ][TIME_TRUSTED] source=sntp utc_ms=1785304761000
-[000004881][INFO ][HTTP     ][REQUEST_COMPLETE] request_id=1 method=POST endpoint=/api/v1/device-heartbeats status=200 category=success
+[000004881][INFO ][HTTP     ][HTTP_COMPLETE] request_id=1 method=POST endpoint=/api/v1/device-heartbeats status=200 category=success
 [000005063][INFO ][BOOT     ][STARTUP_COMPLETE] storage=ready meter=ready network=ready http=ready
 ```
 
@@ -312,16 +429,34 @@ Wi-Fi failure:
 TLS failure:
 
 ```text
-[000008102][INFO ][TLS      ][HANDSHAKE_BEGIN] request_id=4 host=monitor.local port=8443 ca_validation=true hostname_validation=true
-[000008711][ERROR][HTTP     ][REQUEST_FAILED] error=PM-HTTP-001 request_id=4 method=POST endpoint=/api/v1/device-heartbeats transport=connection refused tls_category=TLS_NEGOTIATION_FAILED elapsed_ms=609
+[000008102][INFO ][TLS      ][TLS_BEGIN] request_id=4 host=monitor.local port=8443 ca_validation=true hostname_validation=true
+[000008711][ERROR][TLS      ][TLS_FAILED] error=PM-TLS-004 request_id=4 host=monitor.local port=8443 category=CONNECTION_REFUSED
+[000008713][DEBUG][SYNC     ][SYNC_CLEANUP_COMPLETE] request_id=4 http_ended=true tls_stopped=true
+[000008715][ERROR][HTTP     ][HTTP_FAILED] error=PM-HTTP-001 request_id=4 method=POST endpoint=/api/v1/device-heartbeats transport=connection refused tls_category=CONNECTION_REFUSED elapsed_ms=613
 ```
+
+Representative physical outage recovery, with identifiers and secrets omitted:
+
+```text
+[002770198][WARN ][SERVER   ][SYNC_RETRY_SCHEDULED] attempt=1 base_ms=1000 delay_ms=1023 maximum_ms=900000
+[002787302][WARN ][SERVER   ][SYNC_RETRY_SCHEDULED] attempt=5 base_ms=16000 delay_ms=18793 maximum_ms=900000
+[002806346][WARN ][SERVER   ][SYNC_RETRY_SCHEDULED] attempt=6 base_ms=32000 delay_ms=38343 maximum_ms=900000
+[002846334][INFO ][HEARTBEAT][HEARTBEAT_COMPLETE] successes=174 ack_sequence=0
+[002962185][INFO ][SYNC     ][READ_BATCH_BEGIN] records=24 first_sequence=46 last_sequence=95
+```
+
+The bounded retries did not reboot the device or interrupt local probes or
+microSD writes. The retained acknowledgement of zero reflects a pre-existing
+server history gap (sequences 1 through 45 are not on the card); firmware does
+not fabricate missing readings or advance the durable cursor without server
+acknowledgement.
 
 Password work:
 
 ```text
-[000041201][INFO ][PASSWORD ][JOB_QUEUED] kind=login queue_depth=1 capacity=4 body=redacted
+[000041201][INFO ][PASSWORD ][JOB_QUEUED] kind=login queue_depth=1 capacity=8 priority=normal body=redacted
 [000041214][INFO ][PASSWORD ][JOB_STARTED] kind=login queue_wait_ms=13 core=1 priority=1 heap_free=201844
-[000043911][INFO ][PASSWORD ][JOB_COMPLETE] kind=login result=failed duration_ms=2697 timeout=false high_water_words=1532
+[000043911][INFO ][PASSWORD ][JOB_COMPLETE] kind=login result=failed duration_ms=2697 timeout=false high_water_bytes=1532
 [000043912][WARN ][PASSWORD ][JOB_SLOW] error=PM-PASSWORD-002 kind=login duration_ms=2697 budget_ms=15000
 ```
 

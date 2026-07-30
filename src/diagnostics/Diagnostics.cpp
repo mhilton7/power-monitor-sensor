@@ -12,7 +12,7 @@ namespace pm {
 
 Diagnostics::Diagnostics() { mutex_ = xSemaphoreCreateMutex(); }
 
-void Diagnostics::setLatest(const MeasurementSnapshot& sample) {
+void Diagnostics::setLatest(const MeasurementSnapshot &sample) {
   if (lock()) {
     latest_ = sample;
     has_latest_ = true;
@@ -20,7 +20,7 @@ void Diagnostics::setLatest(const MeasurementSnapshot& sample) {
   }
 }
 
-bool Diagnostics::latest(MeasurementSnapshot& sample) const {
+bool Diagnostics::latest(MeasurementSnapshot &sample) const {
   if (!lock()) {
     return false;
   }
@@ -71,7 +71,7 @@ QueueMetrics Diagnostics::queueMetrics() const {
   return copy;
 }
 
-void Diagnostics::setSyncMetrics(const SyncMetrics& metrics) {
+void Diagnostics::setSyncMetrics(const SyncMetrics &metrics) {
   if (lock()) {
     sync_ = metrics;
     unlock();
@@ -115,33 +115,36 @@ HttpMetrics Diagnostics::httpMetrics() const {
   return copy;
 }
 
-std::string Diagnostics::healthJson(const ConfigService& config,
-                                    const NetworkStatus& network,
-                                    const ClockService& clock,
-                                    const StorageHealth& storage,
-                                    const MeterMetrics& meter) const {
+std::string Diagnostics::healthJson(const ConfigService &config,
+                                    const NetworkStatus &network,
+                                    const ClockService &clock,
+                                    const StorageHealth &storage,
+                                    const MeterMetrics &meter) const {
   MeasurementSnapshot latest;
   const bool has_latest = this->latest(latest);
   const SyncMetrics sync = syncMetrics();
+  const RuntimeConfig active_config = config.config();
+  const DeviceIdentity identity = config.identity();
   JsonDocument document;
   document["schema_version"] = 1;
   document["protocol"] = version::PROTOCOL;
-  document["device_id"] = config.identity().device_id;
-  document["friendly_name"] = config.config().friendly_name;
-  document["site_id"] = config.config().site_id;
-  document["circuit_id"] = config.config().circuit_id;
-  document["parent_circuit_id"] = config.config().parent_circuit_id;
-  document["measurement_role"] = config.config().measurement_role;
+  document["device_id"] = identity.device_id;
+  document["friendly_name"] = active_config.friendly_name;
+  document["site_id"] = active_config.site_id;
+  document["circuit_id"] = active_config.circuit_id;
+  document["parent_circuit_id"] = active_config.parent_circuit_id;
+  document["measurement_role"] = active_config.measurement_role;
   const bool storage_healthy =
       storage.writable &&
-      storage.free_bytes >= config.config().storage_warning_free_bytes;
-  document["status"] = config.safeMode()
-                           ? "safe_mode"
-                           : (storage_healthy && meter.last_error == MeterError::None
-                                  ? "healthy"
-                                  : "degraded");
+      storage.free_bytes >= active_config.storage_warning_free_bytes;
+  document["status"] =
+      config.safeMode()
+          ? "safe_mode"
+          : (storage_healthy && meter.last_error == MeterError::None
+                 ? "healthy"
+                 : "degraded");
   document["uptime_seconds"] = clock.monotonicMs() / 1000U;
-  document["boot_id"] = config.identity().boot_id;
+  document["boot_id"] = identity.boot_id;
   document["firmware_version"] = version::FIRMWARE;
   document["api_version"] = build::API_VERSION;
   document["safe_mode_reason"] = config.safeModeReason();
@@ -168,26 +171,30 @@ std::string Diagnostics::healthJson(const ConfigService& config,
   storage_json["mounted"] = storage.mounted;
   storage_json["writable"] = storage.writable;
   storage_json["free_bytes"] = storage.free_bytes;
-  storage_json["warning_free_bytes"] = config.config().storage_warning_free_bytes;
+  storage_json["warning_free_bytes"] = active_config.storage_warning_free_bytes;
   storage_json["low_space"] =
-      storage.mounted && storage.free_bytes < config.config().storage_warning_free_bytes;
+      storage.mounted &&
+      storage.free_bytes < active_config.storage_warning_free_bytes;
   storage_json["last_write_utc"] = storage.last_write_utc_ms;
   storage_json["oldest_sequence"] = storage.oldest_sequence;
   storage_json["newest_sequence"] = storage.newest_sequence;
   storage_json["server_ack_sequence"] = config.serverAckSequence();
   JsonObject server = document["server"].to<JsonObject>();
-  server["configured"] = !config.config().server_url.empty();
+  server["configured"] = !active_config.server_url.empty();
   server["reachable"] = network.server_reachable;
   server["authenticated"] = network.server_authenticated;
   server["last_heartbeat_utc"] = sync.last_heartbeat_utc_ms;
+  server["sync_in_progress"] = sync.sync_in_progress;
+  server["sync_pending"] = sync.sync_pending;
+  server["active_request_id"] = sync.active_request_id;
   std::string output;
   serializeJson(document, output);
   return output;
 }
 
-std::string Diagnostics::liveJson(const ConfigService& config,
-                                  const ClockService& clock,
-                                  const char* meter_method) const {
+std::string Diagnostics::liveJson(const ConfigService &config,
+                                  const ClockService &clock,
+                                  const char *meter_method) const {
   MeasurementSnapshot sample;
   if (!latest(sample)) {
     return {};
@@ -219,8 +226,8 @@ std::string Diagnostics::liveJson(const ConfigService& config,
   return output;
 }
 
-std::string Diagnostics::metricsJson(const StorageHealth& storage,
-                                     const MeterMetrics& meter) const {
+std::string Diagnostics::metricsJson(const StorageHealth &storage,
+                                     const MeterMetrics &meter) const {
   const QueueMetrics queue = queueMetrics();
   const SyncMetrics sync_metrics = syncMetrics();
   const HttpMetrics http_metrics = httpMetrics();
@@ -254,6 +261,18 @@ std::string Diagnostics::metricsJson(const StorageHealth& storage,
   sync["batch_successes"] = sync_metrics.batch_successes;
   sync["batch_failures"] = sync_metrics.batch_failures;
   sync["authentication_rejections"] = sync_metrics.authentication_rejections;
+  sync["transactions_started"] = sync_metrics.transactions_started;
+  sync["transactions_completed"] = sync_metrics.transactions_completed;
+  sync["transactions_failed"] = sync_metrics.transactions_failed;
+  sync["in_progress"] = sync_metrics.sync_in_progress;
+  sync["pending"] = sync_metrics.sync_pending;
+  sync["active_request_id"] = sync_metrics.active_request_id;
+  sync["stack_allocated_bytes"] = sync_metrics.stack_allocated_bytes;
+  sync["stack_high_water_bytes"] = sync_metrics.stack_high_water_bytes;
+  sync["stack_margin_percent"] = sync_metrics.stack_margin_percent;
+  sync["free_internal_heap_bytes"] = sync_metrics.free_internal_heap_bytes;
+  sync["largest_internal_block_bytes"] =
+      sync_metrics.largest_internal_block_bytes;
   JsonObject http = document["http"].to<JsonObject>();
   http["requests"] = http_metrics.requests;
   http["status_2xx"] = http_metrics.status_2xx;
@@ -265,11 +284,11 @@ std::string Diagnostics::metricsJson(const StorageHealth& storage,
   return output;
 }
 
-std::string Diagnostics::redactedBundle(const ConfigService& config,
-                                        const NetworkStatus& network,
-                                        const ClockService& clock,
-                                        const StorageHealth& storage,
-                                        const MeterMetrics& meter) const {
+std::string Diagnostics::redactedBundle(const ConfigService &config,
+                                        const NetworkStatus &network,
+                                        const ClockService &clock,
+                                        const StorageHealth &storage,
+                                        const MeterMetrics &meter) const {
   JsonDocument document;
   document["generated_utc"] = clock.utcIso8601();
   JsonDocument health;
@@ -287,9 +306,10 @@ std::string Diagnostics::redactedBundle(const ConfigService& config,
   document["recent_errors"] = recent_errors.as<JsonVariantConst>();
   document["serial_log_level"] =
       diag::levelName(diag::SerialLogger::instance().level());
-  document["serial_log_dropped"] =
-      diag::SerialLogger::instance().dropped();
-  document["redaction"] = "Wi-Fi passwords, enrollment material, HMAC keys, session tokens, setup credentials, and signatures are excluded.";
+  document["serial_log_dropped"] = diag::SerialLogger::instance().dropped();
+  document["redaction"] =
+      "Wi-Fi passwords, enrollment material, HMAC keys, session tokens, setup "
+      "credentials, and signatures are excluded.";
   std::string output;
   serializeJson(document, output);
   return output;
@@ -301,4 +321,4 @@ bool Diagnostics::lock(const TickType_t timeout) const {
 
 void Diagnostics::unlock() const { xSemaphoreGive(mutex_); }
 
-}  // namespace pm
+} // namespace pm

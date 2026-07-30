@@ -17,7 +17,9 @@ class DecodedLine:
 
 
 def encode(record: dict) -> bytes:
-    payload = json.dumps(record, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    payload = json.dumps(record, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
     checksum = binascii.crc32(payload) & 0xFFFFFFFF
     return PREFIX + payload + f"\t{checksum:08x}\n".encode("ascii")
 
@@ -38,4 +40,3 @@ def decode(line: bytes) -> DecodedLine:
     except json.JSONDecodeError as error:
         raise ValueError("json_invalid") from error
     return DecodedLine(record, payload, checksum)
-

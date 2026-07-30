@@ -21,7 +21,9 @@ def records(paths: list[Path]):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate and decode PMR1 microSD history")
+    parser = argparse.ArgumentParser(
+        description="Validate and decode PMR1 microSD history"
+    )
     parser.add_argument("paths", nargs="+", type=Path)
     parser.add_argument("--format", choices=["ndjson", "csv"], default="ndjson")
     args = parser.parse_args()
@@ -33,7 +35,15 @@ def main() -> None:
         for _, _, record in decoded:
             print(json.dumps(record, separators=(",", ":"), ensure_ascii=False))
     else:
-        fields = ["device_id", "sequence", "start_utc", "end_utc", "interval_energy_wh", "energy_method", "quality_flags"]
+        fields = [
+            "device_id",
+            "sequence",
+            "start_utc",
+            "end_utc",
+            "interval_energy_wh",
+            "energy_method",
+            "quality_flags",
+        ]
         writer = csv.DictWriter(sys.stdout, fields, extrasaction="ignore")
         writer.writeheader()
         for _, _, record in decoded:
@@ -42,4 +52,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

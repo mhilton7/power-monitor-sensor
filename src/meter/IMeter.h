@@ -20,16 +20,14 @@ struct MeterMetrics {
 };
 
 class IMeter {
- public:
+public:
   virtual ~IMeter() = default;
   virtual bool begin() = 0;
-  virtual MeasurementSnapshot poll(std::uint64_t utc_ms,
-                                   std::uint64_t monotonic_ms,
-                                   bool time_trusted,
-                                   MeterWatchdogCallback watchdog_callback =
-                                       nullptr) = 0;
+  virtual MeasurementSnapshot
+  poll(std::uint64_t utc_ms, std::uint64_t monotonic_ms, bool time_trusted,
+       MeterWatchdogCallback watchdog_callback = nullptr) = 0;
   virtual MeterMetrics metrics() const = 0;
-  virtual const char* methodName() const = 0;
+  virtual const char *methodName() const = 0;
 };
 
-}  // namespace pm
+} // namespace pm

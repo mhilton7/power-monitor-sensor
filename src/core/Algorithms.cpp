@@ -17,17 +17,16 @@ bool retentionEligible(const bool complete_and_valid, const bool time_trusted,
          cutoff_utc_ms != 0 && newest_utc_ms < cutoff_utc_ms;
 }
 
-std::uint32_t validateMeasurement(MeasurementSnapshot& sample,
-                                  const Limits& limits) {
+std::uint32_t validateMeasurement(MeasurementSnapshot &sample,
+                                  const Limits &limits) {
   std::uint32_t flags = sample.time_trusted ? QualityNone : TimeUntrusted;
-  const bool finite = std::isfinite(sample.voltage_v) &&
-                      std::isfinite(sample.current_a) &&
-                      std::isfinite(sample.active_power_w) &&
-                      std::isfinite(sample.frequency_hz) &&
-                      std::isfinite(sample.power_factor);
+  const bool finite =
+      std::isfinite(sample.voltage_v) && std::isfinite(sample.current_a) &&
+      std::isfinite(sample.active_power_w) &&
+      std::isfinite(sample.frequency_hz) && std::isfinite(sample.power_factor);
   if (!finite || sample.voltage_v < 0.0F || sample.current_a < 0.0F ||
       sample.active_power_w < 0.0F || sample.power_factor < 0.0F ||
-      sample.power_factor > 1.01F) {
+      sample.power_factor > 1.0F) {
     sample.valid = false;
     sample.error = MeterError::ImplausibleValue;
     sample.quality_flags = flags | MeterGap;
@@ -43,13 +42,15 @@ std::uint32_t validateMeasurement(MeasurementSnapshot& sample,
   }
   if (sample.current_a >= limits.ct_rating_a * limits.ct_fault_fraction) {
     flags |= CtOverRange;
-  } else if (sample.current_a >= limits.ct_rating_a * limits.ct_critical_fraction) {
+  } else if (sample.current_a >=
+             limits.ct_rating_a * limits.ct_critical_fraction) {
     flags |= CtWarning90;
-  } else if (sample.current_a >= limits.ct_rating_a * limits.ct_warning_fraction) {
+  } else if (sample.current_a >=
+             limits.ct_rating_a * limits.ct_warning_fraction) {
     flags |= CtWarning80;
   }
-  sample.valid = (flags & (VoltageOutOfRange | FrequencyOutOfRange |
-                           CtOverRange)) == 0U;
+  sample.valid =
+      (flags & (VoltageOutOfRange | FrequencyOutOfRange | CtOverRange)) == 0U;
   sample.error = sample.valid ? MeterError::None : MeterError::ImplausibleValue;
   sample.quality_flags = flags | (sample.valid ? 0U : MeterGap);
   return sample.quality_flags;
@@ -58,22 +59,25 @@ std::uint32_t validateMeasurement(MeasurementSnapshot& sample,
 EnergyNormalizer::EnergyNormalizer(const std::uint64_t persisted_offset_wh)
     : offset_wh_(persisted_offset_wh), last_lifetime_wh_(persisted_offset_wh) {}
 
-EnergyResult EnergyNormalizer::update(
-    const std::uint64_t raw_start_wh, const std::uint64_t raw_end_wh,
-    const bool raw_start_valid, const bool raw_end_valid,
-    const double integrated_power_wh, const bool integration_complete) {
+EnergyResult EnergyNormalizer::update(const std::uint64_t raw_start_wh,
+                                      const std::uint64_t raw_end_wh,
+                                      const bool raw_start_valid,
+                                      const bool raw_end_valid,
+                                      const double integrated_power_wh,
+                                      const bool integration_complete) {
   EnergyResult result;
   result.persisted_offset_wh = offset_wh_;
   if (raw_start_valid && raw_end_valid && raw_end_wh >= raw_start_wh) {
     result.interval_wh = static_cast<double>(raw_end_wh - raw_start_wh);
     result.method = "pzem_delta";
-  } else if (raw_start_valid && raw_end_valid &&
-             raw_start_wh > 0xFFF00000ULL && raw_end_wh < 0x00100000ULL) {
+  } else if (raw_start_valid && raw_end_valid && raw_start_wh > 0xFFF00000ULL &&
+             raw_end_wh < 0x00100000ULL) {
     constexpr std::uint64_t counter_range = 0x1'0000'0000ULL;
     offset_wh_ += counter_range;
     result.persisted_offset_wh = offset_wh_;
     result.offset_changed = true;
-    result.interval_wh = static_cast<double>(counter_range - raw_start_wh + raw_end_wh);
+    result.interval_wh =
+        static_cast<double>(counter_range - raw_start_wh + raw_end_wh);
     result.method = "pzem_rollover";
     result.quality_flags |= CounterRollover;
   } else if (raw_start_valid && raw_end_valid) {
@@ -97,8 +101,9 @@ EnergyResult EnergyNormalizer::update(
   if (raw_end_valid) {
     result.lifetime_wh = offset_wh_ + raw_end_wh;
   } else {
-    result.lifetime_wh = last_lifetime_wh_ +
-                         static_cast<std::uint64_t>(std::llround(result.interval_wh));
+    result.lifetime_wh =
+        last_lifetime_wh_ +
+        static_cast<std::uint64_t>(std::llround(result.interval_wh));
   }
   result.lifetime_wh = std::max(result.lifetime_wh, last_lifetime_wh_);
   last_lifetime_wh_ = result.lifetime_wh;
@@ -122,7 +127,8 @@ void IntervalAggregator::reset(const std::uint64_t start_utc_ms,
   sum_voltage_ = sum_current_ = sum_power_ = sum_pf_ = sum_frequency_ = 0.0;
   integrated_wh_ = 0.0;
   min_voltage_ = min_current_ = min_power_ = std::numeric_limits<float>::max();
-  max_voltage_ = max_current_ = max_power_ = std::numeric_limits<float>::lowest();
+  max_voltage_ = max_current_ = max_power_ =
+      std::numeric_limits<float>::lowest();
   raw_start_wh_ = raw_end_wh_ = previous_monotonic_ms_ = 0;
   previous_power_w_ = 0.0F;
   raw_start_valid_ = raw_end_valid_ = previous_power_valid_ = false;
@@ -131,9 +137,10 @@ void IntervalAggregator::reset(const std::uint64_t start_utc_ms,
   all_times_trusted_ = true;
 }
 
-void IntervalAggregator::add(const MeasurementSnapshot& sample) {
+void IntervalAggregator::add(const MeasurementSnapshot &sample) {
   if (last_sample_seen_ && sample.monotonic_ms <= last_sample_monotonic_ms_) {
-    if (sample.monotonic_ms < last_sample_monotonic_ms_) quality_ |= MeterGap;
+    if (sample.monotonic_ms < last_sample_monotonic_ms_)
+      quality_ |= MeterGap;
     return;
   }
   last_sample_seen_ = true;
@@ -165,10 +172,12 @@ void IntervalAggregator::add(const MeasurementSnapshot& sample) {
   raw_end_wh_ = sample.raw_energy_wh;
   raw_end_valid_ = true;
   if (previous_power_valid_ && sample.monotonic_ms > previous_monotonic_ms_) {
-    const double hours = static_cast<double>(sample.monotonic_ms - previous_monotonic_ms_) /
-                         3'600'000.0;
+    const double hours =
+        static_cast<double>(sample.monotonic_ms - previous_monotonic_ms_) /
+        3'600'000.0;
     integrated_wh_ +=
-        (static_cast<double>(previous_power_w_) + sample.active_power_w) * 0.5 * hours;
+        (static_cast<double>(previous_power_w_) + sample.active_power_w) * 0.5 *
+        hours;
   }
   previous_monotonic_ms_ = sample.monotonic_ms;
   previous_power_w_ = sample.active_power_w;
@@ -177,11 +186,13 @@ void IntervalAggregator::add(const MeasurementSnapshot& sample) {
 
 bool IntervalAggregator::hasSamples() const { return samples_ != 0; }
 
-IntervalRecord IntervalAggregator::finish(
-    const std::string& device_id, const std::string& friendly_name,
-    const std::string& boot_id, const std::string& firmware_version,
-    const std::uint64_t end_utc_ms, const std::uint64_t end_monotonic_ms,
-    EnergyNormalizer& energy) {
+IntervalRecord IntervalAggregator::finish(const std::string &device_id,
+                                          const std::string &friendly_name,
+                                          const std::string &boot_id,
+                                          const std::string &firmware_version,
+                                          const std::uint64_t end_utc_ms,
+                                          const std::uint64_t end_monotonic_ms,
+                                          EnergyNormalizer &energy) {
   IntervalRecord record;
   record.device_id = device_id;
   record.friendly_name = friendly_name;
@@ -191,7 +202,31 @@ IntervalRecord IntervalAggregator::finish(
   record.end_utc_ms = end_utc_ms;
   record.start_monotonic_ms = start_monotonic_ms_;
   record.end_monotonic_ms = end_monotonic_ms;
-  record.time_trusted = all_times_trusted_ && start_utc_ms_ != 0 && end_utc_ms != 0;
+  record.time_trusted =
+      all_times_trusted_ && start_utc_ms_ != 0 && end_utc_ms != 0;
+  if (!record.time_trusted) {
+    // Keep untrusted records wire-valid without pretending their time is
+    // trusted. A mid-interval SNTP step must not create a 1970-to-present
+    // interval that the server can never accept. Monotonic duration is the
+    // authoritative duration; anchor it to the best available end estimate.
+    constexpr std::uint64_t kFallbackEpochMs = 1'704'067'200'000ULL;
+    constexpr std::uint64_t kMaximumWireIntervalMs = 86'400'000ULL;
+    const std::uint64_t duration_ms =
+        end_monotonic_ms >= start_monotonic_ms_
+            ? std::min(end_monotonic_ms - start_monotonic_ms_,
+                       kMaximumWireIntervalMs)
+            : 0U;
+    const std::uint64_t minimum_end =
+        kFallbackEpochMs + std::max(end_monotonic_ms, duration_ms);
+    const std::uint64_t anchor_end = std::max(
+        std::max(end_utc_ms, start_utc_ms_ + duration_ms), minimum_end);
+    record.end_utc_ms = anchor_end;
+    record.start_utc_ms =
+        anchor_end > duration_ms ? anchor_end - duration_ms : kFallbackEpochMs;
+    if (record.end_utc_ms <= record.start_utc_ms) {
+      record.end_utc_ms = record.start_utc_ms + 1U;
+    }
+  }
   record.sample_count = samples_;
   record.valid_sample_count = valid_samples_;
   record.ct_rating_a = limits_.ct_rating_a;
@@ -214,8 +249,8 @@ IntervalRecord IntervalAggregator::finish(
   record.raw_energy_end_wh = raw_end_wh_;
   const bool integration_complete = samples_ > 1 && valid_samples_ == samples_;
   const EnergyResult result =
-      energy.update(raw_start_wh_, raw_end_wh_, raw_start_valid_, raw_end_valid_,
-                    integrated_wh_, integration_complete);
+      energy.update(raw_start_wh_, raw_end_wh_, raw_start_valid_,
+                    raw_end_valid_, integrated_wh_, integration_complete);
   record.interval_energy_wh = result.interval_wh;
   record.device_lifetime_energy_wh = result.lifetime_wh;
   record.energy_method = result.method;
@@ -223,4 +258,4 @@ IntervalRecord IntervalAggregator::finish(
   return record;
 }
 
-}  // namespace pm
+} // namespace pm

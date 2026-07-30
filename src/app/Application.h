@@ -8,6 +8,7 @@
 
 #include "api/HttpApi.h"
 #include "app/Maintenance.h"
+#include "build_config.h"
 #include "config/ConfigService.h"
 #include "core/Algorithms.h"
 #include "diagnostics/Diagnostics.h"
@@ -22,19 +23,19 @@
 namespace pm {
 
 class Application {
- public:
+public:
   Application();
   bool begin();
 
- private:
-  static void meterTaskEntry(void* context);
-  static void aggregationTaskEntry(void* context);
-  static void storageTaskEntry(void* context);
-  static void networkTaskEntry(void* context);
-  static void syncTaskEntry(void* context);
-  static void healthTaskEntry(void* context);
-  static void maintenanceTaskEntry(void* context);
-  static void serialCommandTaskEntry(void* context);
+private:
+  static void meterTaskEntry(void *context);
+  static void aggregationTaskEntry(void *context);
+  static void storageTaskEntry(void *context);
+  static void networkTaskEntry(void *context);
+  static void syncTaskEntry(void *context);
+  static void healthTaskEntry(void *context);
+  static void maintenanceTaskEntry(void *context);
+  static void serialCommandTaskEntry(void *context);
   void meterTask();
   void aggregationTask();
   void networkTask();
@@ -42,11 +43,11 @@ class Application {
   void healthTask();
   void maintenanceTask();
   void serialCommandTask();
-  void handleSerialCommand(const std::string& command);
+  void handleSerialCommand(std::string &command);
   void reportStatus() const;
   void reportTasks() const;
   void reportMemory() const;
-  void executeMaintenance(const MaintenanceMessage& message);
+  void executeMaintenance(const MaintenanceMessage &message);
   bool createTasks();
 
   ConfigService config_;
@@ -77,6 +78,11 @@ class Application {
   std::atomic<std::uint64_t> sync_progress_{0};
   std::uint64_t sample_dropped_{0};
   std::uint64_t action_dropped_{0};
+#if PM_PHYSICAL_ADMIN_RECOVERY
+  std::string admin_recovery_request_id_;
+  std::uint64_t admin_recovery_deadline_ms_{0};
+  bool admin_recovery_complete_{false};
+#endif
 };
 
-}  // namespace pm
+} // namespace pm

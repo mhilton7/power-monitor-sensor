@@ -4,19 +4,19 @@ namespace pm {
 namespace pzem {
 namespace {
 
-std::uint16_t readU16Be(const std::uint8_t* data) {
-  return static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[0]) << 8U) |
-                                    data[1]);
+std::uint16_t readU16Be(const std::uint8_t *data) {
+  return static_cast<std::uint16_t>(
+      (static_cast<std::uint16_t>(data[0]) << 8U) | data[1]);
 }
 
-std::uint32_t readRegisterPair(const std::uint8_t* low_register) {
+std::uint32_t readRegisterPair(const std::uint8_t *low_register) {
   return static_cast<std::uint32_t>(readU16Be(low_register)) |
          (static_cast<std::uint32_t>(readU16Be(low_register + 2)) << 16U);
 }
 
-}  // namespace
+} // namespace
 
-std::uint16_t modbusCrc16(const std::uint8_t* data, const std::size_t length) {
+std::uint16_t modbusCrc16(const std::uint8_t *data, const std::size_t length) {
   std::uint16_t crc = 0xFFFFU;
   for (std::size_t pos = 0; pos < length; ++pos) {
     crc ^= data[pos];
@@ -31,19 +31,19 @@ std::uint16_t modbusCrc16(const std::uint8_t* data, const std::size_t length) {
   return crc;
 }
 
-std::array<std::uint8_t, REQUEST_SIZE> buildReadMeasurementRequest(
-    const std::uint8_t address) {
-  std::array<std::uint8_t, REQUEST_SIZE> request{
-      address, 0x04, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00};
+std::array<std::uint8_t, REQUEST_SIZE>
+buildReadMeasurementRequest(const std::uint8_t address) {
+  std::array<std::uint8_t, REQUEST_SIZE> request{address, 0x04, 0x00, 0x00,
+                                                 0x00,    0x0A, 0x00, 0x00};
   const std::uint16_t crc = modbusCrc16(request.data(), request.size() - 2);
   request[6] = static_cast<std::uint8_t>(crc & 0xFFU);
   request[7] = static_cast<std::uint8_t>(crc >> 8U);
   return request;
 }
 
-MeterError parseMeasurementResponse(const std::uint8_t* data,
+MeterError parseMeasurementResponse(const std::uint8_t *data,
                                     const std::size_t length,
-                                    MeasurementSnapshot& result,
+                                    MeasurementSnapshot &result,
                                     const std::uint8_t address) {
   result.valid = false;
   if (length < 5) {
@@ -68,9 +68,10 @@ MeterError parseMeasurementResponse(const std::uint8_t* data,
   if (expected_crc != actual_crc) {
     return MeterError::CrcMismatch;
   }
-  const std::uint8_t* registers = data + 3;
+  const std::uint8_t *registers = data + 3;
   result.voltage_v = static_cast<float>(readU16Be(registers)) * 0.1F;
-  result.current_a = static_cast<float>(readRegisterPair(registers + 2)) * 0.001F;
+  result.current_a =
+      static_cast<float>(readRegisterPair(registers + 2)) * 0.001F;
   result.active_power_w =
       static_cast<float>(readRegisterPair(registers + 6)) * 0.1F;
   result.raw_energy_wh = readRegisterPair(registers + 10);
@@ -81,5 +82,5 @@ MeterError parseMeasurementResponse(const std::uint8_t* data,
   return MeterError::None;
 }
 
-}  // namespace pzem
-}  // namespace pm
+} // namespace pzem
+} // namespace pm

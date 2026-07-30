@@ -1,0 +1,10 @@
+{
+  "version": "1.0.1",
+  "channel": "stable",
+  "hardware_target": "esp32-s3-n16r8",
+  "protocol_min": "pm-protocol/1.0.0",
+  "protocol_max": "pm-protocol/1.0.0",
+  "sha256": "not-a-sha256",
+  "signature": "not-an-ed25519-signature",
+  "signing_key_id": "fixture-ed25519-2026"
+}

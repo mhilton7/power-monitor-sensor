@@ -18,7 +18,9 @@ def hkdf_sha256(ikm: bytes, info: bytes, length: int = 32, salt: bytes = b"") ->
     previous = b""
     counter = 1
     while len(output) < length:
-        previous = hmac.new(prk, previous + info + bytes([counter]), hashlib.sha256).digest()
+        previous = hmac.new(
+            prk, previous + info + bytes([counter]), hashlib.sha256
+        ).digest()
         output += previous
         counter += 1
     return output[:length]
@@ -102,7 +104,9 @@ def verify(
     if abs(now_seconds - timestamp) > window_seconds:
         return False, "timestamp_outside_window"
     nonce = normalized["x-pm-nonce"]
-    if len(nonce) < 32 or any(character not in "0123456789abcdef" for character in nonce):
+    if len(nonce) < 32 or any(
+        character not in "0123456789abcdef" for character in nonce
+    ):
         return False, "nonce_invalid"
     if normalized["x-pm-content-sha256"] != body_sha256(body):
         return False, "body_hash_mismatch"
@@ -119,4 +123,3 @@ def verify(
     if nonce_seen(nonce, timestamp):
         return False, "nonce_replayed"
     return True, "ok"
-

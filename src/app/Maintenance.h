@@ -26,4 +26,4 @@ struct MaintenanceMessage {
   char argument[384]{};
 };
 
-}  // namespace pm
+} // namespace pm

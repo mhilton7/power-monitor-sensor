@@ -13,13 +13,12 @@ struct ProvisioningResult {
 };
 
 class ProvisioningService {
- public:
-  explicit ProvisioningService(ConfigService& config);
-  ProvisioningResult apply(const std::string& json);
+public:
+  explicit ProvisioningService(ConfigService &config);
+  ProvisioningResult apply(const std::string &json);
 
- private:
-  ConfigService& config_;
+private:
+  ConfigService &config_;
 };
 
-}  // namespace pm
-
+} // namespace pm

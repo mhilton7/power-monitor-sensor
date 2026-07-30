@@ -11,6 +11,10 @@
 #define PM_RELEASE_BUILD 0
 #endif
 
+#ifndef PM_PHYSICAL_ADMIN_RECOVERY
+#define PM_PHYSICAL_ADMIN_RECOVERY 0
+#endif
+
 namespace pm::build {
 inline constexpr char PRODUCT_NAME[] = "Power Monitor Sensor Agent";
 inline constexpr char DEFAULT_FRIENDLY_NAME[] = "Unassigned Power Monitor";
@@ -33,5 +37,7 @@ inline constexpr std::uint32_t SETUP_AP_TTL_SECONDS = 900;
 inline constexpr std::uint32_t PBKDF2_ITERATIONS = 120000;
 static_assert(!PM_RELEASE_BUILD || !PM_SIMULATED_METER,
               "Simulated readings are forbidden in release firmware");
-}  // namespace pm::build
-
+static_assert(
+    !PM_RELEASE_BUILD || !PM_PHYSICAL_ADMIN_RECOVERY,
+    "Physical administrator recovery is forbidden in release firmware");
+} // namespace pm::build

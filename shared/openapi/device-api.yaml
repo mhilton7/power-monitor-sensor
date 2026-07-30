@@ -6,6 +6,13 @@ info:
 servers:
   - url: http://power-monitor-device.local
 paths:
+  /api/local/health:
+    get:
+      operationId: getLocalLiveness
+      description: Unauthenticated, read-only LAN liveness probe. It performs no central-server request, authentication work, or microSD history read and exposes no identity or secret material.
+      security: []
+      responses:
+        '200': {description: Bounded device and server-sync liveness counters, content: {application/json: {schema: {$ref: '#/components/schemas/LocalHealth'}}}}
   /api/v1/health:
     get:
       operationId: getHealth
@@ -30,15 +37,18 @@ paths:
   /api/v1/readings:
     get:
       operationId: getReadings
+      description: Returns the completed bounded page by default for pm-protocol/1.0.0 clients. Send the `Prefer` header value `respond-async` to receive a short-lived history job instead.
       security: [{deviceHmac: []}, {localSession: []}]
       parameters:
+        - {$ref: '#/components/parameters/PreferRespondAsync'}
         - {name: after_sequence, in: query, schema: {type: integer, minimum: 0}}
         - {name: from_utc, in: query, schema: {type: string, format: date-time}}
         - {name: to_utc, in: query, schema: {type: string, format: date-time}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
       responses:
+        '202': {description: Bounded storage job queued because the `respond-async` preference was requested, content: {application/json: {schema: {$ref: '#/components/schemas/HistoryJob'}}}}
         '200':
-          description: Bounded sequence-ordered page
+          description: Bounded sequence-ordered page. JSON contains both durable `records` and translated pm-protocol/1.0.0 `readings`.
           content:
             application/json: {schema: {$ref: '#/components/schemas/ReadingPage'}}
             application/x-ndjson: {schema: {type: string}}
@@ -47,12 +57,31 @@ paths:
   /api/v1/events:
     get:
       operationId: getEvents
+      description: Returns the completed bounded page by default for pm-protocol/1.0.0 clients. Send the `Prefer` header value `respond-async` to receive a short-lived history job instead.
       security: [{deviceHmac: []}, {localSession: []}]
       parameters:
+        - {$ref: '#/components/parameters/PreferRespondAsync'}
         - {name: after_sequence, in: query, schema: {type: integer, minimum: 0}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
       responses:
-        '200': {description: Event page, content: {application/json: {schema: {$ref: '#/components/schemas/Page'}}}}
+        '202': {description: Bounded storage job queued because the `respond-async` preference was requested, content: {application/json: {schema: {$ref: '#/components/schemas/HistoryJob'}}}}
+        '200': {description: Event page containing both durable `records` and the `events` compatibility array, content: {application/json: {schema: {$ref: '#/components/schemas/EventPage'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/history-jobs:
+    get:
+      operationId: getHistoryJobResult
+      description: Polls a bounded microSD history job without blocking the AsyncTCP callback.
+      security: [{deviceHmac: []}, {localSession: []}]
+      parameters:
+        - {name: job_id, in: query, required: true, schema: {type: string, pattern: '^[0-9a-f]{16}$'}}
+      responses:
+        '200':
+          description: Completed history page
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/Page'}}
+            application/x-ndjson: {schema: {type: string}}
+        '202': {description: Storage operation remains pending, content: {application/json: {schema: {$ref: '#/components/schemas/PendingJob'}}}}
+        '404': {$ref: '#/components/responses/Problem'}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/storage:
     get:
@@ -77,41 +106,50 @@ paths:
         default: {$ref: '#/components/responses/Problem'}
     put:
       operationId: updateConfig
-      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      description: Returns the verified validation or persistence result by default. Send the `Prefer` header value `respond-async` to receive a short-lived password job instead. Browser callers require a same-origin elevated session obtained by asynchronous administrator-password verification.
+      security: [{deviceHmac: []}, {elevatedLocalSessionCsrf: []}]
       parameters:
+        - {$ref: '#/components/parameters/PreferRespondAsync'}
         - {name: dry_run, in: query, schema: {type: boolean, default: false}}
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/Config'}}}
       responses:
+        '202': {description: Bounded configuration job queued because the `respond-async` preference was requested, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
         '200': {description: Validated or committed configuration, content: {application/json: {schema: {type: object}}}}
         '422': {$ref: '#/components/responses/Problem'}
   /api/v1/network-settings:
     put:
       operationId: updateNetworkSettings
-      description: Atomically replaces selected Wi-Fi, IPv4, central server, and TLS trust settings, then requests a live network reconfiguration without a reboot. Omitted Wi-Fi passwords and a keep trust action preserve existing write-only secrets.
-      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      description: Atomically replaces selected Wi-Fi, IPv4, central server, and TLS trust settings, then requests a live network reconfiguration without a reboot. Omitted Wi-Fi passwords and a keep trust action preserve existing write-only secrets. The verified result is returned by default; send the `Prefer` header value `respond-async` to receive a short-lived password job instead. Browser callers require a same-origin elevated session obtained by asynchronous administrator-password verification.
+      security: [{deviceHmac: []}, {elevatedLocalSessionCsrf: []}]
+      parameters:
+        - {$ref: '#/components/parameters/PreferRespondAsync'}
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: '#/components/schemas/NetworkSettingsUpdate'}
       responses:
+        '202': {description: Bounded configuration job queued because the `respond-async` preference was requested, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
         '200': {description: Settings committed with network-apply status, content: {application/json: {schema: {type: object}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
   /api/v1/setup/apply:
     post:
       operationId: applyFirstRunSetup
-      description: Atomically commits first-run Wi-Fi, server trust, enrollment, administrator, and meter settings, then applies the network configuration without a reboot.
+      description: Uses a durable rollback journal plus the dual-slot configuration store to commit first-run Wi-Fi, server trust, enrollment, administrator, and meter settings as one recoverable transaction, then applies the network configuration without a reboot. A reset before the journal commit point restores the prior credentials and config generation. The verified result is returned by default; send the `Prefer` header value `respond-async` to receive a short-lived password job instead.
       security: [{localSessionCsrf: []}]
+      parameters:
+        - {$ref: '#/components/parameters/PreferRespondAsync'}
       requestBody:
         required: true
         content:
           application/json:
             schema: {$ref: '#/components/schemas/FirstRunSetup'}
       responses:
-        '202': {description: Bounded password/setup job queued, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
+        '200': {description: First-run settings committed with network-apply status, content: {application/json: {schema: {type: object}}}}
+        '202': {description: Bounded password/setup job queued because the `respond-async` preference was requested, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
         '403': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
   /api/v1/metrics:
@@ -145,15 +183,24 @@ paths:
   /api/v1/sync/ack:
     post:
       operationId: acknowledgeSequence
+      description: Stores the monotonic acknowledgement using device HMAC authentication only. The completed persistence result is returned by default; send the `Prefer` header value `respond-async` to receive a short-lived password job instead.
       security: [{deviceHmac: []}]
-      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [ack_sequence], properties: {ack_sequence: {type: integer, minimum: 0}}}}}}
+      parameters:
+        - {$ref: '#/components/parameters/PreferRespondAsync'}
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AcknowledgementRequest'}}}}
       responses:
-        '200': {description: Monotonic cursor stored}
+        '200': {description: Monotonic cursor stored and verified, content: {application/json: {schema: {type: object}}}}
+        '202': {description: Bounded persistence job queued because the `respond-async` preference was requested, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
   /api/v1/enrollment/reenroll:
     post:
       operationId: beginReenrollment
-      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      description: Revokes the existing device credential and starts enrollment with a new one-time token. A browser caller requires a same-origin elevated session obtained by asynchronous administrator-password verification. The verified result is returned by default. The `Prefer` header value `respond-async` is available only to a local browser session because revocation prevents an HMAC client from authenticating the result poll; HMAC clients must omit that preference.
+      security: [{deviceHmac: []}, {elevatedLocalSessionCsrf: []}]
+      parameters:
+        - {$ref: '#/components/parameters/PreferRespondAsync'}
+        - {name: X-PM-Action-Token, in: header, required: true, description: Exact physical-administration confirmation phrase., schema: {type: string, const: REENROLL}}
       requestBody:
         required: true
         content:
@@ -162,10 +209,12 @@ paths:
               type: object
               required: [enrollment_token]
               properties:
-                enrollment_token: {type: string, minLength: 1, maxLength: 256}
+                enrollment_token: {type: string, minLength: 32, maxLength: 256, writeOnly: true}
       responses:
-        '200': {description: Existing device credential revoked and one-time reenrollment pending}
+        '200': {description: Existing device credential revoked and one-time reenrollment pending, content: {application/json: {schema: {type: object}}}}
+        '202': {description: Bounded credential-revocation job queued for a local session that requested the `respond-async` preference, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
         '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
   /api/v1/actions/test-pzem:
     $ref: '#/components/pathItems/QueuedAction'
@@ -178,15 +227,18 @@ paths:
   /api/v1/actions/prepare-card-removal:
     $ref: '#/components/pathItems/QueuedAction'
   /api/v1/actions/reboot:
-    $ref: '#/components/pathItems/DestructiveAction'
+    $ref: '#/components/pathItems/ConfirmedAction'
   /api/v1/actions/network-reset:
     $ref: '#/components/pathItems/DestructiveAction'
   /api/v1/actions/factory-reset:
     $ref: '#/components/pathItems/DestructiveAction'
+  /api/v1/actions/rollback-ota:
+    $ref: '#/components/pathItems/DestructiveAction'
   /api/v1/ota/apply:
     post:
       operationId: applySignedOta
-      security: [{deviceHmac: []}, {localSessionCsrf: []}]
+      description: Browser callers require a same-origin elevated session obtained by asynchronous administrator-password verification.
+      security: [{deviceHmac: []}, {elevatedLocalSessionCsrf: []}]
       requestBody: {required: true, content: {application/json: {schema: {type: object, required: [manifest_url], properties: {manifest_url: {type: string, pattern: '^https://'}}}}}}
       responses:
         '202': {description: Verified OTA job queued}
@@ -195,7 +247,8 @@ paths:
   /api/v1/auth/login:
     post:
       operationId: login
-      security: []
+      description: Queues bounded administrator/setup-password verification from an exact same-origin non-privileged session. The result may be claimed only by that creator session.
+      security: [{localSessionCsrf: []}]
       requestBody: {required: true, content: {application/json: {schema: {type: object, required: [password], properties: {password: {type: string, maxLength: 128}}}}}}
       responses:
         '202': {description: Bounded password-verification job queued, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
@@ -204,21 +257,21 @@ paths:
   /api/v1/auth/password-jobs:
     get:
       operationId: getPasswordJobResult
-      description: Polls an opaque short-lived job. A completed login creates the session; a completed setup returns its apply status.
-      security: []
+      description: Polls an opaque short-lived password or mutation job. A login job requires exact same-origin access and the same non-privileged session that submitted the password; its successful result creates an elevated replacement session. Configuration, setup, network-settings, and local reenrollment jobs require a local session or device HMAC as applicable to the initiating operation. Synchronization acknowledgement jobs require device HMAC only. HMAC reenrollment callers cannot use asynchronous polling after credential revocation and therefore receive the final response directly.
+      security: [{deviceHmac: []}, {localSession: []}]
       parameters:
         - {name: job_id, in: query, required: true, schema: {type: string, pattern: '^[0-9a-f]{32}$'}}
       responses:
         '200': {description: Completed password operation}
-        '202': {description: Operation remains pending}
+        '202': {description: Operation remains pending, content: {application/json: {schema: {$ref: '#/components/schemas/PendingJob'}}}}
         '404': {$ref: '#/components/responses/Problem'}
   /api/v1/auth/session:
     post:
       operationId: createLocalSession
-      description: Creates a short-lived same-origin browser session without displaying a login screen.
+      description: Creates a short-lived same-origin, non-privileged browser session without displaying a login screen. Security-sensitive mutations require a separate elevated session created only after the asynchronous password-login job succeeds.
       security: []
       responses:
-        '200': {description: Short-lived session and CSRF token}
+        '200': {description: Short-lived non-privileged session and CSRF token}
         '403': {$ref: '#/components/responses/Problem'}
   /api/v1/auth/logout:
     post:
@@ -227,6 +280,15 @@ paths:
       responses:
         '204': {description: Session invalidated}
 components:
+  parameters:
+    PreferRespondAsync:
+      name: Prefer
+      in: header
+      required: false
+      description: Omit this header for the backward-compatible final response. Set it to `respond-async` when the caller can accept HTTP 202 and poll the returned job identifier.
+      schema:
+        type: string
+        const: respond-async
   securitySchemes:
     deviceHmac:
       type: apiKey
@@ -241,11 +303,17 @@ components:
       type: apiKey
       in: header
       name: X-PM-CSRF
+      description: Requires the matching pm_session cookie and an exact same-origin Origin header for every browser mutation.
+    elevatedLocalSessionCsrf:
+      type: apiKey
+      in: header
+      name: X-PM-CSRF
+      description: Requires the matching pm_session cookie, an exact same-origin Origin header, and a session elevated only by a completed administrator/setup-password login job.
   pathItems:
     QueuedAction:
       post:
         operationId: queueMaintenanceAction
-        security: [{deviceHmac: []}, {localSessionCsrf: []}]
+        security: [{deviceHmac: []}, {elevatedLocalSessionCsrf: []}]
         responses:
           '202': {description: Bounded maintenance action queued}
           '429': {$ref: '#/components/responses/Problem'}
@@ -257,6 +325,15 @@ components:
           - {name: X-PM-Action-Token, in: header, required: true, schema: {type: string}}
         responses:
           '202': {description: Confirmed destructive action queued}
+          '403': {$ref: '#/components/responses/Problem'}
+    ConfirmedAction:
+      post:
+        operationId: queueConfirmedAction
+        security: [{deviceHmac: []}, {localSessionCsrf: []}]
+        parameters:
+          - {name: X-PM-Action-Token, in: header, required: true, schema: {type: string}}
+        responses:
+          '202': {description: Confirmed action queued}
           '403': {$ref: '#/components/responses/Problem'}
   responses:
     Problem:
@@ -273,10 +350,31 @@ components:
         detail: {type: string}
         instance: {type: string}
         code: {type: string}
+    LocalHealth:
+      type: object
+      additionalProperties: false
+      required: [schema_version, protocol, uptime_seconds, wifi_connected, time_trusted, storage_writable, meter_healthy, sync_in_progress, sync_pending, heartbeat_successes, heartbeat_failures, stack_high_water_bytes, stack_margin_percent, free_heap_bytes, free_internal_heap_bytes, largest_internal_block_bytes]
+      properties:
+        schema_version: {const: 1}
+        protocol: {const: pm-protocol/1.0.0}
+        uptime_seconds: {type: integer, minimum: 0}
+        wifi_connected: {type: boolean}
+        time_trusted: {type: boolean}
+        storage_writable: {type: boolean}
+        meter_healthy: {type: boolean}
+        sync_in_progress: {type: boolean}
+        sync_pending: {type: boolean}
+        heartbeat_successes: {type: integer, minimum: 0}
+        heartbeat_failures: {type: integer, minimum: 0}
+        stack_high_water_bytes: {type: integer, minimum: 0}
+        stack_margin_percent: {type: integer, minimum: 0, maximum: 100}
+        free_heap_bytes: {type: integer, minimum: 0}
+        free_internal_heap_bytes: {type: integer, minimum: 0}
+        largest_internal_block_bytes: {type: integer, minimum: 0}
     Config:
       type: object
       description: Secret fields are never returned.
-      required: [schema_version, config_version, friendly_name, hostname, server_url, connection_mode, sample_interval_seconds, durable_log_interval_seconds, heartbeat_interval_seconds, ct_rating_a, timezone, sd_spi_hz]
+      required: [schema_version, config_version, friendly_name, hostname, server_url, connection_mode, sample_interval_seconds, durable_log_interval_seconds, heartbeat_interval_seconds, ct_rating_a, timezone, sd_spi_hz, ota_signing_key_configured, ota_signing_key_id]
       properties:
         schema_version: {const: 1}
         config_version: {type: integer, minimum: 1}
@@ -293,7 +391,7 @@ components:
         static_subnet: {type: string, maxLength: 15}
         static_dns: {type: string, maxLength: 15}
         server_url: {type: string, pattern: '^https://'}
-        connection_mode: {enum: [pull, push, hybrid]}
+        connection_mode: {enum: [pull, push, hybrid], description: pm-protocol/1.0.0 retains all values for wire compatibility; this firmware operates only in push mode.}
         allowed_server_addresses: {type: array, maxItems: 4, items: {type: string, maxLength: 253}}
         live_interval_seconds: {type: integer, minimum: 1, maximum: 60}
         sample_interval_seconds: {type: integer, minimum: 1, maximum: 30}
@@ -305,17 +403,26 @@ components:
         ct_warning_fraction: {type: number}
         ct_critical_fraction: {type: number}
         ct_fault_fraction: {type: number}
+        voltage_minimum_v: {type: number, minimum: 0, maximum: 400}
+        voltage_maximum_v: {type: number, minimum: 0, maximum: 400}
+        frequency_minimum_hz: {type: number, minimum: 40, maximum: 70}
+        frequency_maximum_hz: {type: number, minimum: 40, maximum: 70}
         timezone: {type: string, maxLength: 64}
         sd_spi_hz: {type: integer, minimum: 1000000, maximum: 20000000}
         storage_warning_free_bytes: {type: integer, minimum: 1048576}
         ota_update_window_enabled: {type: boolean}
         ota_update_window_start_hour: {type: integer, minimum: 0, maximum: 23}
         ota_update_window_end_hour: {type: integer, minimum: 0, maximum: 23}
+        ota_signing_key_configured: {type: boolean, readOnly: true}
+        ota_signing_key_id: {type: string, maxLength: 128, readOnly: true}
         diagnostic_log_level: {type: integer, minimum: 0, maximum: 5}
     NetworkSettingsUpdate:
       type: object
       additionalProperties: false
       required: [wifi_ssid, static_network_enabled, static_ip, static_gateway, static_subnet, static_dns, server_url, tls_trust_action, connection_mode]
+      dependentRequired:
+        ota_signing_public_key_pem: [ota_signing_key_id]
+        ota_signing_key_id: [ota_signing_public_key_pem]
       properties:
         wifi_ssid: {type: string, minLength: 1, maxLength: 32}
         wifi_password: {type: string, minLength: 8, maxLength: 63, writeOnly: true, description: Omit to retain the existing password; required when changing SSID.}
@@ -328,10 +435,16 @@ components:
         tls_trust_action: {enum: [keep, replace_ca, replace_fingerprint], description: replace_fingerprint is retained for v1 compatibility but rejected because the platform cannot perform fingerprint-only TLS without an insecure handshake.}
         server_ca_pem: {type: string, minLength: 1, maxLength: 8192, writeOnly: true}
         server_fingerprint: {type: string, minLength: 1, maxLength: 128, writeOnly: true}
-        connection_mode: {enum: [pull, push, hybrid]}
+        connection_mode: {enum: [pull, push, hybrid], description: "The v1 field retains all values, but this firmware accepts only push; pull and hybrid are rejected with connection_mode_unsupported until the device provides a mutually authenticated HTTPS listener."}
+        ota_trust_action: {enum: [keep, replace], default: keep, description: OTA signing trust is retained unless replace is explicitly selected.}
+        ota_signing_public_key_pem: {type: string, minLength: 113, maxLength: 1024, writeOnly: true, description: Independently verified Ed25519 SubjectPublicKeyInfo PUBLIC KEY PEM. Private keys are rejected.}
+        ota_signing_key_id: {type: string, minLength: 1, maxLength: 128}
     FirstRunSetup:
       type: object
       required: [friendly_name, wifi_ssid, wifi_password, static_network_enabled, static_ip, static_gateway, static_subnet, static_dns, server_url, server_ca_pem, server_fingerprint, enrollment_token, admin_password, connection_mode, ct_rating_a]
+      dependentRequired:
+        ota_signing_public_key_pem: [ota_signing_key_id]
+        ota_signing_key_id: [ota_signing_public_key_pem]
       properties:
         friendly_name: {type: string, minLength: 1, maxLength: 64}
         wifi_ssid: {type: string, minLength: 1, maxLength: 32}
@@ -344,16 +457,39 @@ components:
         server_url: {type: string, maxLength: 256, pattern: '^https://'}
         server_ca_pem: {type: string, maxLength: 8192, writeOnly: true}
         server_fingerprint: {type: string, maxLength: 128, writeOnly: true}
-        enrollment_token: {type: string, minLength: 1, maxLength: 256, writeOnly: true}
+        enrollment_token: {type: string, minLength: 32, maxLength: 256, writeOnly: true}
         admin_password: {type: string, minLength: 12, maxLength: 128, writeOnly: true}
-        connection_mode: {enum: [pull, push, hybrid]}
+        connection_mode: {enum: [pull, push, hybrid], description: "The v1 field retains all values, but this firmware accepts push only."}
         ct_rating_a: {type: number, minimum: 1, maximum: 1000}
+        ota_signing_public_key_pem: {type: string, minLength: 113, maxLength: 1024, writeOnly: true, description: Optional independently verified Ed25519 SubjectPublicKeyInfo PUBLIC KEY PEM.}
+        ota_signing_key_id: {type: string, minLength: 1, maxLength: 128}
     PasswordJob:
       type: object
       required: [status, job_id]
       properties:
         status: {const: queued}
         job_id: {type: string, pattern: '^[0-9a-f]{32}$'}
+    HistoryJob:
+      type: object
+      required: [status, job_id, result_path]
+      properties:
+        status: {const: queued}
+        job_id: {type: string, pattern: '^[0-9a-f]{16}$'}
+        result_path: {const: /api/v1/history-jobs}
+    PendingJob:
+      type: object
+      required: [status]
+      properties:
+        status: {const: pending}
+    AcknowledgementRequest:
+      type: object
+      description: Exactly one acknowledgement field is required. `highest_contiguous_sequence` is the pm-protocol/1.0.0 server compatibility alias for `ack_sequence`.
+      oneOf:
+        - required: [ack_sequence]
+        - required: [highest_contiguous_sequence]
+      properties:
+        ack_sequence: {type: integer, minimum: 0}
+        highest_contiguous_sequence: {type: integer, minimum: 0}
     Health:
       type: object
       required: [schema_version, protocol, device_id, friendly_name, status, uptime_seconds, boot_id, firmware_version, api_version, wifi, time, meter, storage, server]
@@ -383,24 +519,36 @@ components:
         boot_id: {type: string, format: uuid}
         timestamp_utc: {type: string, format: date-time}
         timestamp_trusted: {type: boolean}
-        voltage_v: {type: number}
+        voltage_v: {type: number, minimum: 0, maximum: 400}
         current_a: {type: number}
         active_power_w: {type: number}
         meter_energy_total_wh: {type: integer}
         device_lifetime_energy_wh: {type: integer}
-        frequency_hz: {type: number}
-        power_factor: {type: number}
+        frequency_hz: {type: number, minimum: 40, maximum: 70}
+        power_factor: {type: number, minimum: 0, maximum: 1}
         ct_rating_a: {type: number}
         quality: {type: object}
     Page:
       type: object
       required: [first_sequence, last_sequence, has_more, next_after_sequence, records]
       properties:
+        schema_version: {const: 1}
+        protocol_version: {const: pm-protocol/1.0.0}
+        device_id: {type: string}
         first_sequence: {type: integer}
         last_sequence: {type: integer}
+        oldest_sequence: {type: integer}
+        newest_sequence: {type: integer}
         has_more: {type: boolean}
         next_after_sequence: {type: integer}
-        records: {type: array, maxItems: 500, items: {type: object}}
+        records: {type: array, maxItems: 500, description: Durable on-card records retained for existing device API clients., items: {type: object}}
+        readings: {type: array, maxItems: 500, description: Measurement records translated to the shared pm-protocol/1.0.0 server Reading field names., items: {$ref: './server-ingest-api.yaml#/components/schemas/Reading'}}
+        events: {type: array, maxItems: 500, description: Event records copied from the durable page., items: {type: object}}
     ReadingPage:
       allOf:
         - {$ref: '#/components/schemas/Page'}
+        - {type: object, required: [readings]}
+    EventPage:
+      allOf:
+        - {$ref: '#/components/schemas/Page'}
+        - {type: object, required: [events]}

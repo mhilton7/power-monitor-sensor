@@ -54,10 +54,10 @@ If upload cannot connect, hold BOOT, tap RESET/EN, then release BOOT after the R
 
 ## Release verification
 
-Run `python tools/generate_release.py --skip-build --version 1.0.0`, verify every `SHA256SUMS` line, and inspect `dependencies.json`. Sign only with an external protected P-256 key:
+Run `python tools/generate_release.py --skip-build --version 1.0.0 --channel stable --signing-key-id KEY-ID`. It fails if the build provenance is missing/stale, if any required image changed, or if the packaged `boot_app0.bin` selector is not assigned to `0x11000`. Verify every `SHA256SUMS` line plus `flash-layout.json`, `build-provenance.json`, and `dependencies.json` before signing:
 
 ```sh
-python tools/sign_firmware.py release/1.0.0/manifest.unsigned.json --private-key /secure/offline/ota-p256.pem --output release/1.0.0/manifest.json
+python tools/sign_firmware.py release/1.0.0/manifest.unsigned.json --private-key /secure/offline/ota-ed25519.pem --output release/1.0.0/manifest.json
 ```
 
-Never commit the private key. Firmware rejects unsigned manifests.
+Never commit the private key. The server and firmware reject unsigned manifests.

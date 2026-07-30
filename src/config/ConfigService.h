@@ -3,15 +3,28 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "build_config.h"
+#include "config/AtomicConfigStore.h"
+#include "config/ProvisioningTransaction.h"
 #include "security/Crypto.h"
 
 namespace pm {
 
 enum class ConnectionMode : std::uint8_t { Pull, Push, Hybrid };
+
+#if PM_PHYSICAL_ADMIN_RECOVERY
+enum class AdminPasswordRecoveryResult : std::uint8_t {
+  Applied,
+  RejectedPreserved,
+  FailedUncertain,
+};
+#endif
 
 struct RuntimeConfig {
   std::uint32_t schema_version{1};
@@ -31,7 +44,7 @@ struct RuntimeConfig {
   std::string server_url;
   std::string server_ca_pem;
   std::string server_fingerprint;
-  ConnectionMode connection_mode{ConnectionMode::Hybrid};
+  ConnectionMode connection_mode{ConnectionMode::Push};
   std::array<std::string, 4> allowed_server_addresses{};
   std::uint32_t live_interval_seconds{2};
   std::uint32_t sample_interval_seconds{1};
@@ -49,13 +62,19 @@ struct RuntimeConfig {
   float frequency_minimum_hz{45.0F};
   float frequency_maximum_hz{65.0F};
   std::string timezone{"America/Los_Angeles"};
-  std::array<std::string, 3> ntp_servers{"time.cloudflare.com", "time.google.com", "pool.ntp.org"};
+  std::array<std::string, 3> ntp_servers{"time.cloudflare.com",
+                                         "time.google.com", "pool.ntp.org"};
   std::uint32_t sd_spi_hz{4'000'000};
   std::uint64_t storage_warning_free_bytes{64ULL * 1024ULL * 1024ULL};
   bool retention_enabled{false};
   std::uint16_t retention_days{365};
   std::uint32_t local_session_timeout_seconds{900};
   std::string ota_channel{"stable"};
+  // Offline firmware-signing trust is local-only configuration. The public
+  // key is intentionally write-only in the local API and is never accepted
+  // from desired configuration returned by the central server.
+  std::string ota_signing_public_key_pem;
+  std::string ota_signing_key_id;
   bool ota_update_window_enabled{false};
   std::uint8_t ota_update_window_start_hour{2};
   std::uint8_t ota_update_window_end_hour{5};
@@ -77,50 +96,63 @@ struct ConfigValidation {
 };
 
 class ConfigService {
- public:
+public:
   bool begin();
-  const RuntimeConfig& config() const;
-  const DeviceIdentity& identity() const;
-  ConfigValidation validate(const RuntimeConfig& candidate,
+  RuntimeConfig config() const;
+  DeviceIdentity identity() const;
+  ConfigValidation validate(const RuntimeConfig &candidate,
                             bool ct_change_acknowledged) const;
-  bool stage(const RuntimeConfig& candidate, bool ct_change_acknowledged);
-  bool commitStaged();
-  bool rollbackStaged();
-  bool rollbackToPrevious();
-  bool updateFromJson(const std::string& json, bool dry_run,
-                      bool ct_change_acknowledged, ConfigValidation& result);
+  // Validates, persists, verifies, and publishes one candidate while holding
+  // the mutation lock. The returned generation identifies this exact commit.
+  bool commitCandidate(const RuntimeConfig &candidate,
+                       bool ct_change_acknowledged,
+                       std::uint64_t &committed_generation);
+  // Compare-and-swap rollback: a later commit makes this request a conflict
+  // instead of allowing a delayed caller to undo newer configuration.
+  bool rollbackToPrevious(std::uint64_t expected_current_generation,
+                          std::uint64_t *restored_generation = nullptr);
+  std::uint64_t persistentGeneration() const;
+  bool updateFromJson(const std::string &json, bool dry_run,
+                      bool ct_change_acknowledged, bool trusted_server_update,
+                      ConfigValidation &result,
+                      std::uint64_t *committed_generation = nullptr);
   std::string redactedJson() const;
 
   bool hasWifiCredentials() const;
   std::string wifiPassword() const;
-  bool setWifiCredentials(const std::string& ssid, const std::string& password);
-  bool updateNetworkSettings(const RuntimeConfig& candidate,
-                             const std::string& wifi_password,
+  bool setWifiCredentials(const std::string &ssid, const std::string &password);
+  bool updateNetworkSettings(const RuntimeConfig &candidate,
+                             const std::string &wifi_password,
                              bool replace_wifi_password,
-                             ConfigValidation& result);
+                             ConfigValidation &result);
   std::string enrollmentToken() const;
-  bool setEnrollmentToken(const std::string& token);
-  void clearEnrollmentToken();
-  bool saveEnrollment(const std::string& device_id,
-                      const std::uint8_t* enrollment_secret,
+  bool setEnrollmentToken(const std::string &token);
+  bool clearEnrollmentToken();
+  bool saveEnrollment(const std::string &device_id,
+                      const std::uint8_t *enrollment_secret,
                       std::size_t secret_length,
-                      const std::string& ota_public_key);
-  bool directionalKeys(crypto::Key32& device_to_server,
-                       crypto::Key32& server_to_device) const;
+                      const std::string &ota_public_key);
+  bool directionalKeys(crypto::Key32 &device_to_server,
+                       crypto::Key32 &server_to_device) const;
   std::string otaPublicKey() const;
 
   std::string ensureSetupPassword();
+  bool setSetupPassword(const std::string &password);
   bool setupPasswordNew() const;
   bool hasAdminPassword() const;
-  bool verifySetupPassword(const std::string& password) const;
-  bool setAdminPassword(const std::string& password);
-  bool commitProvisioning(const RuntimeConfig& candidate,
-                          const std::string& wifi_password,
-                          const std::string& enrollment_token,
-                          const std::string& admin_password);
-  bool verifyAdminPassword(const std::string& password) const;
+  bool verifySetupPassword(const std::string &password) const;
+#if PM_PHYSICAL_ADMIN_RECOVERY
+  AdminPasswordRecoveryResult
+  replaceAdminPasswordForPhysicalRecovery(const std::string &password);
+#endif
+  bool commitProvisioning(const RuntimeConfig &candidate,
+                          const std::string &wifi_password,
+                          const std::string &enrollment_token,
+                          const std::string &admin_password);
+  bool verifyAdminPassword(const std::string &password) const;
   bool networkReset();
-  bool beginReenrollment(const std::string& token);
+  bool beginReenrollment(const std::string &token);
+  std::uint64_t reenrollmentGeneration() const;
   bool factoryReset();
 
   std::uint64_t serverAckSequence() const;
@@ -135,28 +167,84 @@ class ConfigService {
   bool safeMode() const;
   std::string safeModeReason() const;
 
- private:
-  bool loadConfig(const char* key, RuntimeConfig& output) const;
-  bool saveConfig(const char* key, const RuntimeConfig& value);
-  std::string serializeConfig(const RuntimeConfig& value) const;
-  bool parseConfig(const std::string& json, RuntimeConfig& value,
-                   ConfigValidation& result) const;
-  bool credentialMatches(const char* salt_key, const char* hash_key,
-                         const std::string& password) const;
-  bool saveCredential(const char* salt_key, const char* hash_key,
-                      const std::string& password);
+private:
+  bool loadLegacyConfig(const char *key, RuntimeConfig &output) const;
+  bool loadPersistentConfig(RuntimeConfig &output, std::string &wifi_password,
+                            std::uint64_t &generation) const;
+  bool commitPersistentConfig(const RuntimeConfig &value,
+                              const std::string &wifi_password,
+                              std::uint64_t *generation = nullptr);
+  bool verifyPersistentConfig(const RuntimeConfig &expected,
+                              const std::string &expected_password) const;
+  std::string serializePersistentConfig(const RuntimeConfig &value,
+                                        const std::string &wifi_password) const;
+  bool parsePersistentConfig(const std::string &json, RuntimeConfig &value,
+                             std::string &wifi_password,
+                             ConfigValidation &result) const;
+  bool loadOrMigrateEnrollment();
+  bool initializePersistentPartition();
+  bool commitEnrollmentRecord(const std::string &device_id,
+                              const std::uint8_t *enrollment_secret,
+                              std::size_t secret_length,
+                              const std::string &ota_public_key,
+                              std::uint64_t reenrollment_generation);
+  bool commitEnrollmentTombstone(std::uint64_t reenrollment_generation = 0);
+  bool commitReenrollmentPending(const std::string &token,
+                                 std::uint64_t reenrollment_generation);
+  bool loadEnrollmentRecord(const std::vector<std::uint8_t> &payload,
+                            std::string &device_id,
+                            std::vector<std::uint8_t> &enrollment_secret,
+                            std::string &ota_public_key,
+                            std::string &pending_reenrollment_token,
+                            std::uint64_t &reenrollment_generation) const;
+  bool clearPersistentNamespace();
+  bool
+  prepareProvisioningTransaction(provisioning_transaction::Journal &journal);
+  bool recoverIncompleteProvisioning();
+  bool clearProvisioningTransaction();
+  bool publishRecoveredProvisioningState();
+  std::string serializeConfig(const RuntimeConfig &value) const;
+  bool parseConfig(const std::string &json, RuntimeConfig &value,
+                   ConfigValidation &result) const;
+  bool credentialMatches(const char *salt_key, const char *hash_key,
+                         const std::string &password) const;
+  bool persistAdminVerifier(const std::string &password);
+  bool saveCredential(const char *salt_key, const char *hash_key,
+                      const std::string &password);
   void initializeIdentity();
+  bool initializeMutexes();
+  RuntimeConfig configUnsafe() const;
+  DeviceIdentity identityUnsafe() const;
+  void publishIdentity(const DeviceIdentity &value);
+  bool publishPersistentConfig(const RuntimeConfig &value,
+                               const std::string &wifi_password,
+                               std::uint64_t generation);
+  bool publishEnrollment(const DeviceIdentity &identity,
+                         const std::vector<std::uint8_t> &enrollment_secret,
+                         const std::string &ota_public_key,
+                         const std::string &pending_reenrollment_token,
+                         std::uint64_t reenrollment_generation);
 
   mutable Preferences preferences_;
   RuntimeConfig config_;
-  RuntimeConfig staged_;
   DeviceIdentity identity_;
-  bool staged_valid_{false};
   bool safe_mode_{false};
   std::string safe_mode_reason_;
   bool setup_password_new_{false};
+  bool admin_password_configured_{false};
+  std::string wifi_password_;
+  std::vector<std::uint8_t> enrollment_secret_;
+  std::string ota_public_key_;
+  std::string pending_reenrollment_token_;
+  std::uint64_t reenrollment_generation_{0};
+  std::uint64_t persistent_generation_{0};
+  std::uint64_t server_ack_sequence_{0};
+  std::uint32_t server_config_version_{0};
+  std::uint64_t energy_offset_wh_{0};
+  mutable SemaphoreHandle_t mutation_mutex_{nullptr};
+  mutable SemaphoreHandle_t state_mutex_{nullptr};
 };
 
-const char* connectionModeName(ConnectionMode mode);
+const char *connectionModeName(ConnectionMode mode);
 
-}  // namespace pm
+} // namespace pm

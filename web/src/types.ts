@@ -60,6 +60,8 @@ export interface EffectiveConfig {
   server_url: string;
   server_ca_configured: boolean;
   server_fingerprint_configured: boolean;
+  ota_signing_key_configured: boolean;
+  ota_signing_key_id: string;
   connection_mode: "pull" | "push" | "hybrid";
   sample_interval_seconds: number;
   durable_log_interval_seconds: number;
@@ -85,7 +87,10 @@ export interface NetworkSettingsPayload {
   tls_trust_action: "keep" | "replace_ca";
   server_ca_pem?: string;
   server_fingerprint?: string;
-  connection_mode: "pull" | "push" | "hybrid";
+  ota_trust_action: "keep" | "replace";
+  ota_signing_public_key_pem?: string;
+  ota_signing_key_id?: string;
+  connection_mode: "push";
 }
 
 export interface SetupPayload {
@@ -100,8 +105,10 @@ export interface SetupPayload {
   server_url: string;
   server_ca_pem: string;
   server_fingerprint: string;
+  ota_signing_public_key_pem: string;
+  ota_signing_key_id: string;
   enrollment_token: string;
   admin_password: string;
-  connection_mode: "pull" | "push" | "hybrid";
+  connection_mode: "push";
   ct_rating_a: number;
 }

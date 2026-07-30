@@ -1,23 +1,27 @@
-# Signed OTA
+# Signed central-server OTA
 
-The 16 MB table has two 6 MB OTA slots, OTA metadata, NVS, PHY, LittleFS, and coredump. Updates target the inactive slot. ESP-IDF marks a new image pending; after storage, meter service, network, queues, and tasks start, firmware confirms it. Repeated incomplete boots enter safe mode, and local rollback is available.
+The 16 MB layout has two 6 MB application slots. The ESP32 writes an update to the inactive slot, boots it as pending, and confirms it only after the required health checks pass. Failed confirmation permits the ESP-IDF rollback path. OTA never uses microSD or fabricated firmware data as a fallback.
 
-Manifest schema 1 requires semantic version, `pm-protocol/1.0.0`, `esp32-s3-n16r8`, HTTPS image URL, byte size, lowercase SHA-256, minimum rollback version, notes, `ecdsa-p256-sha256`, downgrade policy, and base64 DER signature. Signed UTF-8 lines:
+The sensor polls the configured server’s HMAC-authenticated `GET /api/v1/device-firmware/manifest`. An available response must contain `version`, `channel`, `hardware_target`, `protocol_min`, `protocol_max`, `size_bytes`, lowercase `sha256`, a base64 64-byte Ed25519 `signature`, `signing_key_id`, `release_notes`, and a same-origin relative `download_path`. The signature covers sorted compact JSON containing exactly:
 
 ```text
-PM-OTA-MANIFEST-V1
-schema_version
-firmware_version
-protocol
+channel
 hardware_target
-image_url
-image_size
-image_sha256
-minimum_rollback_version
-sha256(release_notes)
-true|false
+protocol_max
+protocol_min
+release_notes
+sha256
+signing_key_id
+version
 ```
 
-Firmware validates policy/public key before download, restricts manifest/image hosts when a server allowlist is configured, enforces the optional UTC update window, requires the configured CA with hostname validation, streams to inactive flash with size/time bounds, hashes during write, and finalizes only on exact match. Unsigned, invalid, cross-target/protocol, truncated, oversized, hash-mismatched, out-of-window, fingerprint-only, and unauthorized downgrade updates fail.
+This is the same canonical form used by the sibling Power Monitor server: Python `json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()`. The download is another HMAC-authenticated GET, over the relative target supplied by the manifest. For a `.local` URL, both manifest and image requests may resolve through mDNS, but they retain the configured hostname for SNI and SAN verification. HTTPS CA/hostname validation remains mandatory. Firmware enforces the configured key ID, Ed25519 signature, target, protocol range, channel, monotonic semantic version, 6 MiB slot limit, exact content length, and streaming SHA-256 before finalizing.
 
-Generate/sign per [BUILD_AND_FLASH.md](BUILD_AND_FLASH.md). Protect and back up the external private key; rotate through an independently authenticated process, never an untrusted manifest.
+OTA trust is local-only. During first-run setup, or later through the authenticated network-settings page, paste an independently verified Ed25519 SubjectPublicKeyInfo `PUBLIC KEY` PEM together with its key ID. The key is stored atomically but never returned by an API or diagnostic export. A private key is rejected. Remote desired configuration and an untrusted manifest cannot install or rotate this trust root. With no key, firmware continues normal monitoring and synchronization but OTA fails closed.
+
+The current sibling server needs two server-side corrections before end-to-end OTA can succeed:
+
+- Include `release_notes` unchanged in every available device manifest response. It is part of the uploaded, verified signature, so omitting it makes reconstruction and verification impossible.
+- Provide an independently authenticated administrator workflow for distributing the trusted Ed25519 public key and key ID. Its enrollment response currently returns `server_ota_signing_public_key: null`; firmware therefore requires deliberate local provisioning.
+
+Do not weaken TLS, skip HMAC, accept a key from the manifest being verified, or place the offline signing private key on the sensor/server. Generate and sign release input as described in [BUILD_AND_FLASH.md](BUILD_AND_FLASH.md).

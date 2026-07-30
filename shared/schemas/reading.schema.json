@@ -23,11 +23,11 @@
     "time_trusted": {"type": "boolean"},
     "sample_count": {"type": "integer", "minimum": 0},
     "valid_sample_count": {"type": "integer", "minimum": 0},
-    "voltage_v": {"$ref": "#/$defs/stat"},
-    "current_a": {"$ref": "#/$defs/stat"},
-    "active_power_w": {"$ref": "#/$defs/stat"},
-    "average_power_factor": {"type": "number", "minimum": 0, "maximum": 1.01},
-    "average_frequency_hz": {"type": "number", "minimum": 0},
+    "voltage_v": {"$ref": "#/$defs/voltage_stat"},
+    "current_a": {"$ref": "#/$defs/current_stat"},
+    "active_power_w": {"$ref": "#/$defs/power_stat"},
+    "average_power_factor": {"type": "number", "minimum": 0, "maximum": 1},
+    "average_frequency_hz": {"type": "number", "minimum": 0, "maximum": 70},
     "raw_energy_start_wh": {"type": "integer", "minimum": 0},
     "raw_energy_end_wh": {"type": "integer", "minimum": 0},
     "device_lifetime_energy_wh": {"type": "integer", "minimum": 0},
@@ -37,15 +37,48 @@
     "quality_flags": {"type": "integer", "minimum": 0},
     "firmware_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+"}
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"valid_sample_count": {"minimum": 1}},
+        "required": ["valid_sample_count"]
+      },
+      "then": {
+        "properties": {
+          "average_frequency_hz": {"minimum": 40, "maximum": 70}
+        }
+      }
+    }
+  ],
   "$defs": {
-    "stat": {
+    "voltage_stat": {
       "type": "object",
       "additionalProperties": false,
       "required": ["average", "minimum", "maximum"],
       "properties": {
-        "average": {"type": "number"},
-        "minimum": {"type": "number"},
-        "maximum": {"type": "number"}
+        "average": {"type": "number", "minimum": 0, "maximum": 400},
+        "minimum": {"type": "number", "minimum": 0, "maximum": 400},
+        "maximum": {"type": "number", "minimum": 0, "maximum": 400}
+      }
+    },
+    "current_stat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["average", "minimum", "maximum"],
+      "properties": {
+        "average": {"type": "number", "minimum": 0, "maximum": 5000},
+        "minimum": {"type": "number", "minimum": 0, "maximum": 5000},
+        "maximum": {"type": "number", "minimum": 0, "maximum": 5000}
+      }
+    },
+    "power_stat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["average", "minimum", "maximum"],
+      "properties": {
+        "average": {"type": "number", "minimum": 0, "maximum": 10000000},
+        "minimum": {"type": "number", "minimum": 0, "maximum": 10000000},
+        "maximum": {"type": "number", "minimum": 0, "maximum": 10000000}
       }
     }
   }

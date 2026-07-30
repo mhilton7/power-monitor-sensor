@@ -96,6 +96,6 @@ struct IntervalRecord {
   std::string firmware_version;
 };
 
-const char* meterErrorCode(MeterError error);
+const char *meterErrorCode(MeterError error);
 
-}  // namespace pm
+} // namespace pm

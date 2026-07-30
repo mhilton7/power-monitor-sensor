@@ -107,7 +107,8 @@ header,
 nav,
 main,
 footer,
-#banner-region {
+#banner-region,
+#notification-region {
   width: min(1120px, calc(100% - 2rem));
   margin-inline: auto;
 }
@@ -229,6 +230,48 @@ dd {
 .banner.warning {
   border-color: var(--warning);
 }
+#notification-region {
+  position: sticky;
+  top: 0.5rem;
+  z-index: 20;
+}
+#notification-region:empty {
+  display: none;
+}
+.notification {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--accent);
+  border-radius: 0.65rem;
+  padding: 0.8rem 1rem;
+  margin: 0.65rem 0;
+  background: var(--surface);
+  box-shadow: 0 4px 18px #0000001f;
+}
+.notification strong {
+  display: block;
+  margin-bottom: 0.2rem;
+}
+.notification-info,
+.notification-success {
+  border-left-color: var(--accent);
+}
+.notification-pending {
+  border-left-color: var(--warning);
+}
+.notification-error {
+  border-left-color: var(--critical);
+}
+.notification-dismiss {
+  flex: 0 0 auto;
+  padding: 0.45rem 0.7rem;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--line);
+}
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -297,6 +340,36 @@ dd {
   display: grid;
   gap: 0.7rem;
 }
+.elevation-dialog {
+  width: min(32rem, calc(100% - 2rem));
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1rem 3rem rgb(0 0 0 / 35%);
+}
+.elevation-dialog::backdrop {
+  background: rgb(0 0 0 / 55%);
+}
+.elevation-dialog form {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1.25rem;
+}
+.elevation-dialog label {
+  display: grid;
+  gap: 0.4rem;
+  font-weight: 700;
+}
+.elevation-dialog input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  padding: 0.65rem;
+  background: var(--bg);
+  color: var(--text);
+}
 .error {
   color: var(--critical);
 }
@@ -326,6 +399,9 @@ footer {
     align-items: flex-start;
   }
   .section-heading {
+    align-items: flex-start;
+  }
+  .notification {
     align-items: flex-start;
   }
   .form-grid .check {

@@ -100,6 +100,27 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/FirmwareManifest'}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/device-firmware/{release_id}/download:
+    get:
+      operationId: downloadFirmware
+      description: Download the exact binary referenced by an authenticated signed manifest. The response Digest header and signed sha256 field cover the same bytes.
+      security: [{deviceHmac: []}]
+      parameters:
+        - name: release_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Firmware application image
+          headers:
+            Digest:
+              description: Base64 SHA-256 digest in RFC 3230 form.
+              schema: {type: string, pattern: '^SHA-256=[A-Za-z0-9+/]+={0,2}$'}
+          content:
+            application/octet-stream:
+              schema: {type: string, contentEncoding: binary}
+        default: {$ref: '#/components/responses/Problem'}
 components:
   securitySchemes:
     deviceHmac:
@@ -200,7 +221,7 @@ components:
         current_ip: {type: [string, 'null']}
         hostname: {type: [string, 'null']}
         rssi_dbm: {type: [integer, 'null'], minimum: -127, maximum: 0}
-        connection_mode: {enum: [pull, push, hybrid]}
+        connection_mode: {enum: [pull, push, hybrid], description: v1 preserves all values; current sensor firmware emits push and fails closed for pull or hybrid configuration.}
         latest:
           oneOf:
             - {$ref: '#/components/schemas/LiveMeasurement'}
@@ -235,21 +256,21 @@ components:
         interval_start: {type: string, format: date-time}
         interval_end: {type: string, format: date-time}
         time_trusted: {type: boolean}
-        voltage_avg: {type: [number, 'null']}
-        voltage_min: {type: [number, 'null']}
-        voltage_max: {type: [number, 'null']}
-        current_avg: {type: [number, 'null']}
-        current_min: {type: [number, 'null']}
-        current_max: {type: [number, 'null']}
-        power_avg: {type: [number, 'null']}
-        power_min: {type: [number, 'null']}
-        power_max: {type: [number, 'null']}
-        power_factor: {type: [number, 'null']}
-        frequency_hz: {type: [number, 'null']}
-        pzem_energy_start_wh: {type: [number, 'null']}
-        pzem_energy_end_wh: {type: [number, 'null']}
-        device_lifetime_energy_wh: {type: [number, 'null']}
-        interval_energy_wh: {type: [number, 'null']}
+        voltage_avg: {type: [number, 'null'], minimum: 0, maximum: 400}
+        voltage_min: {type: [number, 'null'], minimum: 0, maximum: 400}
+        voltage_max: {type: [number, 'null'], minimum: 0, maximum: 400}
+        current_avg: {type: [number, 'null'], minimum: 0, maximum: 5000}
+        current_min: {type: [number, 'null'], minimum: 0, maximum: 5000}
+        current_max: {type: [number, 'null'], minimum: 0, maximum: 5000}
+        power_avg: {type: [number, 'null'], minimum: 0, maximum: 10000000}
+        power_min: {type: [number, 'null'], minimum: 0, maximum: 10000000}
+        power_max: {type: [number, 'null'], minimum: 0, maximum: 10000000}
+        power_factor: {type: [number, 'null'], minimum: 0, maximum: 1}
+        frequency_hz: {type: [number, 'null'], minimum: 40, maximum: 70}
+        pzem_energy_start_wh: {type: [number, 'null'], minimum: 0}
+        pzem_energy_end_wh: {type: [number, 'null'], minimum: 0}
+        device_lifetime_energy_wh: {type: [number, 'null'], minimum: 0}
+        interval_energy_wh: {type: [number, 'null'], minimum: 0}
         energy_method: {type: string, maxLength: 40}
         ct_rating_amps: {type: number, exclusiveMinimum: 0}
         quality_flags:
@@ -319,11 +340,32 @@ components:
         rejected: {type: object}
     FirmwareManifest:
       type: object
+      additionalProperties: false
       required: [available]
       properties:
         available: {type: boolean}
         protocol_version: {const: pm-protocol/1.0.0}
-        version: {type: string}
-        download_path: {type: string}
-        sha256: {type: string}
-        signature: {type: string}
+        deployment_id: {type: string, format: uuid}
+        version: {type: string, pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'}
+        channel: {enum: [development, canary, stable]}
+        hardware_target: {const: esp32-s3-n16r8}
+        protocol_min: {type: string, minLength: 1, maxLength: 64}
+        protocol_max: {type: string, minLength: 1, maxLength: 64}
+        size_bytes: {type: integer, minimum: 1, maximum: 6291456}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        signature:
+          type: string
+          description: Base64 encoding of the exact 64-byte Ed25519 signature over sorted compact JSON containing version, channel, hardware_target, protocol_min, protocol_max, sha256, signing_key_id, and release_notes.
+          minLength: 88
+          maxLength: 88
+        signing_key_id: {type: string, minLength: 1, maxLength: 128}
+        release_notes: {type: string, maxLength: 4096}
+        download_path:
+          type: string
+          pattern: '^/api/v1/device-firmware/[0-9a-fA-F-]{36}/download$'
+      oneOf:
+        - properties:
+            available: {const: false}
+        - required: [deployment_id, version, channel, hardware_target, protocol_min, protocol_max, size_bytes, sha256, signature, signing_key_id, release_notes, download_path]
+          properties:
+            available: {const: true}

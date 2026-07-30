@@ -40,7 +40,9 @@ export function renderShell(): string {
   return `<header><div><p class="eyebrow">Local setup & diagnostics</p><h1>Power Monitor Sensor Agent</h1></div>
     <button id="theme-toggle" class="secondary" type="button" aria-label="Toggle color theme">Theme</button></header>
     <nav aria-label="Diagnostics sections">${views.map(([id, label]) => `<button type="button" data-view="${id}" aria-controls="main">${label}</button>`).join("")}</nav>
-    <div id="banner-region" aria-live="polite"></div><main id="main" tabindex="-1"></main>
+    <div id="banner-region" aria-live="polite"></div>
+    <div id="notification-region" aria-live="polite" aria-atomic="true"></div>
+    <main id="main" tabindex="-1"></main>
     <footer><p>Estimated sensor readings only. The central server owns rates, costs, reports, and alerts.</p></footer>`;
 }
 
@@ -166,10 +168,12 @@ export function renderSetup(
     <label>Static IPv4 address<input name="static_ip" inputmode="decimal" maxlength="15" /></label><label>Gateway<input name="static_gateway" inputmode="decimal" maxlength="15" /></label><label>Subnet mask<input name="static_subnet" inputmode="decimal" maxlength="15" /></label><label>DNS server<input name="static_dns" inputmode="decimal" maxlength="15" /></label>
     <label>Central server URL<input name="server_url" type="url" pattern="https://.*" placeholder="https://monitor.example" required /></label>
     <label>Server CA certificate (public PEM)<textarea name="server_ca_pem" rows="7" maxlength="8192" spellcheck="false" required></textarea><span class="field-note">For TrueNAS internal-CA deployments, paste the complete public <code>root.crt</code> from <code>/mnt/Apps/Power/power-monitor/caddy-data/caddy/pki/authorities/local/root.crt</code>. Never paste or export <code>root.key</code>. CA and hostname validation are mandatory.</span></label>
-    <label>One-time enrollment token<input name="enrollment_token" type="password" maxlength="256" autocomplete="off" required /></label>
+    <label>OTA signing-key ID (optional)<input name="ota_signing_key_id" maxlength="128" autocomplete="off" /><span class="field-note">Enter the key ID from the server firmware manifest together with the independently verified public key below. Leave both blank to keep OTA fail-closed.</span></label>
+    <label>OTA Ed25519 public key (optional public PEM)<textarea name="ota_signing_public_key_pem" rows="5" maxlength="1024" spellcheck="false"></textarea><span class="field-note">Paste only an Ed25519 <code>PUBLIC KEY</code> PEM obtained through an independent administrator channel. Never paste the offline private signing key.</span></label>
+    <label>One-time enrollment token<input name="enrollment_token" type="password" minlength="32" maxlength="256" autocomplete="off" required /><span class="field-note">Use the complete 32 through 256 character token issued by the server.</span></label>
     <label>Local administrator password<input name="admin_password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /></label>
     <label>Confirm administrator password<input name="admin_password_confirm" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /></label>
-    <label>Connection mode<select name="connection_mode"><option>hybrid</option><option>push</option><option>pull</option></select></label>
+    <label>Connection mode<select name="connection_mode"><option value="push" selected>Push (outbound HTTPS)</option></select><span class="field-note">This firmware supports push only and never accepts an inbound central-server connection.</span></label>
     <label>Installed CT rating (A)<input name="ct_rating_a" type="number" min="1" max="1000" step="0.1" value="${config.ct_rating_a}" required /></label>
     <label class="check"><input name="ct_ack" type="checkbox" required /> I verified the CT rating matches the installed PZEM/CT set. Electrical work remains de-energized.</label>
     <button type="submit">Commit setup and connect</button><p id="setup-result" role="status"></p></form></section>`;
@@ -179,6 +183,9 @@ export function renderSetup(
     : config.server_fingerprint_configured
       ? "A legacy fingerprint is configured but cannot be used safely; replace it with a CA certificate."
       : "No TLS trust material is configured.";
+  const otaTrustSummary = config.ota_signing_key_configured
+    ? `Ed25519 key ${config.ota_signing_key_id || "(identifier unavailable)"} is configured.`
+    : "No offline OTA signing key is configured; firmware updates remain disabled.";
   return `<section aria-labelledby="setup-heading"><h2 id="setup-heading">Device settings</h2><p>Changes are validated and stored persistently. Passwords and TLS trust material are write-only and are never returned to this page.</p>
   <h3>Wi-Fi and central server</h3>
   <p>Leave the new Wi-Fi password blank to keep the saved password. Changing these settings restarts the Wi-Fi connection and may change its address.</p>
@@ -191,9 +198,12 @@ export function renderSetup(
   <label>Subnet mask<input name="static_subnet" value="${escapeHtml(config.static_subnet)}" inputmode="decimal" maxlength="15" /></label>
   <label>DNS server<input name="static_dns" value="${escapeHtml(config.static_dns)}" inputmode="decimal" maxlength="15" /></label>
   <label>Central server URL<input name="server_url" type="url" value="${escapeHtml(config.server_url)}" pattern="https://.*" maxlength="256" required /></label>
-  <label>Connection mode<select name="connection_mode">${["pull", "push", "hybrid"].map((mode) => `<option ${config.connection_mode === mode ? "selected" : ""}>${mode}</option>`).join("")}</select></label>
+  <label>Connection mode<select name="connection_mode"><option value="push" selected>Push (outbound HTTPS)</option></select><span class="field-note">This firmware supports push only and never accepts an inbound central-server connection.</span></label>
   <label>TLS trust update<select name="tls_trust_action"><option value="keep" selected>Keep current CA</option><option value="replace_ca">Replace with CA certificate</option></select><span class="field-note">${escapeHtml(trustSummary)}</span></label>
   <label>Replacement server CA certificate (public PEM)<textarea name="server_ca_pem" rows="7" maxlength="8192" spellcheck="false" placeholder="Required only when replacing the CA"></textarea><span class="field-note">Use the public <code>root.crt</code>, never Caddy's private <code>root.key</code>.</span></label>
+  <label>OTA signing trust update<select name="ota_trust_action"><option value="keep" selected>Keep current OTA key</option><option value="replace">Replace with Ed25519 public key</option></select><span class="field-note">${escapeHtml(otaTrustSummary)}</span></label>
+  <label>Replacement OTA signing-key ID<input name="ota_signing_key_id" maxlength="128" autocomplete="off" placeholder="Required only when replacing OTA trust" /></label>
+  <label>Replacement OTA Ed25519 public key (public PEM)<textarea name="ota_signing_public_key_pem" rows="5" maxlength="1024" spellcheck="false" placeholder="Required only when replacing OTA trust"></textarea><span class="field-note">Verify this public key through an independent administrator channel. Private keys are rejected.</span></label>
   <button type="submit">Save settings and reconnect</button><p id="network-settings-result" role="status"></p></form>
   <h3>Device identity and meter</h3>
   <form id="config-form" class="form-grid"><label>Friendly name<input name="friendly_name" value="${escapeHtml(config.friendly_name)}" minlength="1" maxlength="64" required /></label>
@@ -217,7 +227,7 @@ export function renderSetup(
   <label class="check"><input name="ct_ack" type="checkbox" /> I verified the configured CT rating matches the installed PZEM/CT set.</label>
   <button type="submit">Validate and apply</button><p id="config-result" role="status"></p></form>
   <h3>Enrollment</h3>
-  <form id="reenrollment-form" class="form-grid"><label>New one-time enrollment token<input name="enrollment_token" type="password" maxlength="256" autocomplete="off" required /></label><button class="danger" type="submit">Revoke and reenroll</button><p id="reenrollment-result" role="status"></p></form>
+  <form id="reenrollment-form" class="form-grid"><label>New one-time enrollment token<input name="enrollment_token" type="password" minlength="32" maxlength="256" autocomplete="off" required /><span class="field-note">Use the complete 32 through 256 character token issued by the server.</span></label><button class="danger" type="submit">Revoke and reenroll</button><p id="reenrollment-result" role="status"></p></form>
   <div class="scope-note"><strong>No rate settings:</strong> this device stores raw and normalized energy only. Utility rates and bill estimates belong on the central server.</div></section>`;
 }
 
@@ -239,6 +249,19 @@ export function readSetupForm(form: HTMLFormElement): SetupPayload {
   const ca = String(data.get("server_ca_pem") ?? "").trim();
   if (!ca)
     throw new Error("Provide the public server CA certificate in PEM format.");
+  const otaSigningPublicKeyPem = String(
+    data.get("ota_signing_public_key_pem") ?? "",
+  ).trim();
+  const otaSigningKeyId = String(data.get("ota_signing_key_id") ?? "").trim();
+  if (Boolean(otaSigningPublicKeyPem) !== Boolean(otaSigningKeyId)) {
+    throw new Error(
+      "Provide both the OTA Ed25519 public key and its signing-key ID, or leave both blank.",
+    );
+  }
+  const enrollmentToken = String(data.get("enrollment_token") ?? "");
+  if (enrollmentToken.length < 32 || enrollmentToken.length > 256) {
+    throw new Error("Enrollment token must contain 32 through 256 characters.");
+  }
   const ct = Number(data.get("ct_rating_a"));
   if (
     !Number.isFinite(ct) ||
@@ -277,11 +300,11 @@ export function readSetupForm(form: HTMLFormElement): SetupPayload {
     server_url: String(data.get("server_url") ?? "").trim(),
     server_ca_pem: ca,
     server_fingerprint: "",
-    enrollment_token: String(data.get("enrollment_token") ?? ""),
+    ota_signing_public_key_pem: otaSigningPublicKeyPem,
+    ota_signing_key_id: otaSigningKeyId,
+    enrollment_token: enrollmentToken,
     admin_password: adminPassword,
-    connection_mode: String(
-      data.get("connection_mode"),
-    ) as SetupPayload["connection_mode"],
+    connection_mode: "push",
     ct_rating_a: ct,
   };
 }
@@ -365,6 +388,24 @@ export function readNetworkSettingsForm(
   } else {
     throw new Error("Select a supported TLS trust update.");
   }
+  const otaTrustAction = String(
+    data.get("ota_trust_action") ?? "keep",
+  ) as NetworkSettingsPayload["ota_trust_action"];
+  const otaSigningPublicKeyPem = String(
+    data.get("ota_signing_public_key_pem") ?? "",
+  ).trim();
+  const otaSigningKeyId = String(data.get("ota_signing_key_id") ?? "").trim();
+  if (otaTrustAction === "keep") {
+    if (otaSigningPublicKeyPem || otaSigningKeyId)
+      throw new Error("Select replace before entering new OTA signing trust.");
+  } else if (otaTrustAction === "replace") {
+    if (!otaSigningPublicKeyPem || !otaSigningKeyId)
+      throw new Error(
+        "Replacing OTA trust requires both the Ed25519 public key and signing-key ID.",
+      );
+  } else {
+    throw new Error("Select a supported OTA trust update.");
+  }
 
   const payload: NetworkSettingsPayload = {
     wifi_ssid: wifiSsid,
@@ -375,12 +416,15 @@ export function readNetworkSettingsForm(
     static_dns: staticValues[3],
     server_url: serverUrl,
     tls_trust_action: trustAction,
-    connection_mode: String(
-      data.get("connection_mode") ?? "hybrid",
-    ) as NetworkSettingsPayload["connection_mode"],
+    ota_trust_action: otaTrustAction,
+    connection_mode: "push",
   };
   if (wifiPassword) payload.wifi_password = wifiPassword;
   if (trustAction === "replace_ca") payload.server_ca_pem = ca;
+  if (otaTrustAction === "replace") {
+    payload.ota_signing_public_key_pem = otaSigningPublicKeyPem;
+    payload.ota_signing_key_id = otaSigningKeyId;
+  }
   return payload;
 }
 

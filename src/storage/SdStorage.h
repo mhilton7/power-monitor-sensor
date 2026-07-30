@@ -56,16 +56,16 @@ struct HistoryPage {
 };
 
 class SdStorage {
- public:
+public:
   SdStorage();
   bool begin(std::uint32_t spi_hz);
   bool remount(std::uint32_t spi_hz);
-  bool append(IntervalRecord& record);
-  bool appendEvent(const std::string& code, const std::string& severity,
-                   const std::string& detail, std::uint64_t utc_ms,
-                   const std::string& boot_id);
-  HistoryPage readPage(const HistoryQuery& query);
-  HistoryPage readEvents(const HistoryQuery& query);
+  bool append(IntervalRecord &record);
+  bool appendEvent(const std::string &code, const std::string &severity,
+                   const std::string &detail, std::uint64_t utc_ms,
+                   const std::string &boot_id);
+  HistoryPage readPage(const HistoryQuery &query);
+  HistoryPage readEvents(const HistoryQuery &query);
   bool selfTest();
   bool rebuildIndexes();
   bool applyRetention(std::uint64_t server_ack_sequence,
@@ -74,23 +74,23 @@ class SdStorage {
   StorageHealth health() const;
   std::uint64_t nextSequence() const;
 
- private:
+private:
   bool initializeLayout();
   bool recover();
-  bool recoverFile(const std::string& path, std::uint64_t& maximum_sequence);
+  bool recoverFile(const std::string &path, std::uint64_t &maximum_sequence);
   bool writeManifest();
   bool persistSequence(std::uint64_t committed_sequence);
-  bool ensureDirectory(const std::string& path);
-  std::string recordPath(const IntervalRecord& record) const;
-  std::string indexPath(const IntervalRecord& record) const;
-  std::string eventPath(std::uint64_t utc_ms, const std::string& boot_id) const;
-  std::string serializeRecord(const IntervalRecord& record) const;
-  void collectFiles(const std::string& directory, const char* suffix,
-                    std::vector<std::string>& output) const;
-  HistoryPage readEnvelopeFiles(const std::vector<std::string>& paths,
-                                const HistoryQuery& query,
-                                const char* sequence_field);
-  bool appendIndex(const std::string& path, std::uint64_t sequence,
+  bool ensureDirectory(const std::string &path);
+  std::string recordPath(const IntervalRecord &record) const;
+  std::string indexPath(const IntervalRecord &record) const;
+  std::string eventPath(std::uint64_t utc_ms, const std::string &boot_id) const;
+  std::string serializeRecord(const IntervalRecord &record) const;
+  void collectFiles(const std::string &directory, const char *suffix,
+                    std::vector<std::string> &output) const;
+  HistoryPage readEnvelopeFiles(const std::vector<std::string> &paths,
+                                const HistoryQuery &query,
+                                const char *sequence_field);
+  bool appendIndex(const std::string &path, std::uint64_t sequence,
                    std::uint64_t utc_ms, std::uint64_t offset,
                    std::uint32_t payload_crc);
   void updateCapacity();
@@ -103,4 +103,4 @@ class SdStorage {
   std::uint64_t next_sequence_{1};
 };
 
-}  // namespace pm
+} // namespace pm

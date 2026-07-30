@@ -1,26 +1,62 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://powermonitor.local/schemas/ota-manifest-v1.schema.json",
-  "title": "Signed OTA manifest",
+  "title": "Power Monitor central-server firmware upload manifest",
+  "description": "The signature is Ed25519 over sorted compact JSON containing every property except signature.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "firmware_version", "protocol", "hardware_target",
-    "image_url", "image_size", "image_sha256", "minimum_rollback_version",
-    "release_notes", "signature_algorithm", "signature"
+    "version",
+    "channel",
+    "hardware_target",
+    "protocol_min",
+    "protocol_max",
+    "sha256",
+    "signature",
+    "signing_key_id",
+    "release_notes"
   ],
   "properties": {
-    "schema_version": {"const": 1},
-    "firmware_version": {"type": "string"},
-    "protocol": {"const": "pm-protocol/1.0.0"},
-    "hardware_target": {"const": "esp32-s3-n16r8"},
-    "image_url": {"type": "string", "pattern": "^https://"},
-    "image_size": {"type": "integer", "minimum": 1, "maximum": 6291456},
-    "image_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "minimum_rollback_version": {"type": "string"},
-    "release_notes": {"type": "string", "maxLength": 4096},
-    "signature_algorithm": {"const": "ecdsa-p256-sha256"},
-    "signature": {"type": "string", "minLength": 8}
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "channel": {
+      "enum": ["development", "canary", "stable"]
+    },
+    "hardware_target": {
+      "const": "esp32-s3-n16r8"
+    },
+    "protocol_min": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "protocol_max": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 88,
+      "maxLength": 88,
+      "pattern": "^[A-Za-z0-9+/]{86}==$"
+    },
+    "signing_key_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "release_notes": {
+      "type": "string",
+      "maxLength": 20000
+    }
   }
 }
-

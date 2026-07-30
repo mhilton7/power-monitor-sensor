@@ -17,8 +17,11 @@ def git_commit() -> str:
     executable = shutil.which("git")
     if executable is not None:
         result = subprocess.run(
-            [executable, "rev-parse", "--short=12", "HEAD"], cwd=ROOT,
-            text=True, capture_output=True, check=False,
+            [executable, "rev-parse", "--short=12", "HEAD"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -45,5 +48,6 @@ env.Append(  # type: ignore[name-defined]
     CPPDEFINES=[
         ("PM_GIT_COMMIT", env.StringifyMacro(git_commit())),  # type: ignore[name-defined]
         ("PM_BUILD_TIMESTAMP", env.StringifyMacro(build_timestamp)),  # type: ignore[name-defined]
+        ("PM_BUILD_UNIX_SECONDS", int(timestamp.timestamp())),
     ]
 )

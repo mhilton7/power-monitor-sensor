@@ -6,29 +6,73 @@
 #include <cstring>
 
 #include <esp_system.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <mbedtls/md.h>
-#include <mbedtls/pkcs5.h>
 #include <mbedtls/sha256.h>
 
 namespace pm::crypto {
 namespace {
 
-const mbedtls_md_info_t* sha256Info() {
+const mbedtls_md_info_t *sha256Info() {
   return mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
 }
 
-bool derivePasswordHash(const std::string& password,
-                        const std::array<std::uint8_t, 16>& salt,
-                        const std::uint32_t iterations, Key32& output) {
+bool derivePasswordHash(const std::string &password,
+                        const std::array<std::uint8_t, 16> &salt,
+                        const std::uint32_t iterations, Key32 &output,
+                        const std::uint32_t timeout_ms) {
+  output.fill(0);
+  if (iterations == 0 || timeout_ms == 0)
+    return false;
+  const std::int64_t started_us = esp_timer_get_time();
+  const std::int64_t budget_us = static_cast<std::int64_t>(timeout_ms) * 1000;
   mbedtls_md_context_t context;
   mbedtls_md_init(&context);
-  const bool ready = mbedtls_md_setup(&context, sha256Info(), 1) == 0;
-  const bool derived =
-      ready &&
-      mbedtls_pkcs5_pbkdf2_hmac(
-          &context, reinterpret_cast<const std::uint8_t*>(password.data()),
-          password.size(), salt.data(), salt.size(), iterations, output.size(),
-          output.data()) == 0;
+  bool derived =
+      mbedtls_md_setup(&context, sha256Info(), 1) == 0 &&
+      mbedtls_md_hmac_starts(
+          &context, reinterpret_cast<const std::uint8_t *>(password.data()),
+          password.size()) == 0;
+  std::array<std::uint8_t, 32> block{};
+  std::array<std::uint8_t, 32> accumulator{};
+  const std::array<std::uint8_t, 4> block_index{0U, 0U, 0U, 1U};
+  if (derived) {
+    derived = mbedtls_md_hmac_update(&context, salt.data(), salt.size()) == 0 &&
+              mbedtls_md_hmac_update(&context, block_index.data(),
+                                     block_index.size()) == 0 &&
+              mbedtls_md_hmac_finish(&context, block.data()) == 0;
+    accumulator = block;
+  }
+  for (std::uint32_t iteration = 1; derived && iteration < iterations;
+       ++iteration) {
+    derived =
+        mbedtls_md_hmac_reset(&context) == 0 &&
+        mbedtls_md_hmac_update(&context, block.data(), block.size()) == 0 &&
+        mbedtls_md_hmac_finish(&context, block.data()) == 0;
+    if (derived) {
+      for (std::size_t index = 0; index < accumulator.size(); ++index) {
+        accumulator[index] ^= block[index];
+      }
+    }
+    if ((iteration & 0xFFU) == 0U) {
+      // PBKDF2 remains 120,000 rounds, but periodically yielding lets the
+      // ESP32-S3 USB/TCP tasks and task watchdog make progress.
+      vTaskDelay(pdMS_TO_TICKS(1));
+      if (esp_timer_get_time() - started_us >= budget_us) {
+        derived = false;
+      }
+    }
+  }
+  if (derived && esp_timer_get_time() - started_us < budget_us) {
+    output = accumulator;
+  } else {
+    derived = false;
+    output.fill(0);
+  }
+  std::fill(block.begin(), block.end(), 0U);
+  std::fill(accumulator.begin(), accumulator.end(), 0U);
   mbedtls_md_free(&context);
   return derived;
 }
@@ -46,15 +90,15 @@ std::uint8_t hexNibble(const char character) {
   return 0xFFU;
 }
 
-}  // namespace
+} // namespace
 
-Key32 sha256(const std::uint8_t* data, const std::size_t length) {
+Key32 sha256(const std::uint8_t *data, const std::size_t length) {
   Key32 output{};
   mbedtls_sha256_ret(data, length, output.data(), 0);
   return output;
 }
 
-std::string hexEncode(const std::uint8_t* data, const std::size_t length) {
+std::string hexEncode(const std::uint8_t *data, const std::size_t length) {
   static constexpr char digits[] = "0123456789abcdef";
   std::string output(length * 2U, '0');
   for (std::size_t index = 0; index < length; ++index) {
@@ -64,7 +108,7 @@ std::string hexEncode(const std::uint8_t* data, const std::size_t length) {
   return output;
 }
 
-bool hexDecode(const std::string& hex, std::vector<std::uint8_t>& output) {
+bool hexDecode(const std::string &hex, std::vector<std::uint8_t> &output) {
   if ((hex.size() & 1U) != 0U) {
     return false;
   }
@@ -81,29 +125,29 @@ bool hexDecode(const std::string& hex, std::vector<std::uint8_t>& output) {
   return true;
 }
 
-std::string sha256Hex(const std::uint8_t* data, const std::size_t length) {
+std::string sha256Hex(const std::uint8_t *data, const std::size_t length) {
   const Key32 digest = sha256(data, length);
   return hexEncode(digest.data(), digest.size());
 }
 
-Key32 hmacSha256(const std::uint8_t* key, const std::size_t key_length,
-                 const std::uint8_t* data, const std::size_t data_length) {
+Key32 hmacSha256(const std::uint8_t *key, const std::size_t key_length,
+                 const std::uint8_t *data, const std::size_t data_length) {
   Key32 output{};
-  mbedtls_md_hmac(sha256Info(), key, key_length, data, data_length, output.data());
+  mbedtls_md_hmac(sha256Info(), key, key_length, data, data_length,
+                  output.data());
   return output;
 }
 
-std::string hmacSha256Hex(const std::uint8_t* key,
-                          const std::size_t key_length,
-                          const std::string& data) {
+std::string hmacSha256Hex(const std::uint8_t *key, const std::size_t key_length,
+                          const std::string &data) {
   const Key32 digest = hmacSha256(
-      key, key_length, reinterpret_cast<const std::uint8_t*>(data.data()),
+      key, key_length, reinterpret_cast<const std::uint8_t *>(data.data()),
       data.size());
   return hexEncode(digest.data(), digest.size());
 }
 
-Key32 hkdfSha256(const std::uint8_t* secret,
-                 const std::size_t secret_length, const std::string& info) {
+Key32 hkdfSha256(const std::uint8_t *secret, const std::size_t secret_length,
+                 const std::string &info) {
   // RFC 5869 with an omitted salt (HashLen zero octets). A single expansion
   // block is sufficient because the caller requests exactly SHA-256 length.
   Key32 zero_salt{};
@@ -115,18 +159,11 @@ Key32 hkdfSha256(const std::uint8_t* secret,
                     expansion.data(), expansion.size());
 }
 
-bool constantTimeEqual(const std::string& left, const std::string& right) {
-  const std::size_t maximum = std::max(left.size(), right.size());
-  std::uint8_t difference = static_cast<std::uint8_t>(left.size() ^ right.size());
-  for (std::size_t index = 0; index < maximum; ++index) {
-    const std::uint8_t a = index < left.size() ? left[index] : 0U;
-    const std::uint8_t b = index < right.size() ? right[index] : 0U;
-    difference |= static_cast<std::uint8_t>(a ^ b);
-  }
-  return difference == 0U;
+bool constantTimeEqual(const std::string &left, const std::string &right) {
+  return constantTimeEqualPortable(left, right);
 }
 
-void secureRandom(std::uint8_t* output, const std::size_t length) {
+void secureRandom(std::uint8_t *output, const std::size_t length) {
   esp_fill_random(output, length);
 }
 
@@ -151,68 +188,11 @@ std::string uuidV4() {
   return output;
 }
 
-std::string percentEncode(const std::string& input) {
-  static constexpr char digits[] = "0123456789ABCDEF";
-  std::string output;
-  output.reserve(input.size());
-  for (const unsigned char character : input) {
-    if (std::isalnum(character) != 0 || character == '-' || character == '.' ||
-        character == '_' || character == '~') {
-      output.push_back(static_cast<char>(character));
-    } else {
-      output.push_back('%');
-      output.push_back(digits[character >> 4U]);
-      output.push_back(digits[character & 0x0FU]);
-    }
-  }
-  return output;
+bool passwordHash(const std::string &password,
+                  const std::array<std::uint8_t, 16> &salt,
+                  const std::uint32_t iterations, Key32 &output,
+                  const std::uint32_t timeout_ms) {
+  return derivePasswordHash(password, salt, iterations, output, timeout_ms);
 }
 
-std::string canonicalPathQuery(
-    const std::string& path,
-    const std::vector<std::pair<std::string, std::string>>& query) {
-  std::vector<std::pair<std::string, std::string>> encoded;
-  encoded.reserve(query.size());
-  for (const auto& item : query) {
-    encoded.emplace_back(percentEncode(item.first), percentEncode(item.second));
-  }
-  std::sort(encoded.begin(), encoded.end());
-  if (encoded.empty()) {
-    return path;
-  }
-  std::string result = path + "?";
-  for (std::size_t index = 0; index < encoded.size(); ++index) {
-    if (index != 0) {
-      result.push_back('&');
-    }
-    result += encoded[index].first + "=" + encoded[index].second;
-  }
-  return result;
-}
-
-std::string canonicalRequest(const std::string& method,
-                             const std::string& path_query,
-                             const std::string& timestamp,
-                             const std::string& nonce,
-                             const std::string& body_hash) {
-  std::string uppercase_method = method;
-  std::transform(uppercase_method.begin(), uppercase_method.end(),
-                 uppercase_method.begin(),
-                 [](const unsigned char character) {
-                   return static_cast<char>(std::toupper(character));
-                 });
-  return "PM-HMAC-SHA256-V1\n" + uppercase_method + "\n" + path_query + "\n" +
-         timestamp + "\n" + nonce + "\n" + body_hash;
-}
-
-Key32 passwordHash(const std::string& password,
-                   const std::array<std::uint8_t, 16>& salt,
-                   const std::uint32_t iterations) {
-  Key32 output{};
-  if (!derivePasswordHash(password, salt, iterations, output)) {
-    output.fill(0);
-  }
-  return output;
-}
-
-}  // namespace pm::crypto
+} // namespace pm::crypto

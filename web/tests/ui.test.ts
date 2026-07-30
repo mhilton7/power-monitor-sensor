@@ -66,6 +66,8 @@ const config: EffectiveConfig = {
   server_url: "https://server.local",
   server_ca_configured: true,
   server_fingerprint_configured: false,
+  ota_signing_key_configured: false,
+  ota_signing_key_id: "",
   connection_mode: "hybrid",
   sample_interval_seconds: 1,
   durable_log_interval_seconds: 60,
@@ -88,6 +90,7 @@ describe("local diagnostics UI", () => {
           csrf: "job-csrf",
           expires_in_seconds: 900,
           setup_required: false,
+          elevated: true,
         },
       },
     ];
@@ -106,6 +109,7 @@ describe("local diagnostics UI", () => {
     expect(session).toEqual({
       expiresInSeconds: 900,
       setupRequired: false,
+      elevated: true,
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(String(fetchMock.mock.calls[1][0])).toContain(
@@ -126,6 +130,9 @@ describe("local diagnostics UI", () => {
     ];
     expect(buttons[1].dataset.view).toBe("setup");
     expect(buttons[1].textContent).toBe("Settings");
+    expect(
+      document.querySelector("#notification-region")?.getAttribute("aria-live"),
+    ).toBe("polite");
     expect(document.body.textContent).toContain("Power Monitor Sensor Agent");
   });
 
@@ -175,6 +182,10 @@ describe("local diagnostics UI", () => {
         ?.type,
     ).toBe("password");
     expect(
+      document.querySelector<HTMLInputElement>('[name="enrollment_token"]')
+        ?.minLength,
+    ).toBe(32);
+    expect(
       document.querySelector<HTMLInputElement>('[name="admin_password"]')
         ?.autocomplete,
     ).toBe("new-password");
@@ -183,6 +194,13 @@ describe("local diagnostics UI", () => {
     );
     expect(wifiPassword?.required).toBe(true);
     expect(wifiPassword?.minLength).toBe(8);
+    expect(
+      [
+        ...document.querySelectorAll<HTMLOptionElement>(
+          '[name="connection_mode"] option',
+        ),
+      ].map((option) => option.value),
+    ).toEqual(["push"]);
     expect(document.body.textContent).toContain("Secrets are write-only");
   });
 
@@ -214,6 +232,7 @@ describe("local diagnostics UI", () => {
     Object.defineProperty(form, "reportValidity", { value: () => true });
     const payload = readNetworkSettingsForm(form, config);
     expect(payload.wifi_ssid).toBe("Test");
+    expect(payload.connection_mode).toBe("push");
     expect(payload.tls_trust_action).toBe("keep");
     expect(payload).not.toHaveProperty("wifi_password");
     expect(payload).not.toHaveProperty("server_ca_pem");
@@ -267,6 +286,91 @@ describe("local diagnostics UI", () => {
     await vi.waitFor(() => expect(root.textContent).toContain("Garage HVAC"));
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/auth/session");
     expect(root.querySelector("#login-form")).toBeNull();
+  });
+
+  it("reports action progress, queue acceptance, rejection, and dismissal", async () => {
+    const responses = [
+      { csrf: "csrf", expires_in_seconds: 900, setup_required: false },
+      health,
+      live,
+      config,
+      { index_healthy: true },
+      {},
+      {},
+      { records: [] },
+    ];
+    let resolveTlsAction: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+      const path = String(input);
+      if (path === "/api/v1/actions/test-server-tls") {
+        return new Promise((resolve) => {
+          resolveTlsAction = resolve;
+        });
+      }
+      if (path === "/api/v1/actions/test-dns") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              code: "action_queue_full",
+              detail: "The maintenance queue is full.",
+            }),
+            {
+              status: 429,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(responses.shift() ?? {}), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    document.body.innerHTML = '<div id="app"></div>';
+    const root = document.querySelector<HTMLElement>("#app")!;
+    new App(root).start();
+    await vi.waitFor(() => expect(root.textContent).toContain("Garage HVAC"));
+
+    root.querySelector<HTMLButtonElement>('[data-view="network"]')!.click();
+    const tlsButton = root.querySelector<HTMLButtonElement>(
+      '[data-action="test-server-tls"]',
+    )!;
+    tlsButton.click();
+    expect(tlsButton.disabled).toBe(true);
+    expect(tlsButton.getAttribute("aria-busy")).toBe("true");
+    expect(root.querySelector("#notification-region")?.textContent).toContain(
+      "Sending Test server TLS",
+    );
+
+    resolveTlsAction?.(
+      new Response(JSON.stringify({ status: "queued" }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(root.querySelector("#notification-region")?.textContent).toContain(
+        "Test server TLS was queued by the device",
+      ),
+    );
+    expect(tlsButton.disabled).toBe(false);
+    expect(tlsButton.hasAttribute("aria-busy")).toBe(false);
+
+    root.querySelector<HTMLButtonElement>('[data-action="test-dns"]')!.click();
+    await vi.waitFor(() =>
+      expect(root.querySelector("#notification-region")?.textContent).toContain(
+        "Test DNS failed: The maintenance queue is full.",
+      ),
+    );
+    expect(
+      root.querySelector("#notification-region [role='alert']"),
+    ).not.toBeNull();
+
+    root.querySelector<HTMLButtonElement>(".notification-dismiss")!.click();
+    expect(root.querySelector("#notification-region")?.textContent).toBe("");
   });
 
   it("renders available diagnostics when the first meter snapshot is unavailable", async () => {
@@ -382,7 +486,7 @@ describe("local diagnostics UI", () => {
       { status: "setup_applied" },
     ];
     const fetchMock = vi.fn(
-      async (_input: RequestInfo | URL) =>
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
         new Response(JSON.stringify(responses.shift() ?? {}), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -404,7 +508,7 @@ describe("local diagnostics UI", () => {
       "server_ca_pem",
       "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----",
     );
-    setValue("enrollment_token", "single-use-token");
+    setValue("enrollment_token", "t".repeat(32));
     setValue("admin_password", "correct horse battery staple");
     setValue("admin_password_confirm", "correct horse battery staple");
     (form.elements.namedItem("ct_ack") as HTMLInputElement).checked = true;
@@ -414,6 +518,15 @@ describe("local diagnostics UI", () => {
     for (let index = 0; index < 30; index += 1) await Promise.resolve();
     expect(root.textContent).toContain("Setup saved");
     expect(root.textContent).toContain("Reconnect this phone or computer");
+    expect(root.querySelector("#notification-region")?.textContent).toContain(
+      "First-run setup was saved",
+    );
+    const setupCall = fetchMock.mock.calls.find(
+      ([path]) => path === "/api/v1/setup/apply",
+    );
+    expect(new Headers(setupCall?.[1]?.headers).get("Prefer")).toBe(
+      "respond-async",
+    );
     const callsAfterSetup = fetchMock.mock.calls.length;
     await vi.advanceTimersByTimeAsync(10_000);
     expect(fetchMock).toHaveBeenCalledTimes(callsAfterSetup);
@@ -432,6 +545,12 @@ describe("local diagnostics UI", () => {
       {},
       { records: [] },
       {
+        csrf: "elevated-csrf",
+        expires_in_seconds: 900,
+        setup_required: false,
+        elevated: true,
+      },
+      {
         status: "network_settings_applied",
         config_version: 2,
         network_apply_queued: true,
@@ -439,7 +558,7 @@ describe("local diagnostics UI", () => {
       },
     ];
     const fetchMock = vi.fn(
-      async (_input: RequestInfo | URL) =>
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
         new Response(JSON.stringify(responses.shift() ?? {}), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -455,16 +574,173 @@ describe("local diagnostics UI", () => {
     form.dispatchEvent(
       new Event("submit", { bubbles: true, cancelable: true }),
     );
+    await vi.waitFor(() =>
+      expect(root.querySelector("#elevation-dialog")).not.toBeNull(),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([path]) => path === "/api/v1/network-settings",
+      ),
+    ).toBe(false);
+    const elevationForm = root.querySelector<HTMLFormElement>(
+      "#elevation-dialog form",
+    )!;
+    const elevationPassword = elevationForm.querySelector<HTMLInputElement>(
+      'input[type="password"]',
+    )!;
+    elevationPassword.value = "correct horse battery staple";
+    elevationForm.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
     for (let index = 0; index < 30; index += 1) await Promise.resolve();
     expect(root.textContent).toContain("Network/server settings saved");
+    expect(root.querySelector("#notification-region")?.textContent).toContain(
+      "Wi-Fi and server settings were saved",
+    );
     expect(
       fetchMock.mock.calls.some(
         ([path]) => path === "/api/v1/network-settings",
       ),
     ).toBe(true);
+    const networkCall = fetchMock.mock.calls.find(
+      ([path]) => path === "/api/v1/network-settings",
+    );
+    expect(new Headers(networkCall?.[1]?.headers).get("Prefer")).toBe(
+      "respond-async",
+    );
+    expect(root.querySelector("#elevation-dialog")).toBeNull();
+    expect(root.textContent).not.toContain("correct horse battery staple");
     const callsAfterSave = fetchMock.mock.calls.length;
     await vi.advanceTimersByTimeAsync(10_000);
     expect(fetchMock).toHaveBeenCalledTimes(callsAfterSave);
+    vi.useRealTimers();
+  });
+
+  it("does not replace an elevated session when an older refresh returns 401", async () => {
+    vi.useFakeTimers();
+    const json = (body: unknown, status = 200): Response =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    const diagnosticResponses = new Map<string, unknown>([
+      ["/api/v1/health", health],
+      ["/api/v1/live", live],
+      ["/api/v1/config", config],
+      ["/api/v1/storage", { index_healthy: true }],
+      ["/api/v1/metrics", {}],
+      ["/api/v1/ota/status", {}],
+    ]);
+    const staleResolvers: Array<(response: Response) => void> = [];
+    let deferDiagnostics = false;
+    let resolveJobPoll: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn(
+      async (
+        input: RequestInfo | URL,
+        init?: RequestInit,
+      ): Promise<Response> => {
+        const path = String(input);
+        if (path === "/api/v1/auth/session") {
+          return json({
+            csrf: "normal-csrf",
+            expires_in_seconds: 900,
+            setup_required: false,
+            elevated: false,
+          });
+        }
+        if (path === "/api/v1/auth/login") {
+          return json({
+            csrf: "elevated-csrf",
+            expires_in_seconds: 900,
+            setup_required: false,
+            elevated: true,
+          });
+        }
+        if (path === "/api/v1/network-settings") {
+          expect(new Headers(init?.headers).get("X-PM-CSRF")).toBe(
+            "elevated-csrf",
+          );
+          return json({ status: "queued", job_id: "f".repeat(32) }, 202);
+        }
+        if (path.startsWith("/api/v1/auth/password-jobs")) {
+          return new Promise<Response>((resolve) => {
+            resolveJobPoll = resolve;
+          });
+        }
+        if (path.startsWith("/api/v1/events")) {
+          return json({ records: [] });
+        }
+        const diagnostic = diagnosticResponses.get(path);
+        if (diagnostic !== undefined) {
+          if (!deferDiagnostics) return json(diagnostic);
+          return new Promise<Response>((resolve) => {
+            staleResolvers.push(resolve);
+          });
+        }
+        throw new Error(`Unexpected request: ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    document.body.innerHTML = '<div id="app"></div>';
+    const root = document.querySelector<HTMLElement>("#app")!;
+    new App(root).start();
+    await vi.waitFor(() => expect(root.textContent).toContain("Garage HVAC"));
+
+    deferDiagnostics = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.waitFor(() => expect(staleResolvers).toHaveLength(6));
+
+    root.querySelector<HTMLButtonElement>('[data-view="setup"]')!.click();
+    const form = root.querySelector<HTMLFormElement>("#network-settings-form")!;
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await vi.waitFor(() =>
+      expect(root.querySelector("#elevation-dialog")).not.toBeNull(),
+    );
+    const elevationForm = root.querySelector<HTMLFormElement>(
+      "#elevation-dialog form",
+    )!;
+    elevationForm.querySelector<HTMLInputElement>(
+      'input[type="password"]',
+    )!.value = "correct horse battery staple";
+    elevationForm.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await vi.waitFor(() => expect(resolveJobPoll).toBeTypeOf("function"));
+
+    for (const resolve of staleResolvers) {
+      resolve(
+        json(
+          {
+            code: "authentication_required",
+            detail: "The old session is no longer valid.",
+          },
+          401,
+        ),
+      );
+    }
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(
+      fetchMock.mock.calls.filter(([path]) => path === "/api/v1/auth/session"),
+    ).toHaveLength(1);
+
+    resolveJobPoll!(
+      json({
+        status: "network_settings_applied",
+        saved: true,
+        verified: true,
+        config_version: 2,
+        network_apply_queued: true,
+        reboot_queued: false,
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(root.textContent).toContain("Network/server settings saved"),
+    );
+    expect(
+      fetchMock.mock.calls.filter(([path]) => path === "/api/v1/auth/session"),
+    ).toHaveLength(1);
     vi.useRealTimers();
   });
 

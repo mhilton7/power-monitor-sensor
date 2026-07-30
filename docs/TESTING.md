@@ -2,7 +2,7 @@
 
 All automated tests are host/low-voltage only. Never connect live mains for them.
 
-- `python -m unittest discover -s test -p 'test_*.py' -v`: canonical HMAC/HKDF/replay, schemas/OpenAPI, PMR1 CRC/tail/index, OTA ECDSA tamper rejection, and loopback enrollment/heartbeat/backfill/dedupe/conflict.
+- `python -m unittest discover -s test -p 'test_*.py' -v`: canonical HMAC/HKDF/replay, schemas/OpenAPI, PMR1 CRC/tail/index, OTA Ed25519 canonicalization/tamper rejection, and loopback enrollment/heartbeat/backfill/dedupe/conflict/firmware download.
 - PlatformIO `native-tests` plus its executable: PZEM request/CRC/parser faults, measurement limits, energy reset/rollover/integration, interval duplicate handling, retention protection, record CRC.
 - `npm test -- --run`: login, status, persistent SD warning, setup/write-only secrets, destructive confirmation, mobile and keyboard behavior.
 - ESP32 release, debug, and simulated-meter environments.

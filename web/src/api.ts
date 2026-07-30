@@ -47,6 +47,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export interface SessionResult {
   expiresInSeconds: number;
   setupRequired: boolean;
+  elevated: boolean;
 }
 
 async function establishSession(
@@ -62,21 +63,24 @@ async function establishSession(
         csrf: string;
         expires_in_seconds: number;
         setup_required: boolean;
+        elevated: boolean;
       }>(queued.job_id)
     : (queued as {
         csrf: string;
         expires_in_seconds: number;
         setup_required: boolean;
+        elevated: boolean;
       });
   csrfToken = result.csrf;
   return {
     expiresInSeconds: result.expires_in_seconds,
     setupRequired: result.setup_required,
+    elevated: result.elevated === true,
   };
 }
 
 async function waitForPasswordJob<T>(jobId: string): Promise<T> {
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     const result = await request<T & { status?: string }>(
       `/api/v1/auth/password-jobs?job_id=${encodeURIComponent(jobId)}`,
@@ -94,12 +98,40 @@ async function waitForPasswordJob<T>(jobId: string): Promise<T> {
 async function queuePasswordOperation<T>(
   path: string,
   body: string,
+  method: "POST" | "PUT" = "POST",
+  headers?: HeadersInit,
 ): Promise<T> {
+  const operationHeaders = new Headers(headers);
+  operationHeaders.set("Prefer", "respond-async");
   const queued = await request<{ job_id?: string }>(path, {
-    method: "POST",
+    method,
+    headers: operationHeaders,
     body,
   });
   return queued.job_id ? waitForPasswordJob<T>(queued.job_id) : (queued as T);
+}
+
+async function waitForHistoryJob<T>(jobId: string): Promise<T> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const result = await request<T & { status?: string }>(
+      `/api/v1/history-jobs?job_id=${encodeURIComponent(jobId)}`,
+    );
+    if (result.status !== "pending") return result;
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  throw new ApiError(
+    504,
+    "history_job_timeout",
+    "The device did not finish the bounded history request in time.",
+  );
+}
+
+async function requestHistory<T>(path: string): Promise<T> {
+  const queued = await request<T & { job_id?: string }>(path, {
+    headers: { Prefer: "respond-async" },
+  });
+  return queued.job_id ? waitForHistoryJob<T>(queued.job_id) : (queued as T);
 }
 
 export function openSession(): Promise<SessionResult> {
@@ -126,7 +158,7 @@ export const getMetrics = (): Promise<Record<string, unknown>> =>
 export const getOtaStatus = (): Promise<Record<string, unknown>> =>
   request("/api/v1/ota/status");
 export const getEvents = (): Promise<Record<string, unknown>> =>
-  request("/api/v1/events?limit=20");
+  requestHistory("/api/v1/events?limit=20");
 
 export async function exportHistory(
   afterSequence: number,
@@ -140,7 +172,10 @@ export async function exportHistory(
   if (fromUtc) parameters.set("from_utc", fromUtc);
   if (toUtc) parameters.set("to_utc", toUtc);
   const response = await fetch(`/api/v1/readings?${parameters}`, {
-    headers: { Accept: "application/x-ndjson" },
+    headers: {
+      Accept: "application/x-ndjson",
+      Prefer: "respond-async",
+    },
     credentials: "same-origin",
     cache: "no-store",
   });
@@ -155,20 +190,65 @@ export async function exportHistory(
       problem.detail ?? "History export failed.",
     );
   }
-  return response.blob();
+  if (response.status !== 202) return response.blob();
+  const queued = (await response.json()) as { job_id?: string };
+  if (!queued.job_id) {
+    throw new ApiError(
+      502,
+      "history_job_invalid",
+      "The device returned an invalid history job response.",
+    );
+  }
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const result = await fetch(
+      `/api/v1/history-jobs?job_id=${encodeURIComponent(queued.job_id)}`,
+      {
+        headers: { Accept: "application/x-ndjson" },
+        credentials: "same-origin",
+        cache: "no-store",
+      },
+    );
+    if (result.status === 202) {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+      continue;
+    }
+    if (!result.ok) {
+      const problem = (await result.json().catch(() => ({}))) as {
+        code?: string;
+        detail?: string;
+      };
+      throw new ApiError(
+        result.status,
+        problem.code ?? "export_failed",
+        problem.detail ?? "History export failed.",
+      );
+    }
+    return result.blob();
+  }
+  throw new ApiError(
+    504,
+    "history_job_timeout",
+    "The device did not finish the bounded history export in time.",
+  );
 }
 
 export function updateConfig(
   config: EffectiveConfig,
   ctAcknowledged: boolean,
 ): Promise<Record<string, unknown>> {
-  return request("/api/v1/config", {
+  const headers = new Headers();
+  headers.set("X-PM-CT-Change-Acknowledged", ctAcknowledged ? "true" : "false");
+  headers.set("Prefer", "respond-async");
+  return request<{ job_id?: string }>("/api/v1/config", {
     method: "PUT",
-    headers: {
-      "X-PM-CT-Change-Acknowledged": ctAcknowledged ? "true" : "false",
-    },
+    headers,
     body: JSON.stringify(config),
-  });
+  }).then((queued) =>
+    queued.job_id
+      ? waitForPasswordJob<Record<string, unknown>>(queued.job_id)
+      : (queued as Record<string, unknown>),
+  );
 }
 
 export function applySetup(
@@ -180,20 +260,31 @@ export function applySetup(
 export function updateNetworkSettings(
   payload: NetworkSettingsPayload,
 ): Promise<Record<string, unknown>> {
-  return request("/api/v1/network-settings", {
-    method: "PUT",
-    body: JSON.stringify(payload),
-  });
+  return queuePasswordOperation<Record<string, unknown>>(
+    "/api/v1/network-settings",
+    JSON.stringify(payload),
+    "PUT",
+  );
 }
 
 export function beginReenrollment(
   token: string,
 ): Promise<Record<string, unknown>> {
-  return request("/api/v1/enrollment/reenroll", {
-    method: "POST",
-    headers: { "X-PM-Action-Token": "REENROLL" },
-    body: JSON.stringify({ enrollment_token: token }),
-  });
+  if (token.length < 32 || token.length > 256) {
+    return Promise.reject(
+      new ApiError(
+        422,
+        "enrollment_token_invalid",
+        "Enrollment token must contain 32 through 256 characters.",
+      ),
+    );
+  }
+  return queuePasswordOperation<Record<string, unknown>>(
+    "/api/v1/enrollment/reenroll",
+    JSON.stringify({ enrollment_token: token }),
+    "POST",
+    { "X-PM-Action-Token": "REENROLL" },
+  );
 }
 
 export function runAction(

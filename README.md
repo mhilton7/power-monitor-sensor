@@ -3,7 +3,7 @@
 Serial troubleshooting, commands, stable error codes, and backtrace capture
 are documented in [docs/SERIAL_DIAGNOSTICS.md](docs/SERIAL_DIAGNOSTICS.md).
 
-Production firmware for an ESP32-S3 N16R8, one PZEM-004T V4.x meter, and a mandatory SPI microSD card. One runtime-provisioned image samples the meter, writes authoritative interval history to microSD, exposes the authenticated `pm-protocol/1.0.0` device API, enrolls with a central server, sends heartbeats, backfills by pull/push/hybrid synchronization, and accepts only signed OTA releases.
+Production firmware for an ESP32-S3 N16R8, one PZEM-004T V4.x meter, and a mandatory SPI microSD card. One runtime-provisioned image samples the meter, writes authoritative interval history to microSD, exposes the authenticated `pm-protocol/1.0.0` device API, enrolls with a central server, sends heartbeats, backfills by outbound push synchronization, and accepts only signed OTA releases. The v1 field still recognizes the reserved `pull` and `hybrid` names, but this build rejects them because the local device API is not a mutually authenticated HTTPS listener.
 
 This is a monitoring-only product. It contains no load control and performs no electricity-rate or bill calculation. One CT measures only the conductor passing through it; it is not normally a complete North American split-phase whole-home monitor.
 

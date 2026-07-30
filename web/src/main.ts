@@ -17,6 +17,8 @@ import {
 } from "./ui";
 import type { EffectiveConfig, Health, LiveReading } from "./types";
 
+type NotificationTone = "info" | "pending" | "success" | "error";
+
 export class App {
   private sessionTimer = 0;
   private pollTimer = 0;
@@ -32,10 +34,192 @@ export class App {
   private setupFormDirty = false;
   private provisioningComplete = false;
   private refreshInProgress = false;
+  private eventsRefreshInProgress = false;
+  private privilegedOperationInProgress = false;
+  private reconnectAfterPrivilegedOperation = false;
   private refreshWarning = "";
   private bannerHtml = "";
 
   constructor(private readonly root: HTMLElement) {}
+
+  private notify(tone: NotificationTone, message: string): void {
+    const region = this.root.querySelector<HTMLElement>("#notification-region");
+    if (!region) return;
+    const notification = document.createElement("div");
+    notification.className = `notification notification-${tone}`;
+    notification.setAttribute("role", tone === "error" ? "alert" : "status");
+
+    const content = document.createElement("div");
+    const heading = document.createElement("strong");
+    heading.textContent =
+      tone === "pending"
+        ? "Request in progress"
+        : tone === "success"
+          ? "Request accepted"
+          : tone === "error"
+            ? "Request failed"
+            : "Notice";
+    const detail = document.createElement("span");
+    detail.textContent = message;
+    content.append(heading, detail);
+
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "notification-dismiss";
+    dismiss.textContent = "Dismiss";
+    dismiss.setAttribute("aria-label", "Dismiss notification");
+    dismiss.addEventListener("click", () => region.replaceChildren());
+
+    notification.append(content, dismiss);
+    region.replaceChildren(notification);
+  }
+
+  private errorMessage(error: unknown, fallback: string): string {
+    return error instanceof Error ? error.message : fallback;
+  }
+
+  private beginPrivilegedOperation(): boolean {
+    if (this.privilegedOperationInProgress) return false;
+    this.privilegedOperationInProgress = true;
+    this.reconnectAfterPrivilegedOperation = false;
+    this.stopPolling();
+    return true;
+  }
+
+  private finishPrivilegedOperation(): void {
+    if (!this.privilegedOperationInProgress) return;
+    this.privilegedOperationInProgress = false;
+    if (this.provisioningComplete) {
+      this.reconnectAfterPrivilegedOperation = false;
+      return;
+    }
+    if (this.reconnectAfterPrivilegedOperation) {
+      this.reconnectAfterPrivilegedOperation = false;
+      void this.connect();
+      return;
+    }
+    this.startPolling();
+  }
+
+  private requestElevation(operation: string): Promise<boolean> {
+    if (!this.beginPrivilegedOperation()) {
+      this.notify(
+        "info",
+        "Finish the current administrator-authorized operation before starting another.",
+      );
+      return Promise.resolve(false);
+    }
+    this.root.querySelector("#elevation-dialog")?.remove();
+    const dialog = document.createElement("dialog");
+    dialog.id = "elevation-dialog";
+    dialog.className = "elevation-dialog";
+    dialog.setAttribute("aria-labelledby", "elevation-heading");
+
+    const form = document.createElement("form");
+    form.method = "dialog";
+    const heading = document.createElement("h2");
+    heading.id = "elevation-heading";
+    heading.textContent = "Administrator verification required";
+    const explanation = document.createElement("p");
+    explanation.textContent = `Enter the local administrator password to continue ${operation}. The password is sent only for this verification and is not retained.`;
+    const label = document.createElement("label");
+    label.textContent = "Administrator password";
+    const password = document.createElement("input");
+    password.type = "password";
+    password.autocomplete = "current-password";
+    password.minLength = 12;
+    password.maxLength = 128;
+    password.required = true;
+    label.append(password);
+    const status = document.createElement("p");
+    status.setAttribute("role", "status");
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const verify = document.createElement("button");
+    verify.type = "submit";
+    verify.textContent = "Verify and continue";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    actions.append(verify, cancel);
+    form.append(heading, explanation, label, status, actions);
+    dialog.append(form);
+    this.root.append(dialog);
+
+    return new Promise((resolve) => {
+      let finished = false;
+      const finish = (accepted: boolean): void => {
+        if (finished) return;
+        finished = true;
+        password.value = "";
+        dialog.close?.();
+        dialog.remove();
+        if (!accepted) this.finishPrivilegedOperation();
+        resolve(accepted);
+      };
+      cancel.addEventListener("click", () => finish(false));
+      dialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        finish(false);
+      });
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!form.reportValidity()) return;
+        verify.disabled = true;
+        cancel.disabled = true;
+        password.disabled = true;
+        status.textContent = "Verifying password\u2026";
+        this.notify(
+          "pending",
+          `Verifying administrator credentials before ${operation}\u2026`,
+        );
+        let secret = password.value;
+        password.value = "";
+        const verification = api.login(secret);
+        secret = "";
+        try {
+          const session = await verification;
+          if (!session.elevated) {
+            throw new api.ApiError(
+              403,
+              "elevated_session_required",
+              "The device did not issue an elevated session.",
+            );
+          }
+          window.clearTimeout(this.sessionTimer);
+          const renewAfterSeconds = Math.max(1, session.expiresInSeconds - 5);
+          this.sessionTimer = window.setTimeout(
+            () => void this.connect(),
+            renewAfterSeconds * 1000,
+          );
+          this.notify(
+            "success",
+            `Administrator verification succeeded. Continuing ${operation}.`,
+          );
+          finish(true);
+        } catch (error) {
+          status.textContent = this.errorMessage(
+            error,
+            "Administrator verification failed.",
+          );
+          this.notify(
+            "error",
+            `Administrator verification failed: ${status.textContent}`,
+          );
+          verify.disabled = false;
+          cancel.disabled = false;
+          password.disabled = false;
+          password.focus();
+        }
+      });
+      if (typeof dialog.showModal === "function") {
+        dialog.showModal();
+      } else {
+        dialog.setAttribute("open", "");
+      }
+      password.focus();
+    });
+  }
 
   start(): void {
     this.showConnecting();
@@ -55,6 +239,10 @@ export class App {
 
   private async connect(): Promise<void> {
     if (this.provisioningComplete) return;
+    if (this.privilegedOperationInProgress) {
+      this.reconnectAfterPrivilegedOperation = true;
+      return;
+    }
     this.stopPolling();
     window.clearTimeout(this.sessionTimer);
     try {
@@ -85,7 +273,7 @@ export class App {
   }
 
   private startPolling(): void {
-    if (this.provisioningComplete) return;
+    if (this.provisioningComplete || this.privilegedOperationInProgress) return;
     this.stopPolling();
     this.pollTimer = window.setInterval(() => void this.refresh(), 5000);
   }
@@ -126,7 +314,6 @@ export class App {
         api.getStorage(),
         api.getMetrics(),
         api.getOtaStatus(),
-        api.getEvents(),
       ] as const);
       const unauthorized = results.some(
         (result) =>
@@ -147,7 +334,6 @@ export class App {
       if (results[3].status === "fulfilled") this.storage = results[3].value;
       if (results[4].status === "fulfilled") this.metrics = results[4].value;
       if (results[5].status === "fulfilled") this.otaStatus = results[5].value;
-      if (results[6].status === "fulfilled") this.events = results[6].value;
 
       const failures = results
         .map((result, index) => ({ result, index }))
@@ -164,9 +350,28 @@ export class App {
           ? `<div class="banner warning" role="alert">Some diagnostic panels could not be refreshed. Available device data is shown and retrying continues automatically.</div>`
           : "";
       this.renderView();
+      this.refreshEvents();
     } finally {
       this.refreshInProgress = false;
     }
+  }
+
+  private refreshEvents(): void {
+    if (this.eventsRefreshInProgress || this.provisioningComplete) return;
+    this.eventsRefreshInProgress = true;
+    void api
+      .getEvents()
+      .then((events) => {
+        this.events = events;
+        if (this.view === "maintenance") this.renderView();
+      })
+      .catch(() => {
+        // Event history is optional and retries independently; essential
+        // health/config rendering must not wait for microSD.
+      })
+      .finally(() => {
+        this.eventsRefreshInProgress = false;
+      });
   }
 
   private renderView(): void {
@@ -227,18 +432,74 @@ export class App {
       .forEach((button) => {
         button.addEventListener("click", async () => {
           const action = button.dataset.action ?? "";
+          const label = button.textContent?.trim() || action;
           const phrase = button.dataset.destructive;
           const confirmation = phrase
             ? destructiveConfirmation(action, phrase)
             : undefined;
-          if (phrase && !confirmation) return;
+          if (phrase && !confirmation) {
+            this.notify(
+              "info",
+              `${label} was cancelled. No request was sent to the device.`,
+            );
+            return;
+          }
+          const requiresElevation = [
+            "network-reset",
+            "factory-reset",
+            "rollback-ota",
+          ].includes(action);
+          if (
+            requiresElevation &&
+            !(await this.requestElevation(`with ${label}`))
+          ) {
+            this.notify(
+              "info",
+              `${label} was cancelled. No elevated request was sent to the device.`,
+            );
+            return;
+          }
+          const originalText = button.textContent;
           button.disabled = true;
+          button.setAttribute("aria-busy", "true");
+          button.textContent = "Sending\u2026";
+          this.notify("pending", `Sending ${label} to the device\u2026`);
           try {
-            await api.runAction(action, confirmation ?? undefined);
+            const response = await api.runAction(
+              action,
+              confirmation ?? undefined,
+            );
+            const queued = response.status === "queued";
+            this.notify(
+              "success",
+              queued
+                ? `${label} was queued by the device. Background results will appear in diagnostics and the next status refresh.`
+                : `${label} was accepted by the device.`,
+            );
+          } catch (error) {
+            this.notify(
+              "error",
+              `${label} failed: ${this.errorMessage(error, "The device rejected the request.")}`,
+            );
           } finally {
-            button.disabled = false;
+            if (button.isConnected) {
+              button.disabled = false;
+              button.removeAttribute("aria-busy");
+              button.textContent = originalText;
+            }
+            if (requiresElevation) this.finishPrivilegedOperation();
           }
         });
+      });
+    this.root
+      .querySelector<HTMLAnchorElement>(
+        'a[download][href="/api/v1/diagnostics/bundle"]',
+      )
+      ?.addEventListener("click", () => {
+        this.notify(
+          "info",
+          "Diagnostics download requested. Your browser will save the bundle when the device responds.",
+        );
       });
     const exportForm = this.root.querySelector<HTMLFormElement>("#export-form");
     exportForm?.addEventListener("submit", async (event) => {
@@ -252,7 +513,8 @@ export class App {
         return text ? new Date(text).toISOString() : undefined;
       };
       try {
-        result.textContent = "Preparing a bounded NDJSON page…";
+        result.textContent = "Preparing a bounded NDJSON page\u2026";
+        this.notify("pending", "Preparing the history export\u2026");
         const blob = await api.exportHistory(
           sequence,
           toUtc(data.get("from_utc")),
@@ -266,9 +528,14 @@ export class App {
         URL.revokeObjectURL(href);
         result.textContent =
           "Export downloaded. Continue from the last sequence for another page.";
+        this.notify(
+          "success",
+          "History export was generated and sent to your browser.",
+        );
       } catch (error) {
-        result.textContent =
-          error instanceof Error ? error.message : "History export failed.";
+        const message = this.errorMessage(error, "History export failed.");
+        result.textContent = message;
+        this.notify("error", `History export failed: ${message}`);
       }
     });
     const form = this.root.querySelector<HTMLFormElement>("#config-form");
@@ -283,8 +550,20 @@ export class App {
         'button[type="submit"]',
       );
       if (submit) submit.disabled = true;
+      let elevated = false;
       try {
         const candidate = readConfigForm(form, this.config);
+        elevated = await this.requestElevation("saving device configuration");
+        if (!elevated) {
+          if (submit) submit.disabled = false;
+          result.textContent =
+            "Administrator verification was cancelled; configuration was not changed.";
+          return;
+        }
+        this.notify(
+          "pending",
+          "Validating and saving device configuration\u2026",
+        );
         this.stopPolling();
         await api.updateConfig(candidate.config, candidate.ctAcknowledged);
         this.setupFormDirty = false;
@@ -294,11 +573,18 @@ export class App {
           this.root.querySelector<HTMLElement>("#config-result");
         if (refreshedResult)
           refreshedResult.textContent = "Configuration validated and applied.";
+        this.notify(
+          "success",
+          "Device configuration was validated, saved, and applied.",
+        );
       } catch (error) {
         this.startPolling();
         if (submit) submit.disabled = false;
-        result.textContent =
-          error instanceof Error ? error.message : "Configuration failed.";
+        const message = this.errorMessage(error, "Configuration failed.");
+        result.textContent = message;
+        this.notify("error", `Configuration failed: ${message}`);
+      } finally {
+        if (elevated) this.finishPrivilegedOperation();
       }
     });
     const networkSettingsForm = this.root.querySelector<HTMLFormElement>(
@@ -318,10 +604,22 @@ export class App {
       );
       if (submit) submit.disabled = true;
       let submitted = false;
+      let elevated = false;
       try {
         const payload = readNetworkSettingsForm(
           networkSettingsForm,
           this.config,
+        );
+        elevated = await this.requestElevation("saving Wi-Fi/server settings");
+        if (!elevated) {
+          if (submit) submit.disabled = false;
+          result.textContent =
+            "Administrator verification was cancelled; network settings were not changed.";
+          return;
+        }
+        this.notify(
+          "pending",
+          "Validating and saving Wi-Fi and server settings\u2026",
         );
         this.stopPolling();
         submitted = true;
@@ -339,17 +637,29 @@ export class App {
           response.reboot_queued !== false ||
             response.network_apply_queued === true,
         );
+        this.notify(
+          "success",
+          "Wi-Fi and server settings were saved. The device is applying them now.",
+        );
       } catch (error) {
         if (submitted && !(error instanceof api.ApiError)) {
           this.showNetworkTransition(false, false);
+          this.notify(
+            "info",
+            "The connection closed after submission. The device may be applying the saved network settings.",
+          );
           return;
         }
         this.startPolling();
         if (submit) submit.disabled = false;
-        result.textContent =
-          error instanceof Error
-            ? error.message
-            : "Network/server settings failed.";
+        const message = this.errorMessage(
+          error,
+          "Network/server settings failed.",
+        );
+        result.textContent = message;
+        this.notify("error", `Network/server settings failed: ${message}`);
+      } finally {
+        if (elevated) this.finishPrivilegedOperation();
       }
     });
     const setupForm =
@@ -365,6 +675,7 @@ export class App {
         'button[type="submit"]',
       );
       if (submit) submit.disabled = true;
+      this.notify("pending", "Validating and committing first-run setup\u2026");
       let submitted = false;
       try {
         const payload = readSetupForm(setupForm);
@@ -384,19 +695,31 @@ export class App {
           response.reboot_queued !== false ||
             response.network_apply_queued === true,
         );
+        this.notify(
+          "success",
+          "First-run setup was saved. The device is applying its network settings.",
+        );
       } catch (error) {
         if (submitted && !(error instanceof api.ApiError)) {
           this.showNetworkTransition(false, true);
+          this.notify(
+            "info",
+            "The connection closed after setup submission. The device may be applying the saved settings.",
+          );
           return;
         }
         this.startPolling();
         if (submit) submit.disabled = false;
-        result.textContent =
-          error instanceof Error ? error.message : "First-run setup failed.";
+        const message = this.errorMessage(error, "First-run setup failed.");
+        result.textContent = message;
+        this.notify("error", `First-run setup failed: ${message}`);
       }
     });
     const reenrollmentForm =
       this.root.querySelector<HTMLFormElement>("#reenrollment-form");
+    reenrollmentForm?.addEventListener("input", () => {
+      this.setupFormDirty = true;
+    });
     reenrollmentForm?.addEventListener("submit", async (event) => {
       event.preventDefault();
       const result = this.root.querySelector<HTMLElement>(
@@ -405,23 +728,78 @@ export class App {
       const input = reenrollmentForm.elements.namedItem(
         "enrollment_token",
       ) as HTMLInputElement;
+      if (!result) return;
+      const submit = reenrollmentForm.querySelector<HTMLButtonElement>(
+        'button[type="submit"]',
+      );
+      if (!reenrollmentForm.reportValidity()) {
+        this.notify(
+          "error",
+          "Reenrollment token must contain 32 through 256 characters.",
+        );
+        return;
+      }
       if (
-        !result ||
         destructiveConfirmation(
           "credential revocation and reenrollment",
           "REENROLL",
         ) === null
-      )
+      ) {
+        this.notify(
+          "info",
+          "Reenrollment was cancelled. Existing credentials were not changed.",
+        );
         return;
+      }
+      const elevated = await this.requestElevation(
+        "credential revocation and reenrollment",
+      );
+      if (!elevated) {
+        this.notify(
+          "info",
+          "Reenrollment was cancelled. Existing credentials were not changed.",
+        );
+        return;
+      }
+      this.notify(
+        "pending",
+        "Revoking existing server credentials and queuing reenrollment\u2026",
+      );
+      this.setupFormDirty = true;
+      this.stopPolling();
+      if (submit) {
+        submit.disabled = true;
+        submit.setAttribute("aria-busy", "true");
+      }
       try {
         await api.beginReenrollment(input.value);
         input.value = "";
-        result.textContent =
-          "Existing server credentials were revoked. Enrollment is pending.";
+        this.setupFormDirty = false;
+        await this.refresh();
+        this.startPolling();
+        const refreshedResult = this.root.querySelector<HTMLElement>(
+          "#reenrollment-result",
+        );
+        if (refreshedResult) {
+          refreshedResult.textContent =
+            "Existing server credentials were revoked. Enrollment is pending.";
+        }
+        this.notify(
+          "success",
+          "Existing credentials were revoked and reenrollment was queued.",
+        );
       } catch (error) {
+        this.startPolling();
         input.value = "";
-        result.textContent =
-          error instanceof Error ? error.message : "Reenrollment failed.";
+        if (submit) {
+          submit.disabled = false;
+          submit.removeAttribute("aria-busy");
+        }
+        const message = this.errorMessage(error, "Reenrollment failed.");
+        result.textContent = message;
+        this.notify("error", `Reenrollment failed: ${message}`);
+      } finally {
+        this.finishPrivilegedOperation();
       }
     });
   }

@@ -6,8 +6,8 @@
 
 namespace pm {
 
-std::uint32_t validateMeasurement(MeasurementSnapshot& sample,
-                                  const Limits& limits);
+std::uint32_t validateMeasurement(MeasurementSnapshot &sample,
+                                  const Limits &limits);
 bool retentionEligible(bool complete_and_valid, bool time_trusted,
                        std::uint64_t newest_sequence,
                        std::uint64_t server_ack_sequence,
@@ -19,39 +19,37 @@ struct EnergyResult {
   std::uint64_t lifetime_wh{0};
   std::uint64_t persisted_offset_wh{0};
   std::uint32_t quality_flags{QualityNone};
-  const char* method{"unavailable"};
+  const char *method{"unavailable"};
   bool offset_changed{false};
 };
 
 class EnergyNormalizer {
- public:
+public:
   explicit EnergyNormalizer(std::uint64_t persisted_offset_wh = 0);
   EnergyResult update(std::uint64_t raw_start_wh, std::uint64_t raw_end_wh,
                       bool raw_start_valid, bool raw_end_valid,
                       double integrated_power_wh, bool integration_complete);
   std::uint64_t offsetWh() const;
 
- private:
+private:
   std::uint64_t offset_wh_;
   std::uint64_t last_lifetime_wh_{0};
 };
 
 class IntervalAggregator {
- public:
+public:
   explicit IntervalAggregator(Limits limits);
   void setLimits(Limits limits);
   void reset(std::uint64_t start_utc_ms, std::uint64_t start_monotonic_ms);
-  void add(const MeasurementSnapshot& sample);
+  void add(const MeasurementSnapshot &sample);
   bool hasSamples() const;
-  IntervalRecord finish(const std::string& device_id,
-                        const std::string& friendly_name,
-                        const std::string& boot_id,
-                        const std::string& firmware_version,
-                        std::uint64_t end_utc_ms,
-                        std::uint64_t end_monotonic_ms,
-                        EnergyNormalizer& energy);
+  IntervalRecord
+  finish(const std::string &device_id, const std::string &friendly_name,
+         const std::string &boot_id, const std::string &firmware_version,
+         std::uint64_t end_utc_ms, std::uint64_t end_monotonic_ms,
+         EnergyNormalizer &energy);
 
- private:
+private:
   Limits limits_;
   std::uint64_t start_utc_ms_{0};
   std::uint64_t start_monotonic_ms_{0};
@@ -82,4 +80,4 @@ class IntervalAggregator {
   std::uint64_t last_sample_monotonic_ms_{0};
 };
 
-}  // namespace pm
+} // namespace pm
