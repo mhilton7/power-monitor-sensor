@@ -26,6 +26,8 @@ struct StorageHealth {
   std::uint64_t newest_sequence{0};
   std::uint64_t writes{0};
   std::uint64_t reads{0};
+  std::uint64_t reading_record_reads{0};
+  std::uint64_t event_record_reads{0};
   std::uint64_t write_failures{0};
   std::uint64_t read_failures{0};
   std::uint32_t mount_cycles{0};

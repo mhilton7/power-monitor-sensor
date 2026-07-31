@@ -40,6 +40,16 @@ _SOURCE_TREES: dict[str, frozenset[str]] = {
     "tools": frozenset({".py"}),
     "web": frozenset({".css", ".html", ".json", ".ts"}),
 }
+_GENERATED_DIRECTORY_NAMES = frozenset(
+    {
+        ".pio",
+        ".pytest_cache",
+        "__pycache__",
+        "coverage",
+        "dist",
+        "node_modules",
+    }
+)
 
 
 class ReleaseIntegrityError(ValueError):
@@ -63,7 +73,12 @@ def build_input_paths(root: Path) -> list[Path]:
         paths.extend(
             path
             for path in source_root.rglob("*")
-            if path.is_file() and path.suffix.lower() in suffixes
+            if path.is_file()
+            and path.suffix.lower() in suffixes
+            and not any(
+                part in _GENERATED_DIRECTORY_NAMES
+                for part in path.relative_to(source_root).parts[:-1]
+            )
         )
     return sorted(set(paths), key=lambda path: path.relative_to(root).as_posix())
 

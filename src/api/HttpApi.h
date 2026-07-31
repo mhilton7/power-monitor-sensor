@@ -99,6 +99,10 @@ private:
   bool authorize(AsyncWebServerRequest *request, const std::string &body,
                  bool mutation, bool allow_local_session = true,
                  bool require_elevated_local = false);
+  RequestAuthMode classifyAuthMode(AsyncWebServerRequest *request) const;
+  LocalSessionResult localSessionResult(AsyncWebServerRequest *request,
+                                        bool mutation,
+                                        bool require_elevated = false) const;
   bool localSession(AsyncWebServerRequest *request, bool mutation,
                     bool require_elevated = false) const;
   bool sameOrigin(AsyncWebServerRequest *request) const;
@@ -111,6 +115,10 @@ private:
   void sendProblem(AsyncWebServerRequest *request, int status, const char *code,
                    const char *detail, bool rejected_signature = false,
                    bool rate_limited = false);
+  void sendLocalSessionProblem(AsyncWebServerRequest *request, int status,
+                               const char *code, const char *detail);
+  bool beginHeavyLocalOperation(AsyncWebServerRequest *request);
+  void endHeavyLocalOperation();
   void sendPage(AsyncWebServerRequest *request, const HistoryPage &page,
                 bool ndjson);
   void buildPagePayload(const HistoryPage &page, bool ndjson,
@@ -142,8 +150,10 @@ private:
   std::atomic<std::uint32_t> login_failures_{0};
   std::atomic<std::uint64_t> login_allowed_at_ms_{0};
   std::uint64_t history_allowed_at_ms_{0};
-  std::uint64_t api_window_started_ms_{0};
-  std::uint16_t api_requests_in_window_{0};
+  std::uint64_t browser_api_window_started_ms_{0};
+  std::uint16_t browser_api_requests_in_window_{0};
+  std::uint64_t hmac_api_window_started_ms_{0};
+  std::uint16_t hmac_api_requests_in_window_{0};
 };
 
 } // namespace pm

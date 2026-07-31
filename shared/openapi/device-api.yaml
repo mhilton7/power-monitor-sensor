@@ -6,6 +6,17 @@ info:
 servers:
   - url: http://power-monitor-device.local
 paths:
+  /api/v1/diagnostics/disconnect-flight-recorder:
+    get:
+      summary: Download a bounded, redacted disconnect correlation record
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200':
+          description: Redacted Wi-Fi, synchronization, memory, and authentication timeline
+          content:
+            application/json:
+              schema: {type: object}
+        default: {$ref: '#/components/responses/Problem'}
   /api/local/health:
     get:
       operationId: getLocalLiveness
@@ -162,6 +173,22 @@ paths:
           content:
             application/json: {schema: {type: object}}
             text/plain: {schema: {type: string}}
+  /api/v1/ui/status:
+    get:
+      operationId: getCompactUiStatus
+      description: Bounded in-memory status snapshot for the minimal local WebUI. It does not scan microSD history, read secret configuration, contact the central server, or perform password work.
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Compact sensor status, content: {application/json: {schema: {$ref: '#/components/schemas/UiStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/ui/diagnostics:
+    get:
+      operationId: getCompactUiDiagnostics
+      description: Explicitly requested bounded diagnostics snapshot. Large redacted bundles and history remain separate heavy operations.
+      security: [{deviceHmac: []}, {localSession: []}]
+      responses:
+        '200': {description: Compact resource and synchronization diagnostics, content: {application/json: {schema: {$ref: '#/components/schemas/UiDiagnostics'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/diagnostics/recent-errors:
     get:
       operationId: getRecentDiagnosticErrors
@@ -371,6 +398,77 @@ components:
         free_heap_bytes: {type: integer, minimum: 0}
         free_internal_heap_bytes: {type: integer, minimum: 0}
         largest_internal_block_bytes: {type: integer, minimum: 0}
+    UiStatus:
+      type: object
+      additionalProperties: false
+      required: [schema_version, server_now, device, reading, health, sync]
+      properties:
+        schema_version: {const: 1}
+        server_now: {type: string, format: date-time}
+        device:
+          type: object
+          additionalProperties: false
+          required: [friendly_name, firmware, git_commit, build_timestamp, platformio_environment, web_assets, uptime_seconds]
+          properties:
+            friendly_name: {type: string, maxLength: 64}
+            firmware: {type: string}
+            git_commit: {type: string}
+            build_timestamp: {type: string, format: date-time}
+            platformio_environment: {type: string}
+            web_assets:
+              type: object
+              additionalProperties: false
+              required: [index_html_sha256, app_js_sha256, style_css_sha256]
+              properties:
+                index_html_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+                app_js_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+                style_css_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+            uptime_seconds: {type: integer, minimum: 0}
+        reading:
+          type: object
+          additionalProperties: false
+          required: [measured_at_utc_ms, power_w, voltage_v, current_a, frequency_hz, power_factor]
+          properties:
+            measured_at_utc_ms: {type: [integer, 'null'], minimum: 0}
+            power_w: {type: [number, 'null']}
+            voltage_v: {type: [number, 'null']}
+            current_a: {type: [number, 'null']}
+            frequency_hz: {type: [number, 'null']}
+            power_factor: {type: [number, 'null']}
+        health:
+          type: object
+          additionalProperties: false
+          required: [wifi, rssi_dbm, ip_address, server, storage, meter, low_memory]
+          properties:
+            wifi: {enum: [connected, offline]}
+            rssi_dbm: {type: integer}
+            ip_address: {type: string}
+            server: {enum: [connected, unauthenticated, offline]}
+            storage: {enum: [writable, degraded]}
+            meter: {enum: [healthy, degraded]}
+            low_memory: {type: boolean}
+        sync:
+          type: object
+          additionalProperties: false
+          required: [last_success_utc_ms, newest_sequence, acknowledged_sequence, backlog, last_safe_error]
+          properties:
+            last_success_utc_ms: {type: [integer, 'null'], minimum: 0}
+            newest_sequence: {type: integer, minimum: 0}
+            acknowledged_sequence: {type: integer, minimum: 0}
+            backlog: {type: integer, minimum: 0}
+            last_safe_error: {type: string}
+    UiDiagnostics:
+      type: object
+      additionalProperties: false
+      required: [schema_version, memory, tasks, sync, local_http, local_sessions, wifi_disconnects]
+      properties:
+        schema_version: {const: 1}
+        memory: {type: object}
+        tasks: {type: object}
+        sync: {type: object}
+        local_http: {type: object}
+        local_sessions: {type: object}
+        wifi_disconnects: {type: object}
     Config:
       type: object
       description: Secret fields are never returned.

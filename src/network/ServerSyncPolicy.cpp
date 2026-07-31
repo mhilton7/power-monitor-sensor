@@ -89,6 +89,14 @@ std::uint32_t stackMarginPercent(const std::uint32_t allocated_bytes,
   return static_cast<std::uint32_t>((bounded * 100U) / allocated_bytes);
 }
 
+bool stackMarginHealthy(const std::uint32_t allocated_bytes,
+                        const std::uint32_t high_water_bytes,
+                        const std::uint32_t minimum_margin_percent) {
+  return allocated_bytes != 0U &&
+         stackMarginPercent(allocated_bytes, high_water_bytes) >=
+             minimum_margin_percent;
+}
+
 bool tlsMemoryReserveAvailable(
     const std::uint32_t free_internal_bytes,
     const std::uint32_t largest_internal_block_bytes) {
@@ -102,6 +110,42 @@ bool responseLengthAllowed(const int response_size, const int status) {
   }
   return response_size >= 0 &&
          static_cast<std::size_t>(response_size) <= kMaximumResponseBytes;
+}
+
+std::size_t maximumResponseBytes(const std::string &endpoint) {
+  if (endpoint == "/api/v1/device-heartbeats") {
+    return kHeartbeatResponseBytes;
+  }
+  if (endpoint == "/api/v1/device-enrollment/claim") {
+    return kEnrollmentResponseBytes;
+  }
+  if (endpoint == "/api/v1/device-readings/batch") {
+    return kReadingBatchResponseBytes;
+  }
+  if (endpoint == "/api/v1/device-events/batch") {
+    return kEventBatchResponseBytes;
+  }
+  return kMaximumResponseBytes;
+}
+
+std::size_t maximumRequestBytes(const std::string &endpoint) {
+  if (endpoint == "/api/v1/device-readings/batch") {
+    return kReadingBatchPayloadBytes + (4U * 1024U);
+  }
+  if (endpoint == "/api/v1/device-events/batch") {
+    return kEventBatchPayloadBytes + (4U * 1024U);
+  }
+  return kHeartbeatResponseBytes;
+}
+
+bool responseLengthAllowed(const std::string &endpoint,
+                           const int response_size, const int status) {
+  if (status == 204) {
+    return response_size <= 0;
+  }
+  return response_size >= 0 &&
+         static_cast<std::size_t>(response_size) <=
+             maximumResponseBytes(endpoint);
 }
 
 bool responseAllocationAvailable(

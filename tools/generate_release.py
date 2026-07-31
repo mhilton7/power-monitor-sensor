@@ -39,7 +39,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create unsigned reproducible release inputs and binary hashes"
     )
-    parser.add_argument("--version", default="1.0.1")
+    parser.add_argument("--version", default="1.0.8")
     parser.add_argument(
         "--channel",
         choices=("development", "canary", "stable"),

@@ -18,20 +18,28 @@ inline constexpr std::uint32_t kStorageStackBytes = 8192U;
 // unavailable or an SD operation spans multiple scheduler ticks.
 inline constexpr std::uint32_t kAggregationPriority = 3U;
 inline constexpr std::uint32_t kStoragePriority = 2U;
-inline constexpr std::uint32_t kNetworkStackBytes = 6144U;
+// Production reconnect/mDNS traces consumed roughly 5,124 bytes from the old
+// 6,144-byte allocation (16% remaining). An 8 KiB allocation gives the same
+// measured path a 37% margin while NetworkService scratch lifetimes are kept
+// bounded.
+inline constexpr std::uint32_t kNetworkStackBytes = 8192U;
 // mbedTLS certificate verification and HTTP/HMAC framing share this task.
 // Production traces showed fewer than 1 KiB remaining during a heartbeat at
 // 16 KiB, which could corrupt the AsyncWebServer task instead of returning a
 // recoverable request error.
 inline constexpr std::uint32_t kServerSyncStackBytes = 24U * 1024U;
-inline constexpr std::uint32_t kMinimumTlsStackHighWaterBytes = 12U * 1024U;
-inline constexpr std::uint32_t kHealthStackBytes = 6144U;
+// Physical 1.0.6 traces left only 516-724 bytes (8-11%) after the health
+// task captured task metrics and persisted the disconnect flight recorder.
+// Eight KiB keeps that measured path above the mandatory 25% margin without
+// changing task priority or any primary measurement/synchronization work.
+inline constexpr std::uint32_t kHealthStackBytes = 8192U;
 inline constexpr std::uint32_t kMaintenanceStackBytes = 12U * 1024U;
 // Serial configuration commands persist and verify the full atomic
 // configuration, including parsing the private Caddy CA with mbedTLS. An
 // 8 KiB task double-faulted in mbedtls_pem_read_buffer while applying a
 // harmless log-level change on production hardware.
 inline constexpr std::uint32_t kSerialCommandStackBytes = 24U * 1024U;
+inline constexpr std::uint32_t kPasswordJobStackBytes = 16U * 1024U;
 
 inline constexpr std::uint32_t kMinimumStackMarginPercent = 25U;
 

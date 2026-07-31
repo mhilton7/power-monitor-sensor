@@ -122,8 +122,9 @@ Related stable events include:
   `RECOVERY_SCAN_COMPLETE`, `WRITE_SUMMARY`,
   `UART_INIT_BEGIN`, `UART_READY`, `READ_FAILED`, `METER_RECOVERED`,
   `PERIODIC_SUMMARY`.
-- Runtime/OTA: `TASK_STARTED`, `TASK_REPORT`, `LOW_STACK`,
-  `BOOT_MEMORY`, `MEMORY_REPORT`, `LOW_HEAP`, `UPDATE_REQUESTED`,
+- Runtime/OTA: `TASK_STARTED`, `TASK_REPORT`, `STACK_LOW`,
+  `BOOT_MEMORY`, `MEMORY_REPORT`, `LOW_HEAP`, `LOW_MEMORY_MODE_ENTERED`,
+  `LOW_MEMORY_MODE_EXITED`, `UPDATE_REQUESTED`,
   `MANIFEST_PARSED`, `SIGNATURE_VERIFIED`, `DOWNLOAD_PROGRESS`,
   `IMAGE_VERIFIED`, `UPDATE_COMPLETE`.
 
@@ -139,10 +140,11 @@ count. `stack_margin_percent` must remain at or above 25. The same record
 contains current/minimum heap, largest block, internal free/largest block, and
 free PSRAM.
 
-`MEMORY/HEAP_LOW` with `PM-TLS-006` means the request was rejected before TLS
-because either free internal heap was below 60 KiB or the largest internal
-block was below 40 KiB. This is a safe failure: the transport cleanup and
-normal retry path run while the WebUI remains local and responsive. Ordinary
+`MEMORY/HEAP_LOW` with `PM-TLS-006` means the request was deferred before TLS
+because either free internal heap was below 78 KiB or the largest internal
+block was below 32 KiB. This is a safe local-resource deferral: cleanup runs,
+server reachability/authentication are preserved, external failure counters
+do not advance, and the operation retries after 1.5 seconds. Ordinary
 local JSON and embedded-asset responses explicitly close after delivery so
 idle AsyncTCP connections cannot erode that TLS reserve during a long soak.
 

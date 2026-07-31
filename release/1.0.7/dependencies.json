@@ -1,0 +1,22 @@
+{
+  "generated_utc": "2026-07-31T22:32:59.157503+00:00",
+  "platform": "espressif32@6.13.0",
+  "arduino_esp32": "2.0.17",
+  "libraries": [
+    {
+      "name": "ArduinoJson",
+      "version": "7.4.3",
+      "license": "MIT"
+    },
+    {
+      "name": "AsyncTCP",
+      "version": "3.4.10",
+      "license": "LGPL-3.0"
+    },
+    {
+      "name": "ESPAsyncWebServer",
+      "version": "3.11.2",
+      "license": "LGPL-3.0"
+    }
+  ]
+}

@@ -38,6 +38,7 @@ private:
     std::string problem_code;
     std::string tls_category;
     std::uint32_t retry_after_ms{0};
+    bool local_resource_deferred{false};
   };
 
   bool enroll(std::uint32_t &retry_after_ms);
@@ -96,6 +97,7 @@ private:
   sync_policy::EndpointAddressCache endpoint_address_cache_;
   bool immediate_sync_{false};
   bool immediate_sync_release_recorded_{false};
+  bool last_operation_locally_deferred_{false};
   std::string available_firmware_version_;
 };
 

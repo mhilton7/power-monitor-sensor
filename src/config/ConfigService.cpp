@@ -443,6 +443,73 @@ RuntimeConfig ConfigService::config() const {
   return lock ? config_ : RuntimeConfig{};
 }
 
+ServerTransportConfig ConfigService::serverTransportConfig() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  if (!lock) {
+    return {};
+  }
+  return {config_.server_url, config_.server_ca_pem,
+          config_.server_fingerprint, config_.allowed_server_addresses};
+}
+
+SensorStatusConfig ConfigService::sensorStatusConfig() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  return lock ? SensorStatusConfig{config_.friendly_name}
+              : SensorStatusConfig{};
+}
+
+NetworkRuntimeConfig ConfigService::networkRuntimeConfig() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  if (!lock) {
+    return {};
+  }
+  return {config_.hostname,
+          config_.wifi_ssid,
+          config_.static_network_enabled,
+          config_.static_ip,
+          config_.static_gateway,
+          config_.static_subnet,
+          config_.static_dns,
+          config_.ntp_servers};
+}
+
+MeasurementRuntimeConfig ConfigService::measurementRuntimeConfig() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  if (!lock) {
+    return {};
+  }
+  return {config_.friendly_name,
+          config_.sample_interval_seconds,
+          config_.durable_log_interval_seconds,
+          config_.pzem_timeout_ms,
+          config_.sd_spi_hz,
+          config_.ct_rating_a,
+          config_.ct_warning_fraction,
+          config_.ct_critical_fraction,
+          config_.ct_fault_fraction,
+          config_.voltage_minimum_v,
+          config_.voltage_maximum_v,
+          config_.frequency_minimum_hz,
+          config_.frequency_maximum_hz,
+          config_.retention_enabled,
+          config_.retention_days,
+          config_.diagnostic_log_level};
+}
+
+ServerSyncRuntimeConfig ConfigService::serverSyncRuntimeConfig() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  if (!lock) {
+    return {};
+  }
+  return {config_.friendly_name,
+          config_.ota_channel,
+          !config_.server_url.empty(),
+          config_.connection_mode,
+          config_.heartbeat_interval_seconds,
+          config_.sync_interval_seconds,
+          config_.sync_retry_max_seconds};
+}
+
 DeviceIdentity ConfigService::identity() const {
   RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
   return lock ? identity_ : DeviceIdentity{};

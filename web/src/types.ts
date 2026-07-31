@@ -1,49 +1,138 @@
-export interface Health {
-  schema_version: number;
-  protocol: string;
-  device_id: string;
-  friendly_name: string;
-  status: "healthy" | "degraded" | "safe_mode";
-  uptime_seconds: number;
-  firmware_version: string;
-  wifi: {
-    connected: boolean;
+export type HealthState = "connected" | "offline" | "unauthenticated";
+
+export interface UiStatus {
+  schema_version: 1;
+  server_now: string;
+  device: {
+    friendly_name: string;
+    firmware: string;
+    git_commit: string;
+    build_timestamp: string;
+    platformio_environment: string;
+    web_assets: {
+      index_html_sha256: string;
+      app_js_sha256: string;
+      style_css_sha256: string;
+    };
+    uptime_seconds: number;
+  };
+  reading: {
+    measured_at_utc_ms: number | null;
+    power_w: number | null;
+    voltage_v: number | null;
+    current_a: number | null;
+    frequency_hz: number | null;
+    power_factor: number | null;
+  };
+  health: {
+    wifi: "connected" | "offline";
     rssi_dbm: number;
     ip_address: string;
-    hostname: string;
+    server: HealthState;
+    storage: "writable" | "degraded";
+    meter: "healthy" | "degraded";
+    low_memory: boolean;
   };
-  time: { synchronized: boolean; utc: string };
-  meter: { connected: boolean; consecutive_errors: number; last_error: string };
-  storage: {
-    present: boolean;
-    mounted: boolean;
-    writable: boolean;
-    free_bytes: number;
-    warning_free_bytes?: number;
-    low_space?: boolean;
-    oldest_sequence: number;
+  sync: {
+    last_success_utc_ms: number | null;
     newest_sequence: number;
-    server_ack_sequence: number;
-  };
-  server: {
-    configured: boolean;
-    reachable: boolean;
-    last_heartbeat_utc: number;
+    acknowledged_sequence: number;
+    backlog: number;
+    last_safe_error: string;
   };
 }
 
-export interface LiveReading {
-  timestamp_utc: string;
-  timestamp_trusted: boolean;
-  voltage_v: number;
-  current_a: number;
-  active_power_w: number;
-  meter_energy_total_wh: number;
-  device_lifetime_energy_wh: number;
-  frequency_hz: number;
-  power_factor: number;
-  ct_rating_a: number;
-  quality: { valid: boolean; method: string; error: string };
+export interface TaskDiagnostic {
+  name: string;
+  core: number;
+  priority: number;
+  configured_stack_bytes: number;
+  high_water_bytes: number;
+  margin_percent: number;
+  running: boolean;
+  watchdog: boolean;
+}
+
+export interface UiDiagnostics {
+  schema_version: 1;
+  memory: {
+    free_heap_bytes: number;
+    minimum_free_heap_bytes: number;
+    free_internal_heap_bytes: number;
+    minimum_free_internal_heap_bytes: number;
+    largest_internal_block_bytes: number;
+    free_psram_bytes: number;
+    largest_psram_block_bytes: number;
+    heap_integrity_ok: boolean;
+  };
+  tasks: {
+    server_sync_stack_bytes: number;
+    server_sync_high_water_bytes: number;
+    server_sync_margin_percent: number;
+    network_margin_percent: number | null;
+    table: TaskDiagnostic[];
+  };
+  sync: {
+    heartbeat_successes: number;
+    heartbeat_failures: number;
+    batch_successes: number;
+    batch_failures: number;
+    local_resource_deferrals: number;
+    tls_requests_admitted: number;
+    tls_requests_rejected_heap: number;
+    tls_requests_rejected_stack: number;
+    acknowledged_sequence: number;
+    newest_sequence: number;
+    backlog: number;
+    last_safe_error: string;
+  };
+  local_http: {
+    ui_status_requests: number;
+    ui_setup_requests: number;
+    ui_diagnostics_requests: number;
+    ui_heavy_requests_deferred: number;
+    peak_requests: number;
+    browser_session_rejections: number;
+    malformed_auth_header_rejections: number;
+    browser_rate_limited: number;
+    server_hmac_rate_limited: number;
+    browser_requests_accepted: number;
+    browser_requests_session_expired: number;
+    browser_requests_session_invalid: number;
+    browser_requests_csrf_rejected: number;
+    server_hmac_requests_accepted: number;
+    server_hmac_headers_incomplete: number;
+    server_hmac_protocol_mismatch: number;
+    server_hmac_device_mismatch: number;
+    server_hmac_timestamp_rejected: number;
+    server_hmac_nonce_rejected: number;
+    server_hmac_body_hash_rejected: number;
+    server_hmac_signature_rejected: number;
+  };
+  local_sessions: {
+    capacity: number;
+    active: number;
+    peak_active: number;
+    created: number;
+    reused: number;
+    refreshed: number;
+    expired: number;
+    invalid: number;
+    revoked: number;
+    capacity_rejections: number;
+  };
+  wifi_disconnects: {
+    total: number;
+    events: Array<{
+      monotonic_ms: number;
+      reason: string;
+      reason_code: number;
+      rssi_dbm: number;
+      disconnect_number: number;
+      free_internal_heap_bytes: number;
+      largest_internal_block_bytes: number;
+    }>;
+  };
 }
 
 export interface EffectiveConfig {

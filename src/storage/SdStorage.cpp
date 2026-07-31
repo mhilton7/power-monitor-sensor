@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <limits>
 
@@ -1092,6 +1093,11 @@ HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
       candidates.pop_back();
     }
     ++health_.reads;
+    if (std::strcmp(sequence_field, "event_sequence") == 0) {
+      ++health_.event_record_reads;
+    } else {
+      ++health_.reading_record_reads;
+    }
     return true;
   };
 

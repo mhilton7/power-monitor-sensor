@@ -11,6 +11,7 @@
 #include "build_config.h"
 #include "config/ConfigService.h"
 #include "core/Algorithms.h"
+#include "core/MemoryPressurePolicy.h"
 #include "diagnostics/Diagnostics.h"
 #include "meter/IMeter.h"
 #include "network/ClockService.h"
@@ -46,6 +47,7 @@ private:
   void handleSerialCommand(std::string &command);
   void reportStatus() const;
   void reportTasks() const;
+  void captureTaskDiagnostics() const;
   void reportMemory() const;
   void executeMaintenance(const MaintenanceMessage &message);
   bool createTasks();
@@ -76,8 +78,10 @@ private:
   std::atomic<std::uint64_t> aggregation_progress_{0};
   std::atomic<std::uint64_t> network_progress_{0};
   std::atomic<std::uint64_t> sync_progress_{0};
+  MemoryPressurePolicy memory_pressure_;
   std::uint64_t sample_dropped_{0};
   std::uint64_t action_dropped_{0};
+  std::uint64_t last_persisted_wifi_transition_{0};
 #if PM_PHYSICAL_ADMIN_RECOVERY
   std::string admin_recovery_request_id_;
   std::uint64_t admin_recovery_deadline_ms_{0};

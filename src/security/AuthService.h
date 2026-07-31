@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,6 +35,26 @@ enum class AuthResult : std::uint8_t {
   SignatureMismatch,
 };
 
+enum class RequestAuthMode : std::uint8_t {
+  LocalBrowserSession,
+  ServerToDeviceHmac,
+  Unauthenticated,
+  MalformedMixedAuthentication,
+};
+
+const char *requestAuthModeName(RequestAuthMode mode);
+
+enum class LocalSessionResult : std::uint8_t {
+  Ok,
+  Missing,
+  Invalid,
+  Expired,
+  CsrfRejected,
+  ElevationRequired,
+};
+
+const char *localSessionResultCode(LocalSessionResult result);
+
 class NonceCache {
 public:
   ReplayRememberResult checkAndRemember(const std::string &nonce,
@@ -61,26 +82,70 @@ private:
 
 class SessionManager {
 public:
+  static constexpr std::size_t kCapacity = 6U;
+
   struct Session {
     std::string token;
     std::string csrf;
     std::uint64_t expires_ms{0};
     bool elevated{false};
+    bool reused{false};
+    bool refreshed{false};
+    bool capacity_reached{false};
   };
 
-  Session create(std::uint64_t now_ms, std::uint32_t ttl_seconds,
-                 bool elevated = false);
-  bool validate(const std::string &token, std::uint64_t now_ms) const;
-  bool validateMutation(const std::string &token, const std::string &csrf,
-                        std::uint64_t now_ms) const;
-  bool validateElevated(const std::string &token, std::uint64_t now_ms) const;
-  bool validateElevatedMutation(const std::string &token,
-                                const std::string &csrf,
-                                std::uint64_t now_ms) const;
-  void invalidate();
+  struct Metrics {
+    std::uint32_t capacity{kCapacity};
+    std::uint32_t active{0};
+    std::uint32_t peak_active{0};
+    std::uint64_t created{0};
+    std::uint64_t reused{0};
+    std::uint64_t refreshed{0};
+    std::uint64_t expired{0};
+    std::uint64_t invalid{0};
+    std::uint64_t revoked{0};
+    std::uint64_t capacity_rejections{0};
+  };
+
+  Session open(const std::string &presented_token, std::uint64_t now_ms,
+               std::uint32_t ttl_seconds);
+  Session elevate(const std::string &presented_token, std::uint64_t now_ms,
+                  std::uint32_t ttl_seconds,
+                  std::uint32_t elevation_ttl_seconds);
+  LocalSessionResult validate(const std::string &token, std::uint64_t now_ms,
+                              bool require_elevated = false) const;
+  LocalSessionResult validateMutation(const std::string &token,
+                                      const std::string &csrf,
+                                      std::uint64_t now_ms,
+                                      bool require_elevated = false) const;
+  bool invalidate(const std::string &token, std::uint64_t now_ms);
+  void invalidateAll();
+  Metrics metrics(std::uint64_t now_ms) const;
 
 private:
-  Session session_;
+  struct Entry {
+    bool used{false};
+    crypto::Key32 token_digest{};
+    crypto::Key32 csrf_digest{};
+    std::uint64_t created_ms{0};
+    std::uint64_t last_seen_ms{0};
+    std::uint64_t expires_ms{0};
+    std::uint64_t elevated_until_ms{0};
+    std::uint32_t generation{0};
+  };
+
+  static crypto::Key32 digest(const std::string &value);
+  static bool digestEqual(const crypto::Key32 &left,
+                          const crypto::Key32 &right);
+  Entry *find(const crypto::Key32 &token_digest);
+  const Entry *find(const crypto::Key32 &token_digest) const;
+  void purgeExpired(std::uint64_t now_ms);
+  void updatePeak();
+
+  mutable std::mutex mutex_;
+  mutable std::array<Entry, kCapacity> entries_{};
+  mutable Metrics metrics_{};
+  std::uint32_t next_generation_{1};
 };
 
 const char *authResultCode(AuthResult result);

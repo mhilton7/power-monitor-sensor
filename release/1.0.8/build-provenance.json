@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "environment": "esp32-s3-release",
+  "source_sha256": "f5eb9027640c4f66be45254a2feb65042edec63a024032ed0812e230d3586da7",
+  "flash_offsets": {
+    "bootloader.bin": "0x0",
+    "partitions.bin": "0x8000",
+    "boot_app0.bin": "0x11000",
+    "firmware.bin": "0x20000"
+  },
+  "artifacts": {
+    "bootloader.bin": {
+      "size_bytes": 15104,
+      "sha256": "2a71d69b471e20c2bac7fb469f3c6a807b3ebee780e348e5889db0da849ca363"
+    },
+    "partitions.bin": {
+      "size_bytes": 3072,
+      "sha256": "5eaa8f8a888b30d38a3ce8587703e3546b8337685ec9e3ab8631d8bcddfb3c13"
+    },
+    "boot_app0.bin": {
+      "size_bytes": 8192,
+      "sha256": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+    },
+    "firmware.bin": {
+      "size_bytes": 1562880,
+      "sha256": "b167a4f94686b652f1b7dba45ea316be53e805f8605b82c875335baea55d136b"
+    },
+    "firmware.elf": {
+      "size_bytes": 33363760,
+      "sha256": "4f65aab7b7b701c7647e1d6265c265786277b993b9c373045095cd5458599cba"
+    },
+    "firmware.map": {
+      "size_bytes": 16104625,
+      "sha256": "c784922e4da5ac35afc1bdabf384030bdcd082d1e4cf60a8a7caaa331c5a2887"
+    }
+  }
+}

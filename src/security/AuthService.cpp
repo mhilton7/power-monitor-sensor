@@ -75,42 +75,263 @@ AuthResult RequestAuthenticator::verify(
   return AuthResult::Ok;
 }
 
-SessionManager::Session SessionManager::create(const std::uint64_t now_ms,
-                                               const std::uint32_t ttl_seconds,
-                                               const bool elevated) {
-  session_.token = crypto::randomHex(32);
-  session_.csrf = crypto::randomHex(24);
-  session_.expires_ms =
+crypto::Key32 SessionManager::digest(const std::string &value) {
+  return crypto::sha256(reinterpret_cast<const std::uint8_t *>(value.data()),
+                        value.size());
+}
+
+bool SessionManager::digestEqual(const crypto::Key32 &left,
+                                 const crypto::Key32 &right) {
+  std::uint8_t difference = 0U;
+  for (std::size_t index = 0; index < left.size(); ++index) {
+    difference |= static_cast<std::uint8_t>(left[index] ^ right[index]);
+  }
+  return difference == 0U;
+}
+
+SessionManager::Entry *SessionManager::find(const crypto::Key32 &token_digest) {
+  for (Entry &entry : entries_) {
+    if (entry.used && digestEqual(entry.token_digest, token_digest)) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+const SessionManager::Entry *
+SessionManager::find(const crypto::Key32 &token_digest) const {
+  for (const Entry &entry : entries_) {
+    if (entry.used && digestEqual(entry.token_digest, token_digest)) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+void SessionManager::purgeExpired(const std::uint64_t now_ms) {
+  for (Entry &entry : entries_) {
+    if (entry.used && now_ms >= entry.expires_ms) {
+      entry = {};
+      ++metrics_.expired;
+    }
+  }
+}
+
+void SessionManager::updatePeak() {
+  std::uint32_t active = 0U;
+  for (const Entry &entry : entries_) {
+    active += entry.used ? 1U : 0U;
+  }
+  metrics_.active = active;
+  metrics_.peak_active = std::max(metrics_.peak_active, active);
+}
+
+SessionManager::Session
+SessionManager::open(const std::string &presented_token,
+                     const std::uint64_t now_ms,
+                     const std::uint32_t ttl_seconds) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::uint64_t expires_ms =
       now_ms + static_cast<std::uint64_t>(ttl_seconds) * 1000U;
-  session_.elevated = elevated;
-  return session_;
+  if (!presented_token.empty()) {
+    Entry *existing = find(digest(presented_token));
+    if (existing != nullptr && now_ms < existing->expires_ms) {
+      Session session;
+      session.token = presented_token;
+      session.csrf = crypto::randomHex(24);
+      session.expires_ms = expires_ms;
+      session.elevated = now_ms < existing->elevated_until_ms;
+      session.reused = true;
+      session.refreshed = true;
+      existing->csrf_digest = digest(session.csrf);
+      existing->last_seen_ms = now_ms;
+      existing->expires_ms = expires_ms;
+      ++metrics_.reused;
+      ++metrics_.refreshed;
+      updatePeak();
+      return session;
+    }
+  }
+
+  purgeExpired(now_ms);
+  Entry *available = nullptr;
+  for (Entry &entry : entries_) {
+    if (!entry.used) {
+      available = &entry;
+      break;
+    }
+  }
+  if (available == nullptr) {
+    ++metrics_.capacity_rejections;
+    updatePeak();
+    Session rejected;
+    rejected.capacity_reached = true;
+    return rejected;
+  }
+
+  Session session;
+  session.token = crypto::randomHex(32);
+  session.csrf = crypto::randomHex(24);
+  session.expires_ms = expires_ms;
+  *available = {};
+  available->used = true;
+  available->token_digest = digest(session.token);
+  available->csrf_digest = digest(session.csrf);
+  available->created_ms = now_ms;
+  available->last_seen_ms = now_ms;
+  available->expires_ms = expires_ms;
+  available->generation = next_generation_++;
+  ++metrics_.created;
+  updatePeak();
+  return session;
 }
 
-bool SessionManager::validate(const std::string &token,
-                              const std::uint64_t now_ms) const {
-  return now_ms < session_.expires_ms && !session_.token.empty() &&
-         crypto::constantTimeEqual(token, session_.token);
+SessionManager::Session SessionManager::elevate(
+    const std::string &presented_token, const std::uint64_t now_ms,
+    const std::uint32_t ttl_seconds,
+    const std::uint32_t elevation_ttl_seconds) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  Session session;
+  if (presented_token.empty()) {
+    return session;
+  }
+  Entry *existing = find(digest(presented_token));
+  if (existing == nullptr || now_ms >= existing->expires_ms) {
+    ++metrics_.invalid;
+    return session;
+  }
+  session.token = presented_token;
+  session.csrf = crypto::randomHex(24);
+  session.expires_ms =
+      now_ms + static_cast<std::uint64_t>(ttl_seconds) * 1000U;
+  session.elevated = true;
+  session.reused = true;
+  session.refreshed = true;
+  existing->csrf_digest = digest(session.csrf);
+  existing->last_seen_ms = now_ms;
+  existing->expires_ms = session.expires_ms;
+  existing->elevated_until_ms = std::min(
+      session.expires_ms,
+      now_ms + static_cast<std::uint64_t>(elevation_ttl_seconds) * 1000U);
+  ++metrics_.reused;
+  ++metrics_.refreshed;
+  updatePeak();
+  return session;
 }
 
-bool SessionManager::validateMutation(const std::string &token,
-                                      const std::string &csrf,
-                                      const std::uint64_t now_ms) const {
-  return validate(token, now_ms) && !session_.csrf.empty() &&
-         crypto::constantTimeEqual(csrf, session_.csrf);
+LocalSessionResult
+SessionManager::validate(const std::string &token, const std::uint64_t now_ms,
+                         const bool require_elevated) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (token.empty()) {
+    return LocalSessionResult::Missing;
+  }
+  Entry *entry = const_cast<SessionManager *>(this)->find(digest(token));
+  if (entry == nullptr) {
+    ++metrics_.invalid;
+    return LocalSessionResult::Invalid;
+  }
+  if (now_ms >= entry->expires_ms) {
+    ++metrics_.expired;
+    *entry = {};
+    return LocalSessionResult::Expired;
+  }
+  if (require_elevated && now_ms >= entry->elevated_until_ms) {
+    return LocalSessionResult::ElevationRequired;
+  }
+  entry->last_seen_ms = now_ms;
+  return LocalSessionResult::Ok;
 }
 
-bool SessionManager::validateElevated(const std::string &token,
-                                      const std::uint64_t now_ms) const {
-  return session_.elevated && validate(token, now_ms);
-}
-
-bool SessionManager::validateElevatedMutation(
+LocalSessionResult SessionManager::validateMutation(
     const std::string &token, const std::string &csrf,
-    const std::uint64_t now_ms) const {
-  return session_.elevated && validateMutation(token, csrf, now_ms);
+    const std::uint64_t now_ms, const bool require_elevated) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (token.empty()) {
+    return LocalSessionResult::Missing;
+  }
+  Entry *entry = const_cast<SessionManager *>(this)->find(digest(token));
+  if (entry == nullptr) {
+    ++metrics_.invalid;
+    return LocalSessionResult::Invalid;
+  }
+  if (now_ms >= entry->expires_ms) {
+    ++metrics_.expired;
+    *entry = {};
+    return LocalSessionResult::Expired;
+  }
+  if (require_elevated && now_ms >= entry->elevated_until_ms) {
+    return LocalSessionResult::ElevationRequired;
+  }
+  if (csrf.empty() || !digestEqual(entry->csrf_digest, digest(csrf))) {
+    return LocalSessionResult::CsrfRejected;
+  }
+  entry->last_seen_ms = now_ms;
+  return LocalSessionResult::Ok;
 }
 
-void SessionManager::invalidate() { session_ = {}; }
+bool SessionManager::invalidate(const std::string &token,
+                                const std::uint64_t now_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (token.empty()) {
+    return false;
+  }
+  Entry *entry = find(digest(token));
+  if (entry == nullptr || now_ms >= entry->expires_ms) {
+    return false;
+  }
+  *entry = {};
+  ++metrics_.revoked;
+  updatePeak();
+  return true;
+}
+
+void SessionManager::invalidateAll() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (Entry &entry : entries_) {
+    entry = {};
+  }
+  updatePeak();
+}
+
+SessionManager::Metrics SessionManager::metrics(const std::uint64_t now_ms) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const_cast<SessionManager *>(this)->purgeExpired(now_ms);
+  const_cast<SessionManager *>(this)->updatePeak();
+  return metrics_;
+}
+
+const char *localSessionResultCode(const LocalSessionResult result) {
+  switch (result) {
+  case LocalSessionResult::Ok:
+    return "ok";
+  case LocalSessionResult::Missing:
+    return "local_session_missing";
+  case LocalSessionResult::Invalid:
+    return "local_session_invalid";
+  case LocalSessionResult::Expired:
+    return "local_session_expired";
+  case LocalSessionResult::CsrfRejected:
+    return "local_csrf_invalid";
+  case LocalSessionResult::ElevationRequired:
+    return "elevated_session_required";
+  }
+  return "local_session_invalid";
+}
+
+const char *requestAuthModeName(const RequestAuthMode mode) {
+  switch (mode) {
+  case RequestAuthMode::LocalBrowserSession:
+    return "local_browser_session";
+  case RequestAuthMode::ServerToDeviceHmac:
+    return "server_to_device_hmac";
+  case RequestAuthMode::Unauthenticated:
+    return "unauthenticated";
+  case RequestAuthMode::MalformedMixedAuthentication:
+    return "malformed_mixed_authentication";
+  }
+  return "unauthenticated";
+}
 
 const char *authResultCode(const AuthResult result) {
   switch (result) {

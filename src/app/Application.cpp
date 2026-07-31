@@ -22,6 +22,7 @@
 #include "app/TaskConfig.h"
 #include "board_pins.h"
 #include "build_config.h"
+#include "core/MemoryPressurePolicy.h"
 #include "diagnostics/DiagnosticCore.h"
 #include "diagnostics/SerialLogger.h"
 #include "meter/PzemMeter.h"
@@ -118,6 +119,19 @@ std::string httpsHost(const std::string &url) {
     return {};
   const std::size_t colon = authority.rfind(':');
   return colon == std::string::npos ? authority : authority.substr(0, colon);
+}
+
+Limits measurementLimits(const MeasurementRuntimeConfig &config) {
+  Limits limits;
+  limits.ct_rating_a = config.ct_rating_a;
+  limits.ct_warning_fraction = config.ct_warning_fraction;
+  limits.ct_critical_fraction = config.ct_critical_fraction;
+  limits.ct_fault_fraction = config.ct_fault_fraction;
+  limits.minimum_voltage_v = config.voltage_minimum_v;
+  limits.maximum_voltage_v = config.voltage_maximum_v;
+  limits.minimum_frequency_hz = config.frequency_minimum_hz;
+  limits.maximum_frequency_hz = config.frequency_maximum_hz;
+  return limits;
 }
 
 } // namespace
@@ -400,15 +414,9 @@ void Application::meterTask() {
       sample.error = MeterError::UartFailure;
       sample.quality_flags = MeterGap;
     }
-    Limits limits;
-    limits.ct_rating_a = config_.config().ct_rating_a;
-    limits.ct_warning_fraction = config_.config().ct_warning_fraction;
-    limits.ct_critical_fraction = config_.config().ct_critical_fraction;
-    limits.ct_fault_fraction = config_.config().ct_fault_fraction;
-    limits.minimum_voltage_v = config_.config().voltage_minimum_v;
-    limits.maximum_voltage_v = config_.config().voltage_maximum_v;
-    limits.minimum_frequency_hz = config_.config().frequency_minimum_hz;
-    limits.maximum_frequency_hz = config_.config().frequency_maximum_hz;
+    const MeasurementRuntimeConfig measurement_config =
+        config_.measurementRuntimeConfig();
+    const Limits limits = measurementLimits(measurement_config);
     if (sample.error == MeterError::None) {
       validateMeasurement(sample, limits);
       sample.device_lifetime_energy_wh =
@@ -429,7 +437,7 @@ void Application::meterTask() {
     feedWatchdog();
     delayUntilWithWatchdog(
         &last_wake,
-        pdMS_TO_TICKS(config_.config().sample_interval_seconds * 1000U));
+        pdMS_TO_TICKS(measurement_config.sample_interval_seconds * 1000U));
   }
 }
 
@@ -440,15 +448,7 @@ void Application::aggregationTask() {
       "name=AggregationTask core=%d priority=%u stack_bytes=%lu watchdog=true",
       xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
       static_cast<unsigned long>(task_config::kAggregationStackBytes));
-  Limits limits;
-  limits.ct_rating_a = config_.config().ct_rating_a;
-  limits.ct_warning_fraction = config_.config().ct_warning_fraction;
-  limits.ct_critical_fraction = config_.config().ct_critical_fraction;
-  limits.ct_fault_fraction = config_.config().ct_fault_fraction;
-  limits.minimum_voltage_v = config_.config().voltage_minimum_v;
-  limits.maximum_voltage_v = config_.config().voltage_maximum_v;
-  limits.minimum_frequency_hz = config_.config().frequency_minimum_hz;
-  limits.maximum_frequency_hz = config_.config().frequency_maximum_hz;
+  Limits limits = measurementLimits(config_.measurementRuntimeConfig());
   IntervalAggregator aggregator(limits);
   EnergyNormalizer energy(config_.energyOffsetWh());
   bool started = false;
@@ -456,14 +456,9 @@ void Application::aggregationTask() {
   MeasurementSnapshot sample;
   for (;;) {
     if (xQueueReceive(sample_queue_, &sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      limits.ct_rating_a = config_.config().ct_rating_a;
-      limits.ct_warning_fraction = config_.config().ct_warning_fraction;
-      limits.ct_critical_fraction = config_.config().ct_critical_fraction;
-      limits.ct_fault_fraction = config_.config().ct_fault_fraction;
-      limits.minimum_voltage_v = config_.config().voltage_minimum_v;
-      limits.maximum_voltage_v = config_.config().voltage_maximum_v;
-      limits.minimum_frequency_hz = config_.config().frequency_minimum_hz;
-      limits.maximum_frequency_hz = config_.config().frequency_maximum_hz;
+      const MeasurementRuntimeConfig measurement_config =
+          config_.measurementRuntimeConfig();
+      limits = measurementLimits(measurement_config);
       aggregator.setLimits(limits);
       if (!started) {
         aggregator.reset(sample.utc_ms, sample.monotonic_ms);
@@ -473,7 +468,7 @@ void Application::aggregationTask() {
       aggregator.add(sample);
       const std::uint64_t interval_ms =
           static_cast<std::uint64_t>(
-              config_.config().durable_log_interval_seconds) *
+              measurement_config.durable_log_interval_seconds) *
           1000U;
       if (sample.monotonic_ms - interval_started_ms >= interval_ms &&
           aggregator.hasSamples()) {
@@ -481,7 +476,7 @@ void Application::aggregationTask() {
             config_.identity().device_id.empty()
                 ? config_.identity().local_instance_id
                 : config_.identity().device_id,
-            config_.config().friendly_name, config_.identity().boot_id,
+            measurement_config.friendly_name, config_.identity().boot_id,
             version::FIRMWARE, sample.utc_ms, sample.monotonic_ms, energy);
         if (!storage_coordinator_.enqueueRecord(record)) {
           ++sample_dropped_;
@@ -542,14 +537,17 @@ void Application::healthTask() {
         uxQueueMessagesWaiting(maintenance_queue_),
         storage_coordinator_.dropped() + sample_dropped_, action_dropped_);
     const std::uint64_t now = clock_.monotonicMs();
+    const MeasurementRuntimeConfig measurement_config =
+        config_.measurementRuntimeConfig();
     const auto requested_level =
-        static_cast<diag::LogLevel>(config_.config().diagnostic_log_level);
+        static_cast<diag::LogLevel>(measurement_config.diagnostic_log_level);
     if (diag::SerialLogger::instance().level() != requested_level) {
       diag::SerialLogger::instance().setLevel(requested_level);
       PM_LOG_INFO("LOGGER", "LOG_LEVEL_APPLIED", "level=%s source=config",
                   diag::levelName(requested_level));
     }
     if (last_health_ms == 0 || now - last_health_ms >= 60'000U) {
+      captureTaskDiagnostics();
       const NetworkStatus network = network_.status();
       const StorageHealth storage = storage_.health();
       const MeterMetrics meter = meter_->metrics();
@@ -590,6 +588,87 @@ void Application::healthTask() {
                    task_config::kSerialCommandStackBytes);
       last_health_ms = now;
     }
+    const std::uint32_t free_internal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const std::uint32_t largest_internal =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                         MALLOC_CAP_8BIT);
+    const MemoryPressureUpdate pressure =
+        memory_pressure_.update(free_internal, largest_internal, now);
+    diagnostics_.setMemoryPressureMetrics(memory_pressure_.metrics(now));
+    if (pressure.changed) {
+      const bool constrained =
+          pressure.current != MemoryPressureState::Normal;
+      PM_LOG_WARN(
+          "MEMORY", "MEMORY_PRESSURE_STATE_CHANGED",
+          "previous=%s current=%s transitions=%lu free_internal=%lu "
+          "largest_internal=%lu primary_measurement_preserved=true "
+          "heavy_ui_deferred=%s",
+          memoryPressureStateName(pressure.previous),
+          memoryPressureStateName(pressure.current),
+          static_cast<unsigned long>(memory_pressure_.transitions()),
+          static_cast<unsigned long>(free_internal),
+          static_cast<unsigned long>(largest_internal),
+          constrained ? "true" : "false");
+      const MemoryPressureMetrics memory = memory_pressure_.metrics(now);
+      char detail[384]{};
+      std::snprintf(
+          detail, sizeof(detail),
+          "previous=%s current=%s entries=%lu recoveries=%lu "
+          "free_internal=%lu largest_internal=%lu sync_in_progress=%s",
+          memoryPressureStateName(pressure.previous),
+          memoryPressureStateName(pressure.current),
+          static_cast<unsigned long>(memory.entry_count),
+          static_cast<unsigned long>(memory.recovery_count),
+          static_cast<unsigned long>(free_internal),
+          static_cast<unsigned long>(largest_internal),
+          diagnostics_.syncMetrics().sync_in_progress ? "true" : "false");
+      storage_coordinator_.enqueueEvent(
+          pressure.current == MemoryPressureState::Normal
+              ? "EVT_MEMORY_PRESSURE_RECOVERED"
+              : "EVT_MEMORY_PRESSURE_CHANGED",
+          pressure.current == MemoryPressureState::LowMemory ? "warning"
+                                                              : "info",
+          detail, clock_.utcMs(), config_.identity().boot_id);
+    }
+    const WifiDisconnectSnapshot wifi_events =
+        network_.wifiDisconnectEvents();
+    for (std::size_t index = 0; index < wifi_events.count; ++index) {
+      const WifiDisconnectEvent &event = wifi_events.events[index];
+      if (event.transition_number <= last_persisted_wifi_transition_) {
+        continue;
+      }
+      const diag::ReasonInfo reason = diag::wifiDisconnectReason(event.reason);
+      const std::string bssid =
+          diag::maskMac(std::string(event.bssid.data()));
+      char detail[512]{};
+      std::snprintf(
+          detail, sizeof(detail),
+          "event=%s transition=%llu reason=%s reason_code=%u bssid=%s "
+          "channel=%d rssi_dbm=%ld ip=%s gateway=%s dns=%s dhcp_ms=%lu "
+          "reconnect_attempt=%lu free_internal=%lu largest_internal=%lu",
+          wifiEventKindName(event.kind),
+          static_cast<unsigned long long>(event.transition_number),
+          event.reason == 0U ? "none" : reason.name,
+          static_cast<unsigned>(event.reason), bssid.c_str(),
+          static_cast<int>(event.channel), static_cast<long>(event.rssi_dbm),
+          event.ip_address.data(), event.gateway.data(), event.dns.data(),
+          static_cast<unsigned long>(event.dhcp_duration_ms),
+          static_cast<unsigned long>(event.reconnect_count),
+          static_cast<unsigned long>(event.free_internal_heap_bytes),
+          static_cast<unsigned long>(event.largest_internal_block_bytes));
+      const bool persisted = storage_coordinator_.enqueueEvent(
+          "EVT_WIFI_TRANSITION",
+          event.kind == WifiDisconnectEvent::Kind::Disconnected ||
+                  event.kind == WifiDisconnectEvent::Kind::IpLost
+              ? "warning"
+              : "info",
+          detail, clock_.utcMs(), config_.identity().boot_id);
+      if (!persisted) {
+        break;
+      }
+      last_persisted_wifi_transition_ = event.transition_number;
+    }
     if (ESP.getFreeHeap() < 32'768U &&
         diag::SerialLogger::instance().allow("low_heap", 30'000U)) {
       PM_LOG_WARN("MEMORY", "LOW_HEAP",
@@ -600,11 +679,11 @@ void Application::healthTask() {
                   static_cast<unsigned long>(
                       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     }
-    if (!config_.safeMode() && config_.config().retention_enabled &&
+    if (!config_.safeMode() && measurement_config.retention_enabled &&
         clock_.synchronized() &&
         (last_retention_ms == 0 || now - last_retention_ms >= 3'600'000U)) {
       storage_.applyRetention(config_.serverAckSequence(), clock_.utcMs(),
-                              config_.config().retention_days);
+                              measurement_config.retention_days);
       last_retention_ms = now;
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1040,28 +1119,55 @@ void Application::reportStatus() const {
 }
 
 void Application::reportTasks() const {
+  captureTaskDiagnostics();
+  for (const auto &task : diagnostics_.taskMetrics()) {
+    if (task.name.empty()) {
+      continue;
+    }
+    PM_LOG_INFO("TASK", "TASK_REPORT",
+                "name=%s running=%s priority=%lu core=%d stack_bytes=%lu "
+                "high_water_bytes=%lu margin_percent=%lu watchdog=%s",
+                task.name.c_str(), task.running ? "true" : "false",
+                static_cast<unsigned long>(task.priority),
+                static_cast<int>(task.core),
+                static_cast<unsigned long>(task.configured_stack_bytes),
+                static_cast<unsigned long>(task.high_water_bytes),
+                static_cast<unsigned long>(task.margin_percent),
+                task.watchdog ? "true" : "false");
+  }
+}
+
+void Application::captureTaskDiagnostics() const {
   struct TaskReport {
     const char *name;
     TaskHandle_t handle;
     std::uint32_t configured_stack_bytes;
+    std::int8_t core;
     bool watchdog;
   };
-  const std::array<TaskReport, 9> tasks{{
+  const std::array<TaskReport, kTaskRuntimeMetricCapacity> tasks{{
       {"DiagLogTask", xTaskGetHandle("DiagLogTask"),
-       task_config::kDiagnosticLoggerStackBytes, false},
-      {"MeterTask", meter_task_, task_config::kMeterStackBytes, true},
+       task_config::kDiagnosticLoggerStackBytes, 0, false},
+      {"MeterTask", meter_task_, task_config::kMeterStackBytes, 1, true},
       {"AggregationTask", aggregation_task_,
-       task_config::kAggregationStackBytes, true},
-      {"StorageTask", storage_task_, task_config::kStorageStackBytes, false},
-      {"NetworkTask", network_task_, task_config::kNetworkStackBytes, true},
-      {"ServerSyncTask", sync_task_, task_config::kServerSyncStackBytes, false},
-      {"HealthTask", health_task_, task_config::kHealthStackBytes, false},
+       task_config::kAggregationStackBytes, 1, true},
+      {"StorageTask", storage_task_, task_config::kStorageStackBytes, 1,
+       false},
+      {"NetworkTask", network_task_, task_config::kNetworkStackBytes, 0,
+       true},
+      {"ServerSyncTask", sync_task_, task_config::kServerSyncStackBytes, 0,
+       false},
+      {"HealthTask", health_task_, task_config::kHealthStackBytes, 0, false},
       {"OtaMaintenanceTask", maintenance_task_,
-       task_config::kMaintenanceStackBytes, false},
+       task_config::kMaintenanceStackBytes, 0, false},
       {"SerialCommandTask", serial_command_task_,
-       task_config::kSerialCommandStackBytes, false},
+       task_config::kSerialCommandStackBytes, 0, false},
+      {"PasswordJobTask", xTaskGetHandle("PasswordJobTask"),
+       task_config::kPasswordJobStackBytes, 1, false},
   }};
-  for (const auto &task : tasks) {
+  std::array<TaskRuntimeMetric, kTaskRuntimeMetricCapacity> snapshot{};
+  for (std::size_t index = 0; index < tasks.size(); ++index) {
+    const auto &task = tasks[index];
     const std::uint32_t high_water_bytes =
         task.handle == nullptr ? 0U
                                : static_cast<std::uint32_t>(
@@ -1074,18 +1180,20 @@ void Application::reportTasks() const {
                        task.configured_stack_bytes, high_water_bytes)) *
                    100U) /
                   task.configured_stack_bytes);
-    PM_LOG_INFO("TASK", "TASK_REPORT",
-                "name=%s running=%s priority=%u stack_bytes=%lu "
-                "high_water_bytes=%lu margin_percent=%lu watchdog=%s",
-                task.name, task.handle == nullptr ? "false" : "true",
-                task.handle == nullptr
-                    ? 0U
-                    : static_cast<unsigned>(uxTaskPriorityGet(task.handle)),
-                static_cast<unsigned long>(task.configured_stack_bytes),
-                static_cast<unsigned long>(high_water_bytes),
-                static_cast<unsigned long>(margin_percent),
-                task.watchdog ? "true" : "false");
+    snapshot[index] = {
+        task.name,
+        task.configured_stack_bytes,
+        high_water_bytes,
+        margin_percent,
+        task.handle == nullptr
+            ? 0U
+            : static_cast<std::uint32_t>(uxTaskPriorityGet(task.handle)),
+        task.core,
+        task.handle != nullptr,
+        task.watchdog,
+    };
   }
+  diagnostics_.setTaskMetrics(snapshot);
 }
 
 void Application::reportMemory() const {

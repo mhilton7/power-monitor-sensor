@@ -95,10 +95,74 @@ struct ConfigValidation {
   std::string detail;
 };
 
+// A deliberately narrow, short-lived copy for the outbound TLS transport.
+// Keeping this separate from RuntimeConfig prevents every heartbeat from
+// copying unrelated Wi-Fi, OTA, timezone, and metering strings into the
+// already stack/heap-sensitive TLS path.
+struct ServerTransportConfig {
+  std::string server_url;
+  std::string server_ca_pem;
+  std::string server_fingerprint;
+  std::array<std::string, 4> allowed_server_addresses{};
+};
+
+struct SensorStatusConfig {
+  std::string friendly_name;
+};
+
+// Hot-path configuration snapshots intentionally exclude the CA, OTA key,
+// and unrelated strings. RuntimeConfig can contain several KiB of PEM data;
+// copying it from a 250 ms network loop or every meter sample needlessly
+// fragments internal heap and inflates the caller's stack frame.
+struct NetworkRuntimeConfig {
+  std::string hostname;
+  std::string wifi_ssid;
+  bool static_network_enabled{false};
+  std::string static_ip;
+  std::string static_gateway;
+  std::string static_subnet;
+  std::string static_dns;
+  std::array<std::string, 3> ntp_servers{};
+};
+
+struct MeasurementRuntimeConfig {
+  std::string friendly_name;
+  std::uint32_t sample_interval_seconds{1};
+  std::uint32_t durable_log_interval_seconds{60};
+  std::uint32_t pzem_timeout_ms{750};
+  std::uint32_t sd_spi_hz{4'000'000};
+  float ct_rating_a{100.0F};
+  float ct_warning_fraction{0.8F};
+  float ct_critical_fraction{0.9F};
+  float ct_fault_fraction{1.1F};
+  float voltage_minimum_v{80.0F};
+  float voltage_maximum_v{280.0F};
+  float frequency_minimum_hz{45.0F};
+  float frequency_maximum_hz{65.0F};
+  bool retention_enabled{false};
+  std::uint16_t retention_days{365};
+  std::uint8_t diagnostic_log_level{PM_RELEASE_BUILD ? 2U : 1U};
+};
+
+struct ServerSyncRuntimeConfig {
+  std::string friendly_name;
+  std::string ota_channel;
+  bool server_configured{false};
+  ConnectionMode connection_mode{ConnectionMode::Push};
+  std::uint32_t heartbeat_interval_seconds{15};
+  std::uint32_t sync_interval_seconds{300};
+  std::uint32_t sync_retry_max_seconds{900};
+};
+
 class ConfigService {
 public:
   bool begin();
   RuntimeConfig config() const;
+  ServerTransportConfig serverTransportConfig() const;
+  SensorStatusConfig sensorStatusConfig() const;
+  NetworkRuntimeConfig networkRuntimeConfig() const;
+  MeasurementRuntimeConfig measurementRuntimeConfig() const;
+  ServerSyncRuntimeConfig serverSyncRuntimeConfig() const;
   DeviceIdentity identity() const;
   ConfigValidation validate(const RuntimeConfig &candidate,
                             bool ct_change_acknowledged) const;

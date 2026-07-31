@@ -1,11 +1,13 @@
 #include "network/NetworkService.h"
 
 #include <algorithm>
+#include <cstdio>
 
 #include <Arduino.h>
 #include <ESP.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 #include <esp_sntp.h>
 
 #include "build_config.h"
@@ -31,6 +33,24 @@ std::string identitySuffix(const DeviceIdentity &identity) {
 }
 
 } // namespace
+
+const char *wifiEventKindName(const WifiDisconnectEvent::Kind kind) {
+  switch (kind) {
+  case WifiDisconnectEvent::Kind::StationStart:
+    return "STA_START";
+  case WifiDisconnectEvent::Kind::Connected:
+    return "STA_CONNECTED";
+  case WifiDisconnectEvent::Kind::Disconnected:
+    return "STA_DISCONNECTED";
+  case WifiDisconnectEvent::Kind::IpAcquired:
+    return "STA_GOT_IP";
+  case WifiDisconnectEvent::Kind::IpLost:
+    return "STA_LOST_IP";
+  case WifiDisconnectEvent::Kind::AuthModeChanged:
+    return "AUTH_MODE_CHANGED";
+  }
+  return "UNKNOWN";
+}
 
 NetworkService::NetworkService(ConfigService &config, ClockService &clock)
     : config_(config), clock_(clock) {}
@@ -61,14 +81,17 @@ bool NetworkService::begin() {
                       const arduino_event_info_t info) {
     switch (event) {
     case ARDUINO_EVENT_WIFI_STA_START:
+      recordWifiEvent(WifiDisconnectEvent::Kind::StationStart);
       PM_LOG_DEBUG("WIFI", "STATION_STARTED", "driver=ready");
       break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      recordWifiEvent(WifiDisconnectEvent::Kind::Connected);
       PM_LOG_INFO("WIFI", "ASSOCIATED", "ssid=configured bssid=%s channel=%d",
                   diag::maskMac(std::string(WiFi.BSSIDstr().c_str())).c_str(),
                   WiFi.channel());
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      recordWifiEvent(WifiDisconnectEvent::Kind::IpAcquired);
       PM_LOG_INFO("DHCP", "IP_ACQUIRED", "ip=%s gateway=%s subnet=%s dns=%s",
                   WiFi.localIP().toString().c_str(),
                   WiFi.gatewayIP().toString().c_str(),
@@ -78,6 +101,7 @@ bool NetworkService::begin() {
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
       const std::uint16_t reason = info.wifi_sta_disconnected.reason;
       last_disconnect_reason_.store(reason, std::memory_order_relaxed);
+      recordWifiEvent(WifiDisconnectEvent::Kind::Disconnected, reason);
       const diag::ReasonInfo translated = diag::wifiDisconnectReason(reason);
       PM_LOG_ERROR_CODE("WIFI", "DISCONNECTED", reason,
                         "error=%s reason=%s numeric=%u explanation=%s hint=%s",
@@ -87,6 +111,14 @@ bool NetworkService::begin() {
                                                    : translated.hint);
       break;
     }
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      recordWifiEvent(WifiDisconnectEvent::Kind::IpLost);
+      PM_LOG_WARN("DHCP", "IP_LOST", "result=reconnect_pending");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_AUTHMODE_CHANGE:
+      recordWifiEvent(WifiDisconnectEvent::Kind::AuthModeChanged);
+      PM_LOG_INFO("WIFI", "AUTH_MODE_CHANGED", "details=redacted");
+      break;
     case ARDUINO_EVENT_WIFI_AP_START:
       PM_LOG_INFO("WIFI", "SETUP_AP_DRIVER_STARTED",
                   "channel=1 client_limit=4");
@@ -106,7 +138,7 @@ bool NetworkService::begin() {
       break;
     }
   });
-  status_.hostname = config_.config().hostname + ".local";
+  status_.hostname = config_.networkRuntimeConfig().hostname + ".local";
   if (config_.hasWifiCredentials()) {
     transition(Phase::Idle, "credentials_present");
     connectStation();
@@ -119,6 +151,65 @@ bool NetworkService::begin() {
               status_.setup_ap_active ? "active" : "inactive");
   unlockStatus();
   return true;
+}
+
+void NetworkService::recordWifiEvent(const WifiDisconnectEvent::Kind kind,
+                                     const std::uint16_t reason) {
+  WifiDisconnectEvent event;
+  event.kind = kind;
+  event.monotonic_ms = clock_.monotonicMs();
+  event.reason = reason;
+  event.rssi_dbm = WiFi.RSSI();
+  event.channel = static_cast<std::int16_t>(WiFi.channel());
+  const String bssid = WiFi.BSSIDstr();
+  const String ip = WiFi.localIP().toString();
+  const String gateway = WiFi.gatewayIP().toString();
+  const String dns = WiFi.dnsIP().toString();
+  std::snprintf(event.bssid.data(), event.bssid.size(), "%s", bssid.c_str());
+  std::snprintf(event.ip_address.data(), event.ip_address.size(), "%s",
+                ip.c_str());
+  std::snprintf(event.gateway.data(), event.gateway.size(), "%s",
+                gateway.c_str());
+  std::snprintf(event.dns.data(), event.dns.size(), "%s", dns.c_str());
+  const std::uint64_t connect_started_ms =
+      station_connect_started_snapshot_ms_.load(std::memory_order_relaxed);
+  if (kind == WifiDisconnectEvent::Kind::IpAcquired &&
+      connect_started_ms != 0U && event.monotonic_ms >= connect_started_ms) {
+    event.dhcp_duration_ms = static_cast<std::uint32_t>(
+        event.monotonic_ms - connect_started_ms);
+  }
+  event.free_internal_heap_bytes =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  event.largest_internal_block_bytes =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  portENTER_CRITICAL(&disconnect_events_mux_);
+  event.transition_number = disconnect_event_total_ + 1U;
+  event.reconnect_count =
+      reconnect_count_snapshot_.load(std::memory_order_relaxed);
+  disconnect_events_[disconnect_event_next_] = event;
+  disconnect_event_next_ =
+      (disconnect_event_next_ + 1U) % kWifiDisconnectEventCapacity;
+  disconnect_event_count_ =
+      std::min(disconnect_event_count_ + 1U, kWifiDisconnectEventCapacity);
+  ++disconnect_event_total_;
+  portEXIT_CRITICAL(&disconnect_events_mux_);
+}
+
+WifiDisconnectSnapshot NetworkService::wifiDisconnectEvents() const {
+  WifiDisconnectSnapshot snapshot;
+  portENTER_CRITICAL(&disconnect_events_mux_);
+  snapshot.count = disconnect_event_count_;
+  snapshot.total = disconnect_event_total_;
+  const std::size_t oldest =
+      (disconnect_event_next_ + kWifiDisconnectEventCapacity -
+       disconnect_event_count_) %
+      kWifiDisconnectEventCapacity;
+  for (std::size_t index = 0; index < disconnect_event_count_; ++index) {
+    snapshot.events[index] =
+        disconnect_events_[(oldest + index) % kWifiDisconnectEventCapacity];
+  }
+  portEXIT_CRITICAL(&disconnect_events_mux_);
+  return snapshot;
 }
 
 void NetworkService::update() {
@@ -199,6 +290,8 @@ void NetworkService::update() {
   }
   if (!connected && config_.hasWifiCredentials() && now >= next_reconnect_ms_) {
     ++status_.reconnect_count;
+    reconnect_count_snapshot_.store(status_.reconnect_count,
+                                    std::memory_order_relaxed);
     connectStation();
   }
   const bool has_wifi_credentials = config_.hasWifiCredentials();
@@ -261,7 +354,7 @@ void NetworkService::update() {
     }
   }
   if (connected && !clock_.synchronized() && now >= next_ntp_retry_ms_) {
-    const auto ntp = config_.config().ntp_servers;
+    const auto ntp = config_.networkRuntimeConfig().ntp_servers;
     const std::uint32_t exponent = std::min<std::uint32_t>(ntp_attempt_, 4U);
     const std::uint32_t retry_ms = std::min<std::uint32_t>(
         kNtpRetryInitialMs << exponent, kNtpRetryMaximumMs);
@@ -288,7 +381,7 @@ void NetworkService::touchSetupActivity() {
 }
 
 void NetworkService::applyConfiguration() {
-  const RuntimeConfig active_config = config_.config();
+  const NetworkRuntimeConfig active_config = config_.networkRuntimeConfig();
   PM_LOG_INFO("WIFI", "CONFIG_APPLY_BEGIN",
               "ssid=%s static_ipv4=%s recovery_timeout_ms=60000 "
               "credentials_erased=false",
@@ -308,6 +401,7 @@ void NetworkService::applyConfiguration() {
   status_.server_reachable = false;
   status_.server_authenticated = false;
   station_connect_started_ms_ = 0;
+  station_connect_started_snapshot_ms_.store(0U, std::memory_order_relaxed);
   next_reconnect_ms_ = 0;
   next_setup_recovery_ms_ = 0;
   backoff_attempt_ = 0;
@@ -418,7 +512,7 @@ void NetworkService::stopSetupAp() {
 }
 
 void NetworkService::connectStation() {
-  const RuntimeConfig active_config = config_.config();
+  const NetworkRuntimeConfig active_config = config_.networkRuntimeConfig();
   transition(Phase::Connecting, "connection_attempt");
   WiFi.mode(status_.setup_ap_active ? WIFI_AP_STA : WIFI_STA);
   WiFi.setHostname(active_config.hostname.c_str());
@@ -448,6 +542,7 @@ void NetworkService::connectStation() {
   const std::uint64_t now = clock_.monotonicMs();
   if (station_connect_started_ms_ == 0) {
     station_connect_started_ms_ = now;
+    station_connect_started_snapshot_ms_.store(now, std::memory_order_relaxed);
   }
   const wl_status_t start_status =
       WiFi.begin(active_config.wifi_ssid.c_str(), password.c_str());
@@ -470,7 +565,7 @@ void NetworkService::connectStation() {
 }
 
 void NetworkService::onConnected() {
-  const RuntimeConfig active_config = config_.config();
+  const NetworkRuntimeConfig active_config = config_.networkRuntimeConfig();
   const DeviceIdentity identity = config_.identity();
   status_.station_connected = true;
   status_.rssi_dbm = WiFi.RSSI();
@@ -497,6 +592,7 @@ void NetworkService::onConnected() {
   }
   backoff_attempt_ = 0;
   station_connect_started_ms_ = 0;
+  station_connect_started_snapshot_ms_.store(0U, std::memory_order_relaxed);
   PM_LOG_INFO(
       "TIME", "NTP_CONFIGURE",
       "attempt=1 servers=3 timezone=UTC0 trust_state=pending timeout_ms=%lu",
@@ -570,12 +666,14 @@ void NetworkService::updateScan() {
   if (count < 0) {
     PM_LOG_ERROR("WIFI", "SCAN_FAILED", "error=PM-WIFI-010 result=%d", count);
   } else {
+    const std::string configured_ssid =
+        config_.networkRuntimeConfig().wifi_ssid;
     int matches = 0;
     std::int32_t strongest_rssi = -127;
     int strongest_channel = 0;
     int strongest_encryption = 0;
     for (int index = 0; index < count; ++index) {
-      if (std::string(WiFi.SSID(index).c_str()) == config_.config().wifi_ssid) {
+      if (std::string(WiFi.SSID(index).c_str()) == configured_ssid) {
         ++matches;
         if (WiFi.RSSI(index) > strongest_rssi) {
           strongest_rssi = WiFi.RSSI(index);
@@ -596,7 +694,7 @@ void NetworkService::updateScan() {
                 "strongest_rssi_dbm=%ld channel=%d encryption=%d",
                 static_cast<unsigned long long>(clock_.monotonicMs() -
                                                 scan_started_ms_),
-                count, diag::maskSsid(config_.config().wifi_ssid).c_str(),
+                count, diag::maskSsid(configured_ssid).c_str(),
                 matches > 0 ? "true" : "false", matches,
                 matches > 1 ? "true" : "false",
                 static_cast<long>(strongest_rssi), strongest_channel,

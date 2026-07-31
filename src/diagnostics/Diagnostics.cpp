@@ -1,14 +1,41 @@
 #include "diagnostics/Diagnostics.h"
 
+#include <algorithm>
+
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESP.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_system.h>
 
 #include "build_config.h"
 #include "diagnostics/SerialLogger.h"
+#include "ui/embedded_assets.h"
 #include "version.h"
 
 namespace pm {
+namespace {
+
+std::string runningFirmwareSha256() {
+  const esp_partition_t *partition = esp_ota_get_running_partition();
+  if (partition == nullptr) {
+    return {};
+  }
+  std::uint8_t digest[32]{};
+  if (esp_partition_get_sha256(partition, digest) != ESP_OK) {
+    return {};
+  }
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string value(64U, '0');
+  for (std::size_t index = 0; index < sizeof(digest); ++index) {
+    value[index * 2U] = kHex[(digest[index] >> 4U) & 0x0fU];
+    value[index * 2U + 1U] = kHex[digest[index] & 0x0fU];
+  }
+  return value;
+}
+
+} // namespace
 
 Diagnostics::Diagnostics() {
   mutex_ = xSemaphoreCreateMutex();
@@ -90,6 +117,23 @@ SyncMetrics Diagnostics::syncMetrics() const {
   return copy;
 }
 
+void Diagnostics::setMemoryPressureMetrics(
+    const MemoryPressureMetrics &metrics) {
+  if (lock()) {
+    memory_pressure_ = metrics;
+    unlock();
+  }
+}
+
+MemoryPressureMetrics Diagnostics::memoryPressureMetrics() const {
+  if (!lock()) {
+    return {};
+  }
+  const MemoryPressureMetrics copy = memory_pressure_;
+  unlock();
+  return copy;
+}
+
 bool Diagnostics::acquireHighMemoryOperation(const TickType_t timeout) const {
   return high_memory_mutex_ != nullptr &&
          xSemaphoreTake(high_memory_mutex_, timeout) == pdTRUE;
@@ -120,6 +164,85 @@ void Diagnostics::recordHttpStatus(const int status,
   unlock();
 }
 
+void Diagnostics::recordBrowserSessionRejection() {
+  if (lock()) {
+    ++http_.browser_session_rejections;
+    unlock();
+  }
+}
+
+void Diagnostics::recordMalformedAuthHeaderRejection() {
+  if (lock()) {
+    ++http_.malformed_auth_header_rejections;
+    unlock();
+  }
+}
+
+void Diagnostics::recordBrowserAuth(const BrowserAuthMetric result) {
+  if (!lock()) {
+    return;
+  }
+  switch (result) {
+  case BrowserAuthMetric::Accepted:
+    ++http_.browser_requests_accepted;
+    break;
+  case BrowserAuthMetric::SessionExpired:
+    ++http_.browser_requests_session_expired;
+    break;
+  case BrowserAuthMetric::SessionInvalid:
+    ++http_.browser_requests_session_invalid;
+    break;
+  case BrowserAuthMetric::CsrfRejected:
+    ++http_.browser_requests_csrf_rejected;
+    break;
+  }
+  unlock();
+}
+
+void Diagnostics::recordServerHmac(const ServerHmacMetric result) {
+  if (!lock()) {
+    return;
+  }
+  switch (result) {
+  case ServerHmacMetric::Accepted:
+    ++http_.server_hmac_requests_accepted;
+    break;
+  case ServerHmacMetric::HeadersIncomplete:
+    ++http_.server_hmac_headers_incomplete;
+    break;
+  case ServerHmacMetric::ProtocolMismatch:
+    ++http_.server_hmac_protocol_mismatch;
+    break;
+  case ServerHmacMetric::DeviceMismatch:
+    ++http_.server_hmac_device_mismatch;
+    break;
+  case ServerHmacMetric::TimestampRejected:
+    ++http_.server_hmac_timestamp_rejected;
+    break;
+  case ServerHmacMetric::NonceRejected:
+    ++http_.server_hmac_nonce_rejected;
+    break;
+  case ServerHmacMetric::BodyHashRejected:
+    ++http_.server_hmac_body_hash_rejected;
+    break;
+  case ServerHmacMetric::SignatureRejected:
+    ++http_.server_hmac_signature_rejected;
+    break;
+  }
+  unlock();
+}
+
+void Diagnostics::recordAuthRateLimit(const bool browser_session) {
+  if (lock()) {
+    if (browser_session) {
+      ++http_.browser_rate_limited;
+    } else {
+      ++http_.server_hmac_rate_limited;
+    }
+    unlock();
+  }
+}
+
 HttpMetrics Diagnostics::httpMetrics() const {
   if (!lock()) {
     return {};
@@ -127,6 +250,62 @@ HttpMetrics Diagnostics::httpMetrics() const {
   const HttpMetrics copy = http_;
   unlock();
   return copy;
+}
+
+void Diagnostics::setTaskMetrics(
+    const std::array<TaskRuntimeMetric, kTaskRuntimeMetricCapacity> &metrics)
+    const {
+  if (lock()) {
+    task_metrics_ = metrics;
+    unlock();
+  }
+}
+
+std::array<TaskRuntimeMetric, kTaskRuntimeMetricCapacity>
+Diagnostics::taskMetrics() const {
+  if (!lock()) {
+    return {};
+  }
+  const auto copy = task_metrics_;
+  unlock();
+  return copy;
+}
+
+void Diagnostics::recordUiRequest(const UiRequestKind kind) {
+  if (!lock()) {
+    return;
+  }
+  switch (kind) {
+  case UiRequestKind::Status:
+    ++http_.ui_status_requests;
+    break;
+  case UiRequestKind::Setup:
+    ++http_.ui_setup_requests;
+    break;
+  case UiRequestKind::Diagnostics:
+    ++http_.ui_diagnostics_requests;
+    break;
+  }
+  // AsyncWebServer callbacks execute serially per event-loop callback. This
+  // counter intentionally captures callback-level concurrency without
+  // retaining response/request pointers after the callback returns.
+  http_.peak_local_http_requests =
+      std::max<std::uint32_t>(http_.peak_local_http_requests, 1U);
+  unlock();
+}
+
+void Diagnostics::recordHeavyUiDeferral() {
+  if (lock()) {
+    ++http_.ui_heavy_requests_deferred;
+    unlock();
+  }
+}
+
+void Diagnostics::recordLocalResponseAllocationFailure() {
+  if (lock()) {
+    ++http_.local_response_allocation_failures;
+    unlock();
+  }
 }
 
 std::string Diagnostics::healthJson(const ConfigService &config,
@@ -245,12 +424,27 @@ std::string Diagnostics::metricsJson(const StorageHealth &storage,
   const QueueMetrics queue = queueMetrics();
   const SyncMetrics sync_metrics = syncMetrics();
   const HttpMetrics http_metrics = httpMetrics();
+  const MemoryPressureMetrics memory_pressure = memoryPressureMetrics();
   JsonDocument document;
   document["schema_version"] = 1;
   document["free_heap_bytes"] = ESP.getFreeHeap();
   document["minimum_free_heap_bytes"] = ESP.getMinFreeHeap();
   document["psram_size_bytes"] = ESP.getPsramSize();
   document["free_psram_bytes"] = ESP.getFreePsram();
+  JsonObject pressure = document["memory_pressure"].to<JsonObject>();
+  pressure["state"] = memoryPressureStateName(memory_pressure.state);
+  pressure["state_since_ms"] = memory_pressure.state_since_ms;
+  pressure["entry_count"] = memory_pressure.entry_count;
+  pressure["recovery_count"] = memory_pressure.recovery_count;
+  pressure["transition_count"] = memory_pressure.transition_count;
+  pressure["cumulative_pressure_ms"] =
+      memory_pressure.cumulative_pressure_ms;
+  pressure["longest_pressure_episode_ms"] =
+      memory_pressure.longest_pressure_episode_ms;
+  pressure["lowest_free_internal_bytes"] =
+      memory_pressure.lowest_free_internal_bytes;
+  pressure["lowest_largest_internal_block_bytes"] =
+      memory_pressure.lowest_largest_internal_block_bytes;
   JsonObject queues = document["queues"].to<JsonObject>();
   queues["storage_depth"] = queue.storage_depth;
   queues["action_depth"] = queue.action_depth;
@@ -265,6 +459,8 @@ std::string Diagnostics::metricsJson(const StorageHealth &storage,
   JsonObject sd = document["sd"].to<JsonObject>();
   sd["writes"] = storage.writes;
   sd["reads"] = storage.reads;
+  sd["reading_record_reads"] = storage.reading_record_reads;
+  sd["event_record_reads"] = storage.event_record_reads;
   sd["write_failures"] = storage.write_failures;
   sd["read_failures"] = storage.read_failures;
   sd["mount_cycles"] = storage.mount_cycles;
@@ -278,6 +474,13 @@ std::string Diagnostics::metricsJson(const StorageHealth &storage,
   sync["transactions_started"] = sync_metrics.transactions_started;
   sync["transactions_completed"] = sync_metrics.transactions_completed;
   sync["transactions_failed"] = sync_metrics.transactions_failed;
+  sync["local_resource_deferrals"] =
+      sync_metrics.local_resource_deferrals;
+  sync["tls_requests_admitted"] = sync_metrics.tls_requests_admitted;
+  sync["tls_requests_rejected_heap"] =
+      sync_metrics.tls_requests_rejected_heap;
+  sync["tls_requests_rejected_stack"] =
+      sync_metrics.tls_requests_rejected_stack;
   sync["in_progress"] = sync_metrics.sync_in_progress;
   sync["pending"] = sync_metrics.sync_pending;
   sync["durable_reading_backlog"] =
@@ -289,12 +492,53 @@ std::string Diagnostics::metricsJson(const StorageHealth &storage,
   sync["free_internal_heap_bytes"] = sync_metrics.free_internal_heap_bytes;
   sync["largest_internal_block_bytes"] =
       sync_metrics.largest_internal_block_bytes;
+  sync["minimum_free_internal_heap_bytes"] =
+      sync_metrics.minimum_free_internal_heap_bytes;
   JsonObject http = document["http"].to<JsonObject>();
   http["requests"] = http_metrics.requests;
   http["status_2xx"] = http_metrics.status_2xx;
   http["status_4xx"] = http_metrics.status_4xx;
   http["status_5xx"] = http_metrics.status_5xx;
   http["rejected_signatures"] = http_metrics.rejected_signatures;
+  http["browser_session_rejections"] =
+      http_metrics.browser_session_rejections;
+  http["malformed_auth_header_rejections"] =
+      http_metrics.malformed_auth_header_rejections;
+  http["browser_rate_limited"] = http_metrics.browser_rate_limited;
+  http["server_hmac_rate_limited"] =
+      http_metrics.server_hmac_rate_limited;
+  http["browser_requests_accepted"] = http_metrics.browser_requests_accepted;
+  http["browser_requests_session_expired"] =
+      http_metrics.browser_requests_session_expired;
+  http["browser_requests_session_invalid"] =
+      http_metrics.browser_requests_session_invalid;
+  http["browser_requests_csrf_rejected"] =
+      http_metrics.browser_requests_csrf_rejected;
+  http["server_hmac_requests_accepted"] =
+      http_metrics.server_hmac_requests_accepted;
+  http["server_hmac_headers_incomplete"] =
+      http_metrics.server_hmac_headers_incomplete;
+  http["server_hmac_protocol_mismatch"] =
+      http_metrics.server_hmac_protocol_mismatch;
+  http["server_hmac_device_mismatch"] =
+      http_metrics.server_hmac_device_mismatch;
+  http["server_hmac_timestamp_rejected"] =
+      http_metrics.server_hmac_timestamp_rejected;
+  http["server_hmac_nonce_rejected"] =
+      http_metrics.server_hmac_nonce_rejected;
+  http["server_hmac_body_hash_rejected"] =
+      http_metrics.server_hmac_body_hash_rejected;
+  http["server_hmac_signature_rejected"] =
+      http_metrics.server_hmac_signature_rejected;
+  http["ui_status_requests"] = http_metrics.ui_status_requests;
+  http["ui_setup_requests"] = http_metrics.ui_setup_requests;
+  http["ui_diagnostics_requests"] =
+      http_metrics.ui_diagnostics_requests;
+  http["ui_heavy_requests_deferred"] =
+      http_metrics.ui_heavy_requests_deferred;
+  http["local_response_allocation_failures"] =
+      http_metrics.local_response_allocation_failures;
+  http["peak_local_http_requests"] = http_metrics.peak_local_http_requests;
   std::string output;
   serializeJson(document, output);
   return output;
@@ -304,7 +548,9 @@ std::string Diagnostics::redactedBundle(const ConfigService &config,
                                         const NetworkStatus &network,
                                         const ClockService &clock,
                                         const StorageHealth &storage,
-                                        const MeterMetrics &meter) const {
+                                        const MeterMetrics &meter,
+                                        const LocalSessionDiagnostics &sessions,
+                                        const WifiDisconnectSnapshot &wifi_events) const {
   JsonDocument document;
   document["generated_utc"] = clock.utcIso8601();
   JsonDocument health;
@@ -320,6 +566,107 @@ std::string Diagnostics::redactedBundle(const ConfigService &config,
   document["metrics"] = metrics.as<JsonVariantConst>();
   document["config"] = redacted_config.as<JsonVariantConst>();
   document["recent_errors"] = recent_errors.as<JsonVariantConst>();
+  JsonObject identity = document["build_identity"].to<JsonObject>();
+  identity["firmware_version"] = version::FIRMWARE;
+  identity["protocol_version"] = version::PROTOCOL;
+  identity["git_commit"] = version::GIT_COMMIT;
+  identity["build_timestamp"] = version::BUILD_TIMESTAMP;
+  identity["platformio_environment"] = version::PLATFORMIO_ENVIRONMENT;
+  identity["framework_version"] = ESP.getSdkVersion();
+  identity["hardware_target"] = version::HARDWARE_TARGET;
+  identity["partition_layout"] = "esp32-s3-n16r8-dual-ota";
+  const std::string firmware_sha256 = runningFirmwareSha256();
+  if (firmware_sha256.empty()) {
+    identity["firmware_binary_sha256"] = nullptr;
+    identity["firmware_binary_sha256_reason"] =
+        "running_partition_hash_unavailable";
+  } else {
+    identity["firmware_binary_sha256"] = firmware_sha256;
+  }
+  identity["elf_sha256"] = nullptr;
+  identity["elf_sha256_reason"] =
+      "host_only_artifact_see_release_build_provenance";
+  JsonObject flags = identity["compile_time_feature_flags"].to<JsonObject>();
+  flags["release_build"] = PM_RELEASE_BUILD != 0;
+  flags["simulated_meter"] = PM_SIMULATED_METER != 0;
+  flags["physical_admin_recovery"] = PM_PHYSICAL_ADMIN_RECOVERY != 0;
+  flags["serial_trace"] = PM_SERIAL_TRACE_ENABLED != 0;
+  JsonObject dependencies = identity["dependencies"].to<JsonObject>();
+  dependencies["platform_espressif32"] = "6.13.0";
+  dependencies["arduino_json"] = "7.4.3";
+  dependencies["async_tcp"] = "3.4.10";
+  dependencies["esp_async_web_server"] = "3.11.2";
+  JsonObject assets = identity["embedded_web_assets"].to<JsonObject>();
+  const ui::Asset *index_asset = ui::findAsset("/index.html");
+  const ui::Asset *script_asset = ui::findAsset("/assets/app.js");
+  const ui::Asset *style_asset = ui::findAsset("/assets/style.css");
+  assets["index_html_sha256"] =
+      index_asset == nullptr ? nullptr : index_asset->sha256;
+  assets["app_js_sha256"] =
+      script_asset == nullptr ? nullptr : script_asset->sha256;
+  assets["style_css_sha256"] =
+      style_asset == nullptr ? nullptr : style_asset->sha256;
+  JsonObject reset = document["reset_evidence"].to<JsonObject>();
+  const int current_reset_reason = static_cast<int>(esp_reset_reason());
+  reset["current_reason"] = diag::resetReasonName(current_reset_reason);
+  reset["current_reason_code"] = current_reset_reason;
+  reset["previous_reason"] = nullptr;
+  reset["previous_reason_reason"] =
+      "platform_does_not_retain_prior_boot_reset_reason";
+  reset["boot_count"] = diag::SerialLogger::instance().bootCount();
+  reset["abnormal_reset_count"] =
+      diag::SerialLogger::instance().abnormalResetCount();
+  JsonObject session_table = document["local_sessions"].to<JsonObject>();
+  session_table["capacity"] = sessions.capacity;
+  session_table["active"] = sessions.active;
+  session_table["peak_active"] = sessions.peak_active;
+  session_table["created"] = sessions.created;
+  session_table["reused"] = sessions.reused;
+  session_table["refreshed"] = sessions.refreshed;
+  session_table["expired"] = sessions.expired;
+  session_table["invalid"] = sessions.invalid;
+  session_table["revoked"] = sessions.revoked;
+  session_table["capacity_rejections"] = sessions.capacity_rejections;
+  JsonObject flight = document["flight_recorder_excerpt"].to<JsonObject>();
+  flight["transition_total"] = wifi_events.total;
+  flight["persistent_archive"] =
+      "microSD CRC-protected EVT_WIFI_TRANSITION event records";
+  JsonArray flight_events = flight["recent_transitions"].to<JsonArray>();
+  for (std::size_t index = 0; index < wifi_events.count; ++index) {
+    const WifiDisconnectEvent &event = wifi_events.events[index];
+    const diag::ReasonInfo reason = diag::wifiDisconnectReason(event.reason);
+    JsonObject row = flight_events.add<JsonObject>();
+    row["transition_number"] = event.transition_number;
+    row["event"] = wifiEventKindName(event.kind);
+    row["monotonic_ms"] = event.monotonic_ms;
+    row["reason"] = event.reason == 0U ? "none" : reason.name;
+    row["reason_code"] = event.reason;
+    row["rssi_dbm"] = event.rssi_dbm;
+    row["channel"] = event.channel;
+    row["bssid"] = diag::maskMac(std::string(event.bssid.data()));
+    row["ip_address"] = event.ip_address.data();
+    row["gateway"] = event.gateway.data();
+    row["dns"] = event.dns.data();
+    row["dhcp_duration_ms"] = event.dhcp_duration_ms;
+    row["free_internal_heap_bytes"] = event.free_internal_heap_bytes;
+    row["largest_internal_block_bytes"] =
+        event.largest_internal_block_bytes;
+  }
+  JsonArray tasks = document["tasks"].to<JsonArray>();
+  for (const auto &task : taskMetrics()) {
+    if (task.name.empty()) {
+      continue;
+    }
+    JsonObject row = tasks.add<JsonObject>();
+    row["name"] = task.name;
+    row["core"] = task.core;
+    row["priority"] = task.priority;
+    row["configured_stack_bytes"] = task.configured_stack_bytes;
+    row["high_water_bytes"] = task.high_water_bytes;
+    row["margin_percent"] = task.margin_percent;
+    row["running"] = task.running;
+    row["watchdog"] = task.watchdog;
+  }
   document["serial_log_level"] =
       diag::levelName(diag::SerialLogger::instance().level());
   document["serial_log_dropped"] = diag::SerialLogger::instance().dropped();

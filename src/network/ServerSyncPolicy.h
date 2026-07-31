@@ -9,6 +9,10 @@ namespace pm {
 namespace sync_policy {
 
 constexpr std::size_t kMaximumResponseBytes = 24U * 1024U;
+constexpr std::size_t kHeartbeatResponseBytes = 8U * 1024U;
+constexpr std::size_t kEnrollmentResponseBytes = 16U * 1024U;
+constexpr std::size_t kReadingBatchResponseBytes = 12U * 1024U;
+constexpr std::size_t kEventBatchResponseBytes = 8U * 1024U;
 constexpr std::size_t kReadingBatchPayloadBytes = 8U * 1024U;
 constexpr std::size_t kEventBatchPayloadBytes = 16U * 1024U;
 // The live storage/PZEM boundary has been measured at 81,508 free internal
@@ -85,9 +89,16 @@ private:
 
 std::uint32_t stackMarginPercent(std::uint32_t allocated_bytes,
                                  std::uint32_t high_water_bytes);
+bool stackMarginHealthy(std::uint32_t allocated_bytes,
+                        std::uint32_t high_water_bytes,
+                        std::uint32_t minimum_margin_percent);
 bool tlsMemoryReserveAvailable(std::uint32_t free_internal_bytes,
                                std::uint32_t largest_internal_block_bytes);
 bool responseLengthAllowed(int response_size, int status);
+std::size_t maximumResponseBytes(const std::string &endpoint);
+std::size_t maximumRequestBytes(const std::string &endpoint);
+bool responseLengthAllowed(const std::string &endpoint, int response_size,
+                           int status);
 bool responseAllocationAvailable(std::uint32_t free_internal_bytes,
                                  std::uint32_t largest_internal_block_bytes,
                                  int response_size);

@@ -41,6 +41,28 @@ from sign_firmware import canonical  # noqa: E402
 
 
 class StorageAndOtaTests(unittest.TestCase):
+    def test_release_source_fingerprint_ignores_web_dependency_outputs(self) -> None:
+        root = case_directory("release-fingerprint-generated-outputs")
+        try:
+            (root / "web" / "src").mkdir(parents=True)
+            (root / "web" / "src" / "main.ts").write_text(
+                "export const value = 1;\n", encoding="utf-8"
+            )
+            baseline = source_fingerprint(root)
+
+            (root / "web" / "node_modules" / "package").mkdir(parents=True)
+            (root / "web" / "node_modules" / "package" / "package.json").write_text(
+                '{"version":"1.0.0"}\n', encoding="utf-8"
+            )
+            (root / "web" / "dist").mkdir(parents=True)
+            (root / "web" / "dist" / "manifest.json").write_text(
+                '{"generated":true}\n', encoding="utf-8"
+            )
+
+            self.assertEqual(baseline, source_fingerprint(root))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_release_staging_directory_is_unique_and_inherits_parent(self) -> None:
         root = case_directory("release-staging")
         try:

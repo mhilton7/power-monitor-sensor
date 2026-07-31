@@ -20,11 +20,12 @@ of being repeated as numeric literals:
 | Meter | 6 KiB |
 | Aggregation | 8 KiB |
 | Storage | 8 KiB |
-| Network | 6 KiB |
+| Network | 8 KiB |
 | Server synchronization | 24 KiB |
 | Health | 6 KiB |
 | Maintenance | 12 KiB |
 | Serial command | 24 KiB |
+| Password worker (on demand) | 16 KiB |
 
 `ServerSyncTask` remains on core 0 at priority 2. Before this repair it was
 12 KiB on the same core and priority. The larger 24 KiB allocation is a
@@ -38,6 +39,22 @@ including parsing the configured Caddy CA with mbedTLS. A production trace
 captured a double exception in `mbedtls_pem_read_buffer` while an 8 KiB serial
 task applied `loglevel info`; the larger stack keeps that verified write path
 safe.
+
+The production NetworkTask previously left 1,020 bytes of a 6,144-byte
+allocation (16 percent). Hot network paths now copy a narrow configuration
+snapshot that excludes CA/OTA PEM data, reuse one configured SSID during a
+scan, and use an 8,192-byte allocation. Replaying reconnect, DHCP, mDNS,
+setup-AP, scan, and concurrent synchronization is required before release;
+the same former worst-case use would leave 37 percent.
+
+Serial input remains a small nonblocking loop, but serial configuration writes
+retain their independently measured worker stack because they must parse and
+atomically verify the complete CA-bearing configuration. Password work is
+created only while a bounded job exists. They are not merged: doing so would
+couple physical recovery input to browser authentication, expand the shared
+secret lifetime, and add priority-inversion and queue-starvation risk. OTA and
+maintenance remain off AsyncTCP and keep a dedicated bounded worker because
+signed download, flash writes, rollback, and storage repair may block.
 
 Server synchronization does not enumerate or read microSD files directly.
 It submits bounded history jobs to `StorageTask` through
@@ -73,7 +90,7 @@ margin_percent = min(high_water_bytes, allocated_bytes)
                  * 100 / allocated_bytes
 ```
 
-For a 16 KiB task, acceptance requires at least 4 KiB of measured high-water
+For a 24 KiB task, acceptance requires at least 6 KiB of measured high-water
 space at the worst tested checkpoint. Record the actual minimum from the
 physical 100-heartbeat CSV in the release verification report; never replace
 measurement with the configured allocation.
@@ -96,20 +113,8 @@ an unbounded stack allocation.
 
 ## Physical verification
 
-The ESP32-S3 N16R8 production image was exercised on COM6 for 100 consecutive
-automatic heartbeat intervals while a host sampled ICMP, `/`, and
-`/api/local/health`. All 100 heartbeats succeeded across 771 host samples.
-There were no resets, watchdogs, lost local probes, Wi-Fi failures, or storage
-failures.
-
-The worst `ServerSyncTask` high-water value was 5,384 bytes out of the
-16,384-byte allocation. Estimated worst-case use was therefore 11,000 bytes,
-leaving a measured 32 percent margin. The task remained on core 0 at priority
-2.
-
-Minimum sampled free internal heap during TLS was 71,136 bytes and the minimum
-largest internal block was 59,380 bytes. Idle free internal heap was 122,456
-bytes at the first sample and 122,204 bytes at the last; the first 20 idle
-samples averaged 121,671.2 bytes and the last 20 averaged 122,008.2 bytes.
-The largest idle block began and ended at 69,620 bytes. These measurements show
-no continuous heap loss or fragmentation trend.
+Physical results are valid only for the exact source fingerprint and binary
+listed in the release verification record. Earlier 16 KiB ServerSyncTask soak
+claims are intentionally removed because they do not describe the current
+24 KiB layout or minimal WebUI. See `FIRMWARE_OPTIMIZATION_1.0.5.md` for the
+current baseline and acceptance status.

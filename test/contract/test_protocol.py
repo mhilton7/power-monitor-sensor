@@ -326,7 +326,6 @@ class ProtocolContractTests(unittest.TestCase):
             "reading_wire::append(readings, encoded)",
             "createLocalSession(request, false)",
             "createLocalSession(request, true)",
-            '"elevated_session_required"',
             "require_elevated_local",
             '"origin_required"',
             "creator_session_digest",
@@ -341,6 +340,7 @@ class ProtocolContractTests(unittest.TestCase):
             "auth_policy::parseTimestamp",
             "auth_policy::timestampWithinWindow",
             "ReplayRememberResult::CapacityExceeded",
+            '"elevated_session_required"',
         ):
             self.assertIn(marker, auth_source)
 
@@ -938,6 +938,28 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertNotIn("WiFi.setSleep(true)", network_source)
 
         local_api_source = (ROOT / "src/api/HttpApi.cpp").read_text(encoding="utf-8")
+        for marker in (
+            "classifyAuthMode(request)",
+            "RequestAuthMode::LocalBrowserSession",
+            "RequestAuthMode::ServerToDeviceHmac",
+            "RequestAuthMode::MalformedMixedAuthentication",
+            '"BROWSER_HMAC_FALLBACK_PREVENTED"',
+            '"EVT_LOCAL_SESSION_REJECTED"',
+            '"EVT_SERVER_HMAC_REJECTED"',
+        ):
+            self.assertIn(marker, local_api_source)
+        auth_header = (ROOT / "src/security/AuthService.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("static constexpr std::size_t kCapacity = 6U", auth_header)
+        self.assertIn("std::array<Entry, kCapacity>", auth_header)
+        sync_source = (ROOT / "src/network/ServerSync.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'http.addHeader("X-Request-ID", correlation_id.c_str())', sync_source
+        )
+        self.assertIn('"pm-" + config_.identity().boot_id', sync_source)
         self.assertGreaterEqual(
             local_api_source.count('addHeader("Connection", "close", false)'),
             8,
@@ -1096,6 +1118,7 @@ class ProtocolContractTests(unittest.TestCase):
         )
         self.assertIn("kAggregationPriority = 3U", task_config)
         self.assertIn("kStoragePriority = 2U", task_config)
+        self.assertIn("kHealthStackBytes = 8192U", task_config)
         self.assertIn("task_config::kAggregationPriority", application)
         self.assertIn("task_config::kStoragePriority", application)
         header = (ROOT / "src/storage/SdStorage.h").read_text(encoding="utf-8")
@@ -1154,6 +1177,34 @@ class ProtocolContractTests(unittest.TestCase):
             "$minimumStackMargin -ge 25",
         ):
             self.assertIn(marker, source)
+
+    def test_two_sensor_monitor_respects_local_session_limits(self) -> None:
+        source = (ROOT / "tools/diagnostics/Monitor-TwoSensors.ps1").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "-Headers @{ Origin = $Client.Url }",
+            "NextSessionAttempt",
+            "AddSeconds(60)",
+            '"$($client.Url)/api/local/health"',
+            "session_degraded = $true",
+            "heartbeat_successes = $health.heartbeat_successes",
+            "acknowledged_sequence = $health.server_ack_sequence",
+        ):
+            self.assertIn(marker, source)
+        self.assertNotIn("pm_session=", source)
+        self.assertNotIn("pm_csrf=", source)
+
+    def test_local_session_response_preserves_both_set_cookie_headers(self) -> None:
+        source = (ROOT / "src/api/HttpApi.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            'response->addHeader("Set-Cookie", csrf_cookie.c_str(), false);',
+            source,
+        )
+        self.assertEqual(
+            2,
+            len(re.findall(r'"pm_csrf=;[^\"]*",\s*false\)', source)),
+        )
 
     def test_current_server_hmac_vector_matches_sensor_signer(self) -> None:
         vector_path = (

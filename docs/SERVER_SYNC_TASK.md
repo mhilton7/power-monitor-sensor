@@ -9,7 +9,7 @@ central-server transport work.
 ## Call path and ownership
 
 ```text
-Application::serverTask
+Application::syncTask
   -> ServerSync::tick
      -> heartbeat | pushReadings | pushEvents | pullConfiguration |
         reportConfiguration | checkFirmware
@@ -57,7 +57,10 @@ The repair addresses ownership and peak live memory:
 - Event pages are limited to 24 records and 16 KiB of stored payload.
 - The ArduinoJson tree is destroyed before TLS starts.
 - The page's raw string vector is released before TLS starts.
-- HTTP response `Content-Length` is required and capped at 24 KiB.
+- HTTP response `Content-Length` is required. Heartbeat and event responses
+  are capped at 8 KiB, reading acknowledgements at 12 KiB, enrollment at
+  16 KiB, and all other responses at 24 KiB. Request bodies are bounded per
+  endpoint before TLS begins.
 - Response bytes are read through a bounded stream loop, not `getString()`.
 - TLS admission requires at least 78 KiB of free internal heap and a largest
   contiguous internal block of at least 32 KiB. The latter accepts the
@@ -121,6 +124,14 @@ The repair addresses ownership and peak live memory:
   receives the configured hostname for SNI and SAN validation. Two consecutive
   cached-address transport failures invalidate the cache and force a fresh
   lookup, so a server address change remains recoverable.
+- `HTTPClient` owns the single TCP/TLS connect call. A resolved-address client
+  routes that call to the cached address while retaining the configured host
+  for SNI and certificate verification. The former manual secure-client
+  connect followed by `HTTPClient::sendRequest()` attempted a second connect
+  and produced the observed `Connection already in progress` failure.
+- The transport snapshot copies only the server URL, CA, fingerprint, and
+  allowlist. Hot Network, meter, and heartbeat loops use narrower snapshots
+  and never copy the complete PEM-bearing `RuntimeConfig`.
 - microSD recovery always performs all three advertised reset/mount attempts.
 - Runtime recovery retries the configured preferred SPI speed before the
   fallback and 400 kHz recovery speeds; it never treats the last failed
@@ -150,9 +161,18 @@ The repair addresses ownership and peak live memory:
   appliance. This avoids multi-second receive latency for ICMP and AsyncTCP
   while a DNS or TLS operation is active.
 
-If the memory reserve is unavailable, the transaction fails as
-`MEMORY_EXHAUSTED`, releases ownership, and enters normal bounded backoff.
-It does not attempt a TLS allocation that could destabilize lwIP.
+If a local memory reserve or high-memory lease is temporarily unavailable,
+the transaction is classified `LOCAL_RESOURCE_DEFERRED`, releases ownership,
+and retries after 1.5 seconds. It does not mark the server unreachable, clear
+authentication, increment external heartbeat-failure counters, or enter the
+external exponential-backoff ladder. DNS, TCP, TLS, HTTP, and rate-limit
+failures retain their bounded external retry behavior.
+
+The task's stack high-water mark is lifetime diagnostic evidence. It emits a
+rate-limited `STACK_LOW` warning below the 25-percent release threshold, but
+is never a per-request TLS admission gate. A lifetime minimum cannot rise
+after a deep call unwinds; using it as admission caused the former permanent
+`TLS_STACK_PREFLIGHT_REJECTED` latch.
 
 ## Single-flight behavior
 
@@ -160,12 +180,11 @@ It does not attempt a TLS allocation that could destabilize lwIP.
 A local action queues the pending bit. Further actions coalesce into that bit.
 Only `ServerSyncTask` consumes it. Every request has a cleanup guard that:
 
-1. ends `HTTPClient` if it began;
-2. stops `WiFiClientSecure`;
-3. marks the transaction complete or failed;
-4. clears the active request identifier;
-5. releases the single-flight gate; and
-6. retains at most one pending request.
+1. ends `HTTPClient` if it began, otherwise stops `WiFiClientSecure`;
+2. marks the transaction complete, failed, or locally deferred;
+3. clears the active request identifier;
+4. releases the single-flight gate; and
+5. retains at most one pending request.
 
 No transport mutex is held across DNS, TCP, TLS, HTTP, microSD, or NVS.
 Configuration and identity values needed by a request are copied into small,
@@ -218,9 +237,6 @@ attempts so one dropped packet is recorded without being misclassified as a
 device outage; the root and health HTTP probes remain independent and
 fail-closed.
 
-The final COM6 verification completed 100/100 automatic heartbeats with 771
-host samples and zero reset, heartbeat, ping, WebUI, health, Wi-Fi, or storage
-failures. Seventy-eight samples landed while a server transaction was active;
-all local probes succeeded. The minimum task margin was 32 percent, minimum
-free internal heap was 71,136 bytes, and the idle-heap average was higher over
-the final 20 samples than the first 20 samples.
+Do not treat results from another source revision as release evidence. The
+exact 1.0.5 binary must complete the physical matrix and its hashes, source
+fingerprint, timestamps, and task table must be retained with the result.

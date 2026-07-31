@@ -12,6 +12,7 @@
 #include "config/ConfigValidationHelpers.h"
 #include "config/ProvisioningTransaction.h"
 #include "core/Algorithms.h"
+#include "core/MemoryPressurePolicy.h"
 #include "diagnostics/DiagnosticCore.h"
 #include "meter/PzemProtocol.h"
 #include "network/ClockPolicy.h"
@@ -427,6 +428,10 @@ void testServerSyncPolicy() {
             pm::sync_policy::stackMarginPercent(16'384U, 20'000U) == 100U &&
             pm::sync_policy::stackMarginPercent(0U, 4096U) == 0U,
         "server sync stack margin uses ESP-IDF byte units and is bounded");
+  check(pm::sync_policy::stackMarginHealthy(24'576U, 11'844U, 25U) &&
+            !pm::sync_policy::stackMarginHealthy(24'576U, 6143U, 25U),
+        "historical stack watermark is release health evidence, not a "
+        "latching TLS request admission gate");
   check(pm::sync_policy::tlsMemoryReserveAvailable(
             pm::sync_policy::kMinimumInternalHeapBytes,
             pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
@@ -449,6 +454,15 @@ void testServerSyncPolicy() {
             !pm::sync_policy::responseLengthAllowed(-1, 200) &&
             pm::sync_policy::responseLengthAllowed(-1, 204),
         "HTTP response allocation is bounded and rejects chunked JSON");
+  check(pm::sync_policy::maximumResponseBytes(
+            "/api/v1/device-heartbeats") == 8U * 1024U &&
+            pm::sync_policy::maximumResponseBytes(
+                "/api/v1/device-readings/batch") == 12U * 1024U &&
+            pm::sync_policy::maximumRequestBytes(
+                "/api/v1/device-events/batch") == 20U * 1024U &&
+            !pm::sync_policy::responseLengthAllowed(
+                "/api/v1/device-heartbeats", 8193, 200),
+        "central endpoints enforce measured request and response caps");
   check(pm::sync_policy::responseAllocationAvailable(
             pm::sync_policy::kMinimumPostResponseInternalHeapBytes + 4096U,
             4096U, 4096) &&
@@ -968,6 +982,45 @@ void testAuthenticationPolicy() {
         "replay capacity becomes available only after the full window");
 }
 
+void testMemoryPressurePolicy() {
+  pm::MemoryPressurePolicy policy;
+  auto update = policy.update(96U * 1024U, 48U * 1024U, 0U);
+  check(!update.changed &&
+            update.current == pm::MemoryPressureState::Normal,
+        "healthy heap begins in normal memory state");
+
+  update = policy.update(79U * 1024U, 31U * 1024U, 1'000U);
+  check(update.changed &&
+            update.current == pm::MemoryPressureState::PressureWarning,
+        "moderate pressure enters warning without low-memory mode");
+  policy.update(70U * 1024U, 27U * 1024U, 2'000U);
+  policy.update(70U * 1024U, 27U * 1024U, 3'000U);
+  update = policy.update(70U * 1024U, 27U * 1024U, 4'000U);
+  check(update.changed &&
+            update.current == pm::MemoryPressureState::LowMemory,
+        "three consecutive low samples enter low-memory mode");
+
+  for (std::uint64_t second = 5U; second < 34U; ++second) {
+    policy.update(96U * 1024U, 48U * 1024U, second * 1'000U);
+  }
+  update = policy.update(96U * 1024U, 48U * 1024U, 34'000U);
+  check(update.changed &&
+            update.current == pm::MemoryPressureState::Recovering,
+        "low-memory mode requires sustained recovery and minimum dwell");
+  update = policy.update(96U * 1024U, 48U * 1024U, 64'000U);
+  check(update.changed &&
+            update.current == pm::MemoryPressureState::Normal,
+        "recovery dwell returns to normal without threshold oscillation");
+  const pm::MemoryPressureMetrics metrics = policy.metrics(64'000U);
+  check(metrics.entry_count == 1U && metrics.recovery_count == 1U &&
+            metrics.transition_count == 4U &&
+            metrics.cumulative_pressure_ms == 63'000U &&
+            metrics.longest_pressure_episode_ms == 63'000U &&
+            metrics.lowest_free_internal_bytes == 70U * 1024U &&
+            metrics.lowest_largest_internal_block_bytes == 27U * 1024U,
+        "memory pressure evidence retains bounded episode and minimum metrics");
+}
+
 void testProvisioningTransaction() {
   pm::provisioning_transaction::Journal journal;
   journal.previous_config_generation = 7;
@@ -1019,6 +1072,7 @@ int main() {
   testSyncCoverage();
   testProtocolCanonicalization();
   testAuthenticationPolicy();
+  testMemoryPressurePolicy();
   testProvisioningTransaction();
   if (failures == 0) {
     std::cout << "native C++ tests passed\n";

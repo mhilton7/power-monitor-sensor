@@ -13,6 +13,7 @@
 #include <esp_heap_caps.h>
 
 #include "board_pins.h"
+#include "app/TaskConfig.h"
 #include "build_config.h"
 #include "diagnostics/SerialLogger.h"
 #include "network/ReadingWireFormat.h"
@@ -26,7 +27,9 @@ namespace {
 // ESP-IDF expresses task stack depth and high-water marks in bytes. Network
 // settings exercise PEM validation plus atomic serialize/verify paths and need
 // more headroom than password hashing alone.
-constexpr std::uint32_t kPasswordJobTaskStackBytes = 16U * 1024U;
+constexpr std::uint32_t kMinimumLightUiInternalHeapBytes = 40U * 1024U;
+constexpr std::uint32_t kMinimumHeavyUiInternalHeapBytes = 72U * 1024U;
+constexpr std::uint32_t kMinimumHeavyUiLargestBlockBytes = 28U * 1024U;
 
 struct DeferredHttpResult {
   int status{200};
@@ -160,7 +163,7 @@ void HttpApi::begin() {
   const bool worker_started =
       password_job_queue_ != nullptr && password_result_mutex_ != nullptr &&
       xTaskCreatePinnedToCore(passwordJobTaskEntry, "PasswordJobTask",
-                              kPasswordJobTaskStackBytes, this, 1,
+                              task_config::kPasswordJobStackBytes, this, 1,
                               &password_job_task_, 1) == pdPASS;
   if (!worker_started) {
     PM_LOG_ERROR("PASSWORD", "WORKER_INIT_FAILED",
@@ -173,7 +176,7 @@ void HttpApi::begin() {
                 "stack_bytes=%lu watchdog=false",
                 static_cast<unsigned>(kPasswordJobQueueCapacity),
                 static_cast<unsigned>(kPasswordResultCapacity),
-                static_cast<unsigned long>(kPasswordJobTaskStackBytes));
+                static_cast<unsigned long>(task_config::kPasswordJobStackBytes));
   }
   registerReadRoutes();
   registerMutationRoutes();
@@ -267,7 +270,7 @@ void HttpApi::passwordJobTask() {
       "TASK", "TASK_STARTED",
       "name=PasswordJobTask core=%d priority=%u stack_bytes=%lu watchdog=false",
       xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
-      static_cast<unsigned long>(kPasswordJobTaskStackBytes));
+      static_cast<unsigned long>(task_config::kPasswordJobStackBytes));
   PasswordJob *job = nullptr;
   for (;;) {
     if (xQueueReceive(password_job_queue_, &job, pdMS_TO_TICKS(1000)) !=
@@ -699,6 +702,7 @@ void HttpApi::sendPasswordJobAccepted(AsyncWebServerRequest *request,
       },
       30'000U);
   if (response == nullptr) {
+    diagnostics_.recordLocalResponseAllocationFailure();
     sendProblem(request, 503, "response_allocation_failed",
                 "The deferred response could not be allocated.");
     return;
@@ -736,6 +740,7 @@ void HttpApi::sendHistoryJobAccepted(AsyncWebServerRequest *request,
       },
       5'000U);
   if (response == nullptr) {
+    diagnostics_.recordLocalResponseAllocationFailure();
     sendProblem(request, 503, "response_allocation_failed",
                 "The deferred response could not be allocated.");
     return;
@@ -921,7 +926,8 @@ void HttpApi::registerReadRoutes() {
               reinterpret_cast<const std::uint8_t *>(session_token.data()),
               session_token.size());
           if (!result.creator_session_bound || session_token.empty() ||
-              !sessions_.validate(session_token, clock_.monotonicMs()) ||
+              sessions_.validate(session_token, clock_.monotonicMs()) !=
+                  LocalSessionResult::Ok ||
               !constantTimeDigestEqual(session_digest,
                                        result.creator_session_digest)) {
             sendProblem(request, 403, "job_not_authorized",
@@ -966,12 +972,367 @@ void HttpApi::registerReadRoutes() {
                 ? "{\"status\":\"completed\",\"saved\":true,\"verified\":true}"
                 : result.response_json);
       });
+  server_.on(
+      "/api/v1/ui/status", HTTP_GET,
+      [this](AsyncWebServerRequest *request) {
+        if (!authorize(request, "", false))
+          return;
+        diagnostics_.recordUiRequest(UiRequestKind::Status);
+        const NetworkStatus network = network_.status();
+        const StorageHealth storage = storage_.health();
+        const MeterMetrics meter = meter_.metrics();
+        const SyncMetrics sync = diagnostics_.syncMetrics();
+        const SensorStatusConfig status_config = config_.sensorStatusConfig();
+        MeasurementSnapshot latest;
+        const bool has_latest = diagnostics_.latest(latest) && latest.valid;
+        const std::uint64_t acknowledgement = config_.serverAckSequence();
+        const std::uint64_t backlog =
+            storage.newest_sequence >= acknowledgement
+                ? storage.newest_sequence - acknowledgement
+                : 0U;
+        const std::uint32_t free_internal =
+            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const std::uint32_t largest_internal =
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                             MALLOC_CAP_8BIT);
+        JsonDocument document;
+        document["schema_version"] = 1;
+        document["server_now"] = clock_.utcIso8601();
+        JsonObject device = document["device"].to<JsonObject>();
+        device["friendly_name"] = status_config.friendly_name;
+        device["firmware"] = version::FIRMWARE;
+        device["git_commit"] = version::GIT_COMMIT;
+        device["build_timestamp"] = version::BUILD_TIMESTAMP;
+        device["platformio_environment"] = version::PLATFORMIO_ENVIRONMENT;
+        device["uptime_seconds"] = clock_.monotonicMs() / 1000U;
+        JsonObject web_assets = device["web_assets"].to<JsonObject>();
+        const ui::Asset *index_asset = ui::findAsset("/index.html");
+        const ui::Asset *script_asset = ui::findAsset("/assets/app.js");
+        const ui::Asset *style_asset = ui::findAsset("/assets/style.css");
+        web_assets["index_html_sha256"] =
+            index_asset == nullptr ? "unavailable" : index_asset->sha256;
+        web_assets["app_js_sha256"] =
+            script_asset == nullptr ? "unavailable" : script_asset->sha256;
+        web_assets["style_css_sha256"] =
+            style_asset == nullptr ? "unavailable" : style_asset->sha256;
+        JsonObject reading = document["reading"].to<JsonObject>();
+        if (has_latest) {
+          reading["measured_at_utc_ms"] = latest.utc_ms;
+          reading["power_w"] = latest.active_power_w;
+          reading["voltage_v"] = latest.voltage_v;
+          reading["current_a"] = latest.current_a;
+          reading["frequency_hz"] = latest.frequency_hz;
+          reading["power_factor"] = latest.power_factor;
+        } else {
+          reading["measured_at_utc_ms"] = nullptr;
+          reading["power_w"] = nullptr;
+          reading["voltage_v"] = nullptr;
+          reading["current_a"] = nullptr;
+          reading["frequency_hz"] = nullptr;
+          reading["power_factor"] = nullptr;
+        }
+        JsonObject health = document["health"].to<JsonObject>();
+        health["wifi"] = network.station_connected ? "connected" : "offline";
+        health["rssi_dbm"] = network.rssi_dbm;
+        health["ip_address"] = network.ip_address;
+        health["server"] =
+            network.server_authenticated
+                ? "connected"
+                : (network.server_reachable ? "unauthenticated" : "offline");
+        health["storage"] = storage.writable ? "writable" : "degraded";
+        health["meter"] =
+            meter.last_error == MeterError::None ? "healthy" : "degraded";
+        health["low_memory"] =
+            free_internal < kMinimumLightUiInternalHeapBytes ||
+            largest_internal < kMinimumHeavyUiLargestBlockBytes;
+        JsonObject sync_json = document["sync"].to<JsonObject>();
+        if (sync.last_heartbeat_utc_ms == 0U) {
+          sync_json["last_success_utc_ms"] = nullptr;
+        } else {
+          sync_json["last_success_utc_ms"] = sync.last_heartbeat_utc_ms;
+        }
+        sync_json["newest_sequence"] = storage.newest_sequence;
+        sync_json["acknowledged_sequence"] = acknowledgement;
+        sync_json["backlog"] = backlog;
+        sync_json["last_safe_error"] = sync.last_error;
+        std::string body;
+        serializeJson(document, body);
+        sendJson(request, 200, body);
+      });
+  server_.on(
+      "/api/v1/ui/diagnostics", HTTP_GET,
+      [this](AsyncWebServerRequest *request) {
+        if (!authorize(request, "", false))
+          return;
+        diagnostics_.recordUiRequest(UiRequestKind::Diagnostics);
+        const StorageHealth storage = storage_.health();
+        const SyncMetrics sync = diagnostics_.syncMetrics();
+        const HttpMetrics http = diagnostics_.httpMetrics();
+        const std::uint64_t acknowledgement = config_.serverAckSequence();
+        JsonDocument document;
+        document["schema_version"] = 1;
+        JsonObject memory = document["memory"].to<JsonObject>();
+        memory["free_heap_bytes"] = ESP.getFreeHeap();
+        memory["minimum_free_heap_bytes"] = ESP.getMinFreeHeap();
+        memory["free_internal_heap_bytes"] =
+            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        memory["minimum_free_internal_heap_bytes"] =
+            heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL |
+                                            MALLOC_CAP_8BIT);
+        memory["largest_internal_block_bytes"] =
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                             MALLOC_CAP_8BIT);
+        memory["free_psram_bytes"] = ESP.getFreePsram();
+        memory["largest_psram_block_bytes"] =
+            heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM |
+                                             MALLOC_CAP_8BIT);
+        memory["heap_integrity_ok"] = heap_caps_check_integrity_all(false);
+        const MemoryPressureMetrics pressure =
+            diagnostics_.memoryPressureMetrics();
+        memory["pressure_state"] = memoryPressureStateName(pressure.state);
+        memory["pressure_state_since_ms"] = pressure.state_since_ms;
+        memory["pressure_entry_count"] = pressure.entry_count;
+        memory["pressure_recovery_count"] = pressure.recovery_count;
+        memory["pressure_transition_count"] = pressure.transition_count;
+        memory["cumulative_pressure_ms"] = pressure.cumulative_pressure_ms;
+        memory["longest_pressure_episode_ms"] =
+            pressure.longest_pressure_episode_ms;
+        memory["lowest_free_internal_bytes"] =
+            pressure.lowest_free_internal_bytes;
+        memory["lowest_largest_internal_block_bytes"] =
+            pressure.lowest_largest_internal_block_bytes;
+        JsonObject tasks = document["tasks"].to<JsonObject>();
+        tasks["server_sync_stack_bytes"] = sync.stack_allocated_bytes;
+        tasks["server_sync_high_water_bytes"] = sync.stack_high_water_bytes;
+        tasks["server_sync_margin_percent"] = sync.stack_margin_percent;
+        tasks["network_margin_percent"] = nullptr;
+        JsonArray task_table = tasks["table"].to<JsonArray>();
+        for (const auto &task : diagnostics_.taskMetrics()) {
+          if (task.name.empty()) {
+            continue;
+          }
+          JsonObject row = task_table.add<JsonObject>();
+          row["name"] = task.name;
+          row["core"] = task.core;
+          row["priority"] = task.priority;
+          row["configured_stack_bytes"] = task.configured_stack_bytes;
+          row["high_water_bytes"] = task.high_water_bytes;
+          row["margin_percent"] = task.margin_percent;
+          row["running"] = task.running;
+          row["watchdog"] = task.watchdog;
+          if (task.name == "NetworkTask") {
+            tasks["network_margin_percent"] = task.margin_percent;
+          }
+        }
+        JsonObject sync_json = document["sync"].to<JsonObject>();
+        sync_json["heartbeat_successes"] = sync.heartbeat_successes;
+        sync_json["heartbeat_failures"] = sync.heartbeat_failures;
+        sync_json["batch_successes"] = sync.batch_successes;
+        sync_json["batch_failures"] = sync.batch_failures;
+        sync_json["local_resource_deferrals"] =
+            sync.local_resource_deferrals;
+        sync_json["tls_requests_admitted"] = sync.tls_requests_admitted;
+        sync_json["tls_requests_rejected_heap"] =
+            sync.tls_requests_rejected_heap;
+        sync_json["tls_requests_rejected_stack"] =
+            sync.tls_requests_rejected_stack;
+        sync_json["acknowledged_sequence"] = acknowledgement;
+        sync_json["newest_sequence"] = storage.newest_sequence;
+        sync_json["backlog"] =
+            storage.newest_sequence >= acknowledgement
+                ? storage.newest_sequence - acknowledgement
+                : 0U;
+        sync_json["last_safe_error"] = sync.last_error;
+        JsonObject local_http = document["local_http"].to<JsonObject>();
+        local_http["ui_status_requests"] = http.ui_status_requests;
+        local_http["ui_setup_requests"] = http.ui_setup_requests;
+        local_http["ui_diagnostics_requests"] =
+            http.ui_diagnostics_requests;
+        local_http["ui_heavy_requests_deferred"] =
+            http.ui_heavy_requests_deferred;
+        local_http["peak_requests"] = http.peak_local_http_requests;
+        local_http["browser_session_rejections"] =
+            http.browser_session_rejections;
+        local_http["malformed_auth_header_rejections"] =
+            http.malformed_auth_header_rejections;
+        local_http["browser_rate_limited"] = http.browser_rate_limited;
+        local_http["server_hmac_rate_limited"] =
+            http.server_hmac_rate_limited;
+        local_http["browser_requests_accepted"] =
+            http.browser_requests_accepted;
+        local_http["browser_requests_session_expired"] =
+            http.browser_requests_session_expired;
+        local_http["browser_requests_session_invalid"] =
+            http.browser_requests_session_invalid;
+        local_http["browser_requests_csrf_rejected"] =
+            http.browser_requests_csrf_rejected;
+        local_http["server_hmac_requests_accepted"] =
+            http.server_hmac_requests_accepted;
+        local_http["server_hmac_headers_incomplete"] =
+            http.server_hmac_headers_incomplete;
+        local_http["server_hmac_protocol_mismatch"] =
+            http.server_hmac_protocol_mismatch;
+        local_http["server_hmac_device_mismatch"] =
+            http.server_hmac_device_mismatch;
+        local_http["server_hmac_timestamp_rejected"] =
+            http.server_hmac_timestamp_rejected;
+        local_http["server_hmac_nonce_rejected"] =
+            http.server_hmac_nonce_rejected;
+        local_http["server_hmac_body_hash_rejected"] =
+            http.server_hmac_body_hash_rejected;
+        local_http["server_hmac_signature_rejected"] =
+            http.server_hmac_signature_rejected;
+        const SessionManager::Metrics session_metrics =
+            sessions_.metrics(clock_.monotonicMs());
+        JsonObject local_sessions =
+            document["local_sessions"].to<JsonObject>();
+        local_sessions["capacity"] = session_metrics.capacity;
+        local_sessions["active"] = session_metrics.active;
+        local_sessions["peak_active"] = session_metrics.peak_active;
+        local_sessions["created"] = session_metrics.created;
+        local_sessions["reused"] = session_metrics.reused;
+        local_sessions["refreshed"] = session_metrics.refreshed;
+        local_sessions["expired"] = session_metrics.expired;
+        local_sessions["invalid"] = session_metrics.invalid;
+        local_sessions["revoked"] = session_metrics.revoked;
+        local_sessions["capacity_rejections"] =
+            session_metrics.capacity_rejections;
+        const WifiDisconnectSnapshot disconnects =
+            network_.wifiDisconnectEvents();
+        JsonObject wifi_disconnects =
+            document["wifi_disconnects"].to<JsonObject>();
+        wifi_disconnects["total"] = disconnects.total;
+        wifi_disconnects["description"] =
+            "Recent RAM tail; CRC-protected transitions are also archived on microSD.";
+        JsonArray disconnect_events =
+            wifi_disconnects["events"].to<JsonArray>();
+        for (std::size_t index = 0; index < disconnects.count; ++index) {
+          const WifiDisconnectEvent &event = disconnects.events[index];
+          const diag::ReasonInfo reason =
+              diag::wifiDisconnectReason(event.reason);
+          JsonObject row = disconnect_events.add<JsonObject>();
+          row["event"] = wifiEventKindName(event.kind);
+          row["transition_number"] = event.transition_number;
+          row["monotonic_ms"] = event.monotonic_ms;
+          row["reason"] = event.reason == 0U ? "none" : reason.name;
+          row["reason_code"] = event.reason;
+          row["rssi_dbm"] = event.rssi_dbm;
+          row["disconnect_number"] = event.reconnect_count;
+          row["free_internal_heap_bytes"] =
+              event.free_internal_heap_bytes;
+          row["largest_internal_block_bytes"] =
+              event.largest_internal_block_bytes;
+          row["channel"] = event.channel;
+          row["bssid"] = diag::maskMac(std::string(event.bssid.data()));
+          row["ip_address"] = event.ip_address.data();
+          row["gateway"] = event.gateway.data();
+          row["dns"] = event.dns.data();
+          row["dhcp_duration_ms"] = event.dhcp_duration_ms;
+        }
+        std::string body;
+        serializeJson(document, body);
+        sendJson(request, 200, body);
+      });
+  server_.on(
+      "/api/v1/diagnostics/disconnect-flight-recorder", HTTP_GET,
+      [this](AsyncWebServerRequest *request) {
+        if (!authorize(request, "", false))
+          return;
+        const WifiDisconnectSnapshot disconnects =
+            network_.wifiDisconnectEvents();
+        const SyncMetrics sync = diagnostics_.syncMetrics();
+        const HttpMetrics http = diagnostics_.httpMetrics();
+        const SessionManager::Metrics sessions =
+            sessions_.metrics(clock_.monotonicMs());
+        JsonDocument document;
+        document["schema_version"] = 1;
+        document["captured_at"] = clock_.utcIso8601();
+        document["wifi_transition_total"] = disconnects.total;
+        document["persistence"] =
+            "CRC-protected EVT_WIFI_TRANSITION records are retained in the rotating microSD event archive.";
+        JsonArray events = document["wifi_disconnects"].to<JsonArray>();
+        for (std::size_t index = 0; index < disconnects.count; ++index) {
+          const WifiDisconnectEvent &event = disconnects.events[index];
+          const diag::ReasonInfo reason =
+              diag::wifiDisconnectReason(event.reason);
+          JsonObject row = events.add<JsonObject>();
+          row["event"] = wifiEventKindName(event.kind);
+          row["transition_number"] = event.transition_number;
+          row["monotonic_ms"] = event.monotonic_ms;
+          row["reason"] = event.reason == 0U ? "none" : reason.name;
+          row["reason_code"] = event.reason;
+          row["rssi_dbm"] = event.rssi_dbm;
+          row["free_internal_heap_bytes"] =
+              event.free_internal_heap_bytes;
+          row["largest_internal_block_bytes"] =
+              event.largest_internal_block_bytes;
+          row["channel"] = event.channel;
+          row["bssid"] = diag::maskMac(std::string(event.bssid.data()));
+          row["ip_address"] = event.ip_address.data();
+          row["gateway"] = event.gateway.data();
+          row["dns"] = event.dns.data();
+          row["dhcp_duration_ms"] = event.dhcp_duration_ms;
+        }
+        JsonObject synchronization = document["synchronization"].to<JsonObject>();
+        synchronization["heartbeat_successes"] = sync.heartbeat_successes;
+        synchronization["heartbeat_failures"] = sync.heartbeat_failures;
+        synchronization["batch_successes"] = sync.batch_successes;
+        synchronization["batch_failures"] = sync.batch_failures;
+        synchronization["tls_requests_rejected_heap"] =
+            sync.tls_requests_rejected_heap;
+        JsonObject authentication = document["authentication"].to<JsonObject>();
+        authentication["server_signature_rejections"] =
+            http.rejected_signatures;
+        authentication["browser_session_rejections"] =
+            http.browser_session_rejections;
+        authentication["browser_requests_accepted"] =
+            http.browser_requests_accepted;
+        authentication["browser_requests_session_expired"] =
+            http.browser_requests_session_expired;
+        authentication["browser_requests_session_invalid"] =
+            http.browser_requests_session_invalid;
+        authentication["browser_requests_csrf_rejected"] =
+            http.browser_requests_csrf_rejected;
+        authentication["server_hmac_requests_accepted"] =
+            http.server_hmac_requests_accepted;
+        authentication["server_hmac_headers_incomplete"] =
+            http.server_hmac_headers_incomplete;
+        authentication["server_hmac_protocol_mismatch"] =
+            http.server_hmac_protocol_mismatch;
+        authentication["server_hmac_device_mismatch"] =
+            http.server_hmac_device_mismatch;
+        authentication["server_hmac_timestamp_rejected"] =
+            http.server_hmac_timestamp_rejected;
+        authentication["server_hmac_nonce_rejected"] =
+            http.server_hmac_nonce_rejected;
+        authentication["server_hmac_body_hash_rejected"] =
+            http.server_hmac_body_hash_rejected;
+        authentication["server_hmac_signature_rejected"] =
+            http.server_hmac_signature_rejected;
+        authentication["local_sessions_active"] = sessions.active;
+        authentication["local_sessions_capacity"] = sessions.capacity;
+        std::string body;
+        serializeJson(document, body);
+        AsyncWebServerResponse *response = request->beginResponse(
+            200, "application/json", body.c_str());
+        response->addHeader(
+            "Content-Disposition",
+            "attachment; filename=power-monitor-disconnect-flight-recorder.json");
+        response->addHeader("Cache-Control", "no-store");
+        response->addHeader("Connection", "close", false);
+        diagnostics_.recordHttpStatus(200);
+        request->send(response);
+      });
   server_.on("/api/v1/diagnostics/recent-errors", HTTP_GET,
              [this](AsyncWebServerRequest *request) {
                if (!authorize(request, "", false))
                  return;
-               sendJson(request, 200,
-                        diag::SerialLogger::instance().recentErrorsJson());
+               if (!beginHeavyLocalOperation(request))
+                 return;
+               const std::string body =
+                   diag::SerialLogger::instance().recentErrorsJson();
+               endHeavyLocalOperation();
+               sendJson(request, 200, body);
              });
   server_.on(
       "/api/v1/health", HTTP_GET, [this](AsyncWebServerRequest *request) {
@@ -1103,6 +1464,9 @@ void HttpApi::registerReadRoutes() {
       "/api/v1/readings", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!authorize(request, "", false))
           return;
+        if (!beginHeavyLocalOperation(request))
+          return;
+        endHeavyLocalOperation();
         if (clock_.monotonicMs() < history_allowed_at_ms_) {
           sendProblem(request, 429, "history_rate_limited",
                       "Wait before issuing another storage history request.",
@@ -1126,6 +1490,9 @@ void HttpApi::registerReadRoutes() {
       "/api/v1/events", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!authorize(request, "", false))
           return;
+        if (!beginHeavyLocalOperation(request))
+          return;
+        endHeavyLocalOperation();
         if (clock_.monotonicMs() < history_allowed_at_ms_) {
           sendProblem(request, 429, "history_rate_limited",
                       "Wait before issuing another storage history request.",
@@ -1201,14 +1568,19 @@ void HttpApi::registerReadRoutes() {
              [this](AsyncWebServerRequest *request) {
                if (!authorize(request, "", false))
                  return;
+               diagnostics_.recordUiRequest(UiRequestKind::Setup);
                sendJson(request, 200, config_.redactedJson());
              });
   server_.on(
       "/api/v1/metrics", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!authorize(request, "", false))
           return;
-        sendJson(request, 200,
-                 diagnostics_.metricsJson(storage_.health(), meter_.metrics()));
+        if (!beginHeavyLocalOperation(request))
+          return;
+        const std::string body =
+            diagnostics_.metricsJson(storage_.health(), meter_.metrics());
+        endHeavyLocalOperation();
+        sendJson(request, 200, body);
       });
   server_.on("/api/v1/ota/status", HTTP_GET,
              [this](AsyncWebServerRequest *request) {
@@ -1232,12 +1604,28 @@ void HttpApi::registerReadRoutes() {
              [this](AsyncWebServerRequest *request) {
                if (!authorize(request, "", false))
                  return;
+               if (!beginHeavyLocalOperation(request))
+                 return;
+               const SessionManager::Metrics session_metrics =
+                   sessions_.metrics(clock_.monotonicMs());
+               const LocalSessionDiagnostics session_diagnostics{
+                   session_metrics.capacity,
+                   session_metrics.active,
+                   session_metrics.peak_active,
+                   session_metrics.created,
+                   session_metrics.reused,
+                   session_metrics.refreshed,
+                   session_metrics.expired,
+                   session_metrics.invalid,
+                   session_metrics.revoked,
+                   session_metrics.capacity_rejections};
+               const std::string body = diagnostics_.redactedBundle(
+                   config_, network_.status(), clock_, storage_.health(),
+                   meter_.metrics(), session_diagnostics,
+                   network_.wifiDisconnectEvents());
+               endHeavyLocalOperation();
                AsyncWebServerResponse *response = request->beginResponse(
-                   200, "application/json",
-                   diagnostics_
-                       .redactedBundle(config_, network_.status(), clock_,
-                                       storage_.health(), meter_.metrics())
-                       .c_str());
+                   200, "application/json", body.c_str());
                response->addHeader(
                    "Content-Disposition",
                    "attachment; filename=power-monitor-diagnostics.json");
@@ -1308,11 +1696,19 @@ void HttpApi::registerMutationRoutes() {
         const std::string body = takeBody(request);
         if (!authorize(request, body, true))
           return;
-        sessions_.invalidate();
+        sessions_.invalidate(cookieValue(request, "pm_session"),
+                             clock_.monotonicMs());
+        coordinator_.enqueueEvent("EVT_LOCAL_SESSION_REVOKED", "info",
+                                  "scope=requesting_session_only",
+                                  clock_.utcMs(),
+                                  config_.identity().boot_id);
         AsyncWebServerResponse *response = request->beginResponse(204);
         response->addHeader(
             "Set-Cookie",
             "pm_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+        response->addHeader(
+            "Set-Cookie", "pm_csrf=; SameSite=Strict; Path=/; Max-Age=0",
+            false);
         response->addHeader("Connection", "close", false);
         request->send(response);
       });
@@ -1577,6 +1973,29 @@ std::string HttpApi::takeBody(AsyncWebServerRequest *request) const {
   return body;
 }
 
+RequestAuthMode
+HttpApi::classifyAuthMode(AsyncWebServerRequest *request) const {
+  static constexpr std::array<const char *, 6> hmac_headers = {
+      "X-PM-Protocol",       "X-PM-Device-ID", "X-PM-Timestamp",
+      "X-PM-Nonce",          "X-PM-Content-SHA256",
+      "X-PM-Signature",
+  };
+  std::size_t hmac_header_count = 0U;
+  for (const char *name : hmac_headers) {
+    hmac_header_count += request->hasHeader(name) ? 1U : 0U;
+  }
+  if (hmac_header_count == hmac_headers.size()) {
+    return RequestAuthMode::ServerToDeviceHmac;
+  }
+  if (hmac_header_count != 0U) {
+    return RequestAuthMode::MalformedMixedAuthentication;
+  }
+  if (!cookieValue(request, "pm_session").empty()) {
+    return RequestAuthMode::LocalBrowserSession;
+  }
+  return RequestAuthMode::Unauthenticated;
+}
+
 bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
                         const bool mutation, const bool allow_local_session,
                         const bool require_elevated_local) {
@@ -1584,21 +2003,36 @@ bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
     network_.touchSetupActivity();
   }
   const std::uint64_t now = clock_.monotonicMs();
-  if (api_window_started_ms_ == 0 || now - api_window_started_ms_ >= 1000U) {
-    api_window_started_ms_ = now;
-    api_requests_in_window_ = 0;
+  const RequestAuthMode mode = classifyAuthMode(request);
+  PM_LOG_DEBUG("AUTH", "AUTH_MODE_CLASSIFIED",
+               "route=%s method=%s mode=%s cookie_present=%s",
+               request->url().c_str(), request->methodToString(),
+               requestAuthModeName(mode),
+               cookieValue(request, "pm_session").empty() ? "false" : "true");
+  std::uint64_t *window_started = &hmac_api_window_started_ms_;
+  std::uint16_t *requests_in_window = &hmac_api_requests_in_window_;
+  const bool browser_mode = mode == RequestAuthMode::LocalBrowserSession;
+  if (browser_mode) {
+    window_started = &browser_api_window_started_ms_;
+    requests_in_window = &browser_api_requests_in_window_;
   }
-  if (api_requests_in_window_ >= 60U) {
+  if (*window_started == 0 || now - *window_started >= 1000U) {
+    *window_started = now;
+    *requests_in_window = 0;
+  }
+  if (*requests_in_window >= 60U) {
     PM_LOG_WARN("AUTH", "API_RATE_LIMITED",
-                "error=PM-AUTH-002 window_ms=1000 limit=60 route=%s",
+                "error=PM-AUTH-002 class=%s window_ms=1000 limit=60 route=%s",
+                browser_mode ? "browser" : "server_hmac",
                 request->url().c_str());
+    diagnostics_.recordAuthRateLimit(browser_mode);
     sendProblem(
         request, 429, "api_rate_limited",
         "The authenticated API request rate exceeded the bounded limit.", false,
         true);
     return false;
   }
-  ++api_requests_in_window_;
+  ++(*requests_in_window);
   const bool origin_present = request->hasHeader("Origin");
   if (origin_present && !sameOrigin(request)) {
     PM_LOG_WARN("AUTH", "ORIGIN_REJECTED",
@@ -1608,37 +2042,115 @@ bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
                 "Cross-origin API access is not allowed.");
     return false;
   }
-  if (allow_local_session && (!mutation || origin_present) &&
-      localSession(request, mutation, require_elevated_local)) {
+
+  if (mode == RequestAuthMode::MalformedMixedAuthentication) {
+    PM_LOG_WARN("AUTH", "AUTHENTICATION_HEADERS_INCOMPLETE",
+                "error=PM-AUTH-008 route=%s method=%s",
+                request->url().c_str(), request->methodToString());
+    diagnostics_.recordMalformedAuthHeaderRejection();
+    diagnostics_.recordServerHmac(ServerHmacMetric::HeadersIncomplete);
+    if (diag::SerialLogger::instance().allow("flight_partial_hmac", 10'000U)) {
+      coordinator_.enqueueEvent(
+          "EVT_AUTH_HEADERS_INCOMPLETE", "warning",
+          std::string("route=") + request->url().c_str() +
+              " method=" + request->methodToString() +
+              " credential_material=redacted",
+          clock_.utcMs(), config_.identity().boot_id);
+    }
+    sendProblem(request, 400, "authentication_headers_incomplete",
+                "Server HMAC authentication headers must be supplied as one "
+                "complete set. Browser sessions must not send a partial set.");
+    return false;
+  }
+
+  if (mode == RequestAuthMode::LocalBrowserSession) {
+    if (!allow_local_session) {
+      sendProblem(request, 401, "server_hmac_required",
+                  "This route requires a complete server-to-device HMAC "
+                  "request and does not accept a browser session.");
+      return false;
+    }
+    if (mutation && !origin_present) {
+      PM_LOG_WARN("AUTH", "ORIGIN_REQUIRED",
+                  "error=PM-AUTH-006 route=%s method=%s",
+                  request->url().c_str(), request->methodToString());
+      sendProblem(request, 403, "origin_required",
+                  "Mutating browser requests must include the exact local "
+                  "Origin header.");
+      return false;
+    }
+    const LocalSessionResult session_result =
+        localSessionResult(request, mutation, require_elevated_local);
+    if (session_result != LocalSessionResult::Ok) {
+      const bool forbidden =
+          session_result == LocalSessionResult::CsrfRejected ||
+          session_result == LocalSessionResult::ElevationRequired;
+      PM_LOG_WARN("AUTH", "LOCAL_SESSION_REJECTED",
+                  "error=PM-AUTH-009 route=%s method=%s reason=%s",
+                  request->url().c_str(), request->methodToString(),
+                  localSessionResultCode(session_result));
+      const char *detail =
+          session_result == LocalSessionResult::ElevationRequired
+              ? "Administrator verification is required for this "
+                "security-sensitive operation."
+          : session_result == LocalSessionResult::CsrfRejected
+              ? "The browser CSRF value is missing, expired, or invalid."
+          : session_result == LocalSessionResult::Expired
+              ? "The local browser session expired and must be renewed."
+              : "The local browser session is invalid and must be renewed.";
+      diagnostics_.recordBrowserSessionRejection();
+      if (session_result == LocalSessionResult::Expired) {
+        diagnostics_.recordBrowserAuth(BrowserAuthMetric::SessionExpired);
+      } else if (session_result == LocalSessionResult::CsrfRejected) {
+        diagnostics_.recordBrowserAuth(BrowserAuthMetric::CsrfRejected);
+      } else {
+        diagnostics_.recordBrowserAuth(BrowserAuthMetric::SessionInvalid);
+      }
+      PM_LOG_INFO("AUTH", "BROWSER_HMAC_FALLBACK_PREVENTED",
+                  "route=%s method=%s local_result=%s hmac_attempted=false",
+                  request->url().c_str(), request->methodToString(),
+                  localSessionResultCode(session_result));
+      if (diag::SerialLogger::instance().allow("flight_local_session_rejected",
+                                               10'000U)) {
+        const std::string detail =
+            std::string("route=") + request->url().c_str() +
+            " method=" + request->methodToString() +
+            " auth_mode=local_browser_session result=" +
+            localSessionResultCode(session_result) +
+            " hmac_attempted=false";
+        coordinator_.enqueueEvent("EVT_LOCAL_SESSION_REJECTED", "warning",
+                                  detail, clock_.utcMs(),
+                                  config_.identity().boot_id);
+      }
+      if (session_result == LocalSessionResult::Expired ||
+          session_result == LocalSessionResult::Invalid) {
+        sendLocalSessionProblem(request, 401,
+                                localSessionResultCode(session_result), detail);
+      } else {
+        sendProblem(request, forbidden ? 403 : 401,
+                    localSessionResultCode(session_result), detail);
+      }
+      return false;
+    }
     PM_LOG_DEBUG("AUTH", "LOCAL_SESSION_ACCEPTED",
                  "route=%s method=%s mutation=%s elevated_required=%s",
                  request->url().c_str(), request->methodToString(),
                  mutation ? "true" : "false",
-                 require_elevated_local ? "true" : "false");
+                  require_elevated_local ? "true" : "false");
+    diagnostics_.recordBrowserAuth(BrowserAuthMetric::Accepted);
     return true;
   }
-  const bool has_local_cookie = !cookieValue(request, "pm_session").empty();
-  if (allow_local_session && mutation && has_local_cookie && !origin_present &&
-      !request->hasHeader("X-PM-Signature")) {
-    PM_LOG_WARN("AUTH", "ORIGIN_REQUIRED",
-                "error=PM-AUTH-006 route=%s method=%s", request->url().c_str(),
-                request->methodToString());
-    sendProblem(request, 403, "origin_required",
-                "Mutating browser requests must include the exact local "
-                "Origin header.");
+
+  if (mode == RequestAuthMode::Unauthenticated) {
+    PM_LOG_WARN("AUTH", "AUTHENTICATION_REQUIRED",
+                "error=PM-AUTH-004 route=%s class=unauthenticated",
+                request->url().c_str());
+    sendProblem(request, 401, "authentication_required",
+                "A local browser session or a complete enrolled-server HMAC "
+                "request is required.");
     return false;
   }
-  if (allow_local_session && has_local_cookie && require_elevated_local &&
-      !request->hasHeader("X-PM-Signature")) {
-    PM_LOG_WARN("AUTH", "ELEVATION_REQUIRED",
-                "error=PM-AUTH-007 route=%s method=%s", request->url().c_str(),
-                request->methodToString());
-    sendProblem(
-        request, 403, "elevated_session_required",
-        "Administrator or setup-password verification is required for this "
-        "security-sensitive operation.");
-    return false;
-  }
+
   crypto::Key32 outbound{};
   crypto::Key32 inbound{};
   if (!config_.directionalKeys(outbound, inbound)) {
@@ -1647,8 +2159,7 @@ bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
         "error=PM-AUTH-004 route=%s local_session=false enrolled_keys=false",
         request->url().c_str());
     sendProblem(request, 401, "authentication_required",
-                "A local session or enrolled server signature is required.",
-                true);
+                "The sensor is not enrolled with server HMAC keys.");
     return false;
   }
   AuthHeaders headers;
@@ -1675,11 +2186,49 @@ bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
       config_.identity().device_id, inbound, std::time(nullptr),
       clock_.synchronized());
   if (result != AuthResult::Ok) {
+    switch (result) {
+    case AuthResult::MissingHeader:
+      diagnostics_.recordServerHmac(ServerHmacMetric::HeadersIncomplete);
+      break;
+    case AuthResult::ProtocolMismatch:
+      diagnostics_.recordServerHmac(ServerHmacMetric::ProtocolMismatch);
+      break;
+    case AuthResult::DeviceMismatch:
+      diagnostics_.recordServerHmac(ServerHmacMetric::DeviceMismatch);
+      break;
+    case AuthResult::TimestampInvalid:
+    case AuthResult::TimestampOutsideWindow:
+      diagnostics_.recordServerHmac(ServerHmacMetric::TimestampRejected);
+      break;
+    case AuthResult::NonceInvalid:
+    case AuthResult::NonceReplayed:
+    case AuthResult::NonceCapacityExceeded:
+      diagnostics_.recordServerHmac(ServerHmacMetric::NonceRejected);
+      break;
+    case AuthResult::BodyHashMismatch:
+      diagnostics_.recordServerHmac(ServerHmacMetric::BodyHashRejected);
+      break;
+    case AuthResult::SignatureMismatch:
+      diagnostics_.recordServerHmac(ServerHmacMetric::SignatureRejected);
+      break;
+    case AuthResult::Ok:
+      break;
+    }
     PM_LOG_WARN(
         "AUTH", "SERVER_SIGNATURE_REJECTED",
         "error=PM-AUTH-005 route=%s method=%s reason=%s signature=redacted",
         request->url().c_str(), request->methodToString(),
         authResultCode(result));
+    if (diag::SerialLogger::instance().allow("flight_server_hmac_rejected",
+                                             10'000U)) {
+      const std::string detail =
+          std::string("route=") + request->url().c_str() +
+          " method=" + request->methodToString() + " result=" +
+          authResultCode(result) + " credential_material=redacted";
+      coordinator_.enqueueEvent("EVT_SERVER_HMAC_REJECTED", "warning",
+                                detail, clock_.utcMs(),
+                                config_.identity().boot_id);
+    }
     const int status =
         result == AuthResult::ProtocolMismatch
             ? 409
@@ -1695,27 +2244,30 @@ bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
   PM_LOG_INFO("AUTH", "SERVER_SIGNATURE_ACCEPTED",
               "route=%s method=%s nonce=redacted", request->url().c_str(),
               request->methodToString());
+  diagnostics_.recordServerHmac(ServerHmacMetric::Accepted);
   return true;
 }
 
-bool HttpApi::localSession(AsyncWebServerRequest *request, const bool mutation,
-                           const bool require_elevated) const {
+LocalSessionResult
+HttpApi::localSessionResult(AsyncWebServerRequest *request,
+                            const bool mutation,
+                            const bool require_elevated) const {
   const std::string token = cookieValue(request, "pm_session");
-  if (token.empty())
-    return false;
   if (!mutation) {
-    return require_elevated
-               ? sessions_.validateElevated(token, clock_.monotonicMs())
-               : sessions_.validate(token, clock_.monotonicMs());
+    return sessions_.validate(token, clock_.monotonicMs(), require_elevated);
   }
   const std::string csrf =
       request->hasHeader("X-PM-CSRF")
           ? request->getHeader("X-PM-CSRF")->value().c_str()
           : "";
-  return require_elevated
-             ? sessions_.validateElevatedMutation(token, csrf,
-                                                  clock_.monotonicMs())
-             : sessions_.validateMutation(token, csrf, clock_.monotonicMs());
+  return sessions_.validateMutation(token, csrf, clock_.monotonicMs(),
+                                    require_elevated);
+}
+
+bool HttpApi::localSession(AsyncWebServerRequest *request, const bool mutation,
+                           const bool require_elevated) const {
+  return localSessionResult(request, mutation, require_elevated) ==
+         LocalSessionResult::Ok;
 }
 
 bool HttpApi::sameOrigin(AsyncWebServerRequest *request) const {
@@ -1728,9 +2280,28 @@ bool HttpApi::sameOrigin(AsyncWebServerRequest *request) const {
 
 void HttpApi::createLocalSession(AsyncWebServerRequest *request,
                                  const bool elevated) {
-  const SessionManager::Session session = sessions_.create(
-      clock_.monotonicMs(), config_.config().local_session_timeout_seconds,
-      elevated);
+  const std::string current_token = cookieValue(request, "pm_session");
+  const SessionManager::Session session =
+      elevated
+          ? sessions_.elevate(current_token, clock_.monotonicMs(),
+                              config_.config().local_session_timeout_seconds,
+                              300U)
+          : sessions_.open(current_token, clock_.monotonicMs(),
+                           config_.config().local_session_timeout_seconds);
+  if (session.capacity_reached) {
+    coordinator_.enqueueEvent("EVT_LOCAL_SESSION_CAPACITY_REACHED", "warning",
+                              "capacity=6 active_sessions_preserved=true",
+                              clock_.utcMs(), config_.identity().boot_id);
+    sendProblem(request, 503, "local_session_capacity_reached",
+                "All bounded browser-session slots are active. Sign out one "
+                "client or wait for a session to expire.");
+    return;
+  }
+  if (session.token.empty() || session.csrf.empty()) {
+    sendProblem(request, 401, "local_session_invalid",
+                "The local browser session could not be refreshed.");
+    return;
+  }
   JsonDocument document;
   document["csrf"] = session.csrf;
   document["expires_in_seconds"] =
@@ -1746,18 +2317,35 @@ void HttpApi::createLocalSession(AsyncWebServerRequest *request,
       "; HttpOnly; SameSite=Strict; Path=/; Max-Age=" +
       std::to_string(config_.config().local_session_timeout_seconds);
   response->addHeader("Set-Cookie", cookie.c_str());
+  const std::string csrf_cookie =
+      "pm_csrf=" + session.csrf + "; SameSite=Strict; Path=/; Max-Age=" +
+      std::to_string(config_.config().local_session_timeout_seconds);
+  // ESPAsyncWebServer replaces an existing header unless replaceExisting is
+  // explicitly disabled. Keep both cookies: losing pm_session makes the
+  // successful session response unusable, while losing pm_csrf breaks every
+  // authenticated mutation.
+  response->addHeader("Set-Cookie", csrf_cookie.c_str(), false);
   response->addHeader("Cache-Control", "no-store");
   response->addHeader("Connection", "close", false);
   diagnostics_.recordHttpStatus(200);
   request->send(response);
   PM_LOG_INFO(
-      "AUTH", "SESSION_CREATED",
-      "expires_in_seconds=%lu setup_required=%s elevated=%s token=redacted "
-      "csrf=redacted",
+      "AUTH", session.refreshed ? "SESSION_REFRESHED" : "SESSION_CREATED",
+      "expires_in_seconds=%lu setup_required=%s elevated=%s reused=%s "
+      "token=redacted csrf=redacted",
       static_cast<unsigned long>(
           config_.config().local_session_timeout_seconds),
       config_.hasAdminPassword() ? "false" : "true",
-      session.elevated ? "true" : "false");
+      session.elevated ? "true" : "false",
+      session.reused ? "true" : "false");
+  coordinator_.enqueueEvent(
+      session.refreshed ? "EVT_LOCAL_SESSION_REFRESHED"
+                        : "EVT_LOCAL_SESSION_CREATED",
+      "info",
+      std::string("elevated=") + (session.elevated ? "true" : "false") +
+          " reused=" + (session.reused ? "true" : "false") +
+          " token=redacted csrf=redacted",
+      clock_.utcMs(), config_.identity().boot_id);
 }
 
 std::string HttpApi::cookieValue(AsyncWebServerRequest *request,
@@ -1820,6 +2408,89 @@ void HttpApi::sendProblem(AsyncWebServerRequest *request, const int status,
               diag::httpStatusCategory(status), code,
               rejected_signature ? "true" : "false",
               rate_limited ? "true" : "false");
+}
+
+void HttpApi::sendLocalSessionProblem(AsyncWebServerRequest *request,
+                                      const int status, const char *code,
+                                      const char *detail) {
+  JsonDocument document;
+  document["type"] = std::string("https://powermonitor.local/problems/") + code;
+  document["title"] = code;
+  document["status"] = status;
+  document["detail"] = detail;
+  document["instance"] = request->url();
+  document["code"] = code;
+  std::string body;
+  serializeJson(document, body);
+  diagnostics_.recordHttpStatus(status);
+  AsyncWebServerResponse *response =
+      request->beginResponse(status, "application/problem+json", body.c_str());
+  response->addHeader("Cache-Control", "no-store");
+  response->addHeader(
+      "Set-Cookie",
+      "pm_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+  response->addHeader("Set-Cookie",
+                      "pm_csrf=; SameSite=Strict; Path=/; Max-Age=0", false);
+  response->addHeader("Connection", "close", false);
+  request->send(response);
+}
+
+bool HttpApi::beginHeavyLocalOperation(AsyncWebServerRequest *request) {
+  const SyncMetrics sync = diagnostics_.syncMetrics();
+  const std::uint32_t free_internal =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const std::uint32_t largest_internal =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const bool low_memory = free_internal < kMinimumHeavyUiInternalHeapBytes ||
+                          largest_internal <
+                              kMinimumHeavyUiLargestBlockBytes;
+  if (sync.sync_in_progress || sync.primary_storage_pending ||
+      sync.durable_reading_backlog || low_memory ||
+      !diagnostics_.acquireHighMemoryOperation(0)) {
+    diagnostics_.recordHeavyUiDeferral();
+    const char body[] =
+        "{\"type\":\"https://powermonitor.local/problems/local_resource_"
+        "deferred\",\"title\":\"local_resource_deferred\",\"status\":503,"
+        "\"detail\":\"The primary measurement or synchronization path needs "
+        "the available local resources. Retry shortly.\",\"code\":"
+        "\"local_resource_deferred\"}";
+    AsyncWebServerResponse *response = request->beginResponse(
+        503, "application/problem+json", body);
+    response->addHeader("Cache-Control", "no-store");
+    response->addHeader("Retry-After", "2");
+    response->addHeader("Connection", "close", false);
+    diagnostics_.recordHttpStatus(503);
+    request->send(response);
+    PM_LOG_WARN(
+        "WEB", "HEAVY_REQUEST_DEFERRED",
+        "route=%s sync_active=%s storage_pending=%s backlog=%s "
+        "low_memory=%s free_internal=%lu largest_internal=%lu",
+        request->url().c_str(), sync.sync_in_progress ? "true" : "false",
+        sync.primary_storage_pending ? "true" : "false",
+        sync.durable_reading_backlog ? "true" : "false",
+        low_memory ? "true" : "false",
+        static_cast<unsigned long>(free_internal),
+        static_cast<unsigned long>(largest_internal));
+    if (diag::SerialLogger::instance().allow("flight_heavy_ui_deferred",
+                                             30'000U)) {
+      const std::string detail =
+          std::string("route=") + request->url().c_str() +
+          " sync_active=" + (sync.sync_in_progress ? "true" : "false") +
+          " storage_pending=" +
+          (sync.primary_storage_pending ? "true" : "false") +
+          " backlog=" + (sync.durable_reading_backlog ? "true" : "false") +
+          " low_memory=" + (low_memory ? "true" : "false");
+      coordinator_.enqueueEvent("EVT_HEAVY_UI_DEFERRED", "warning", detail,
+                                clock_.utcMs(),
+                                config_.identity().boot_id);
+    }
+    return false;
+  }
+  return true;
+}
+
+void HttpApi::endHeavyLocalOperation() {
+  diagnostics_.releaseHighMemoryOperation();
 }
 
 void HttpApi::sendPage(AsyncWebServerRequest *request, const HistoryPage &page,

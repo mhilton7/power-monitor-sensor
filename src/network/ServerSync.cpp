@@ -25,6 +25,7 @@
 #include "diagnostics/DiagnosticCore.h"
 #include "diagnostics/SerialLogger.h"
 #include "network/ReadingWireFormat.h"
+#include "network/ResolvedTlsClient.h"
 #include "security/Crypto.h"
 #include "version.h"
 
@@ -38,25 +39,10 @@ constexpr std::uint32_t kHttpResponseTimeoutMs = 10'000U;
 constexpr std::uint32_t kHttpBodyTimeoutMs = 5000U;
 constexpr std::uint32_t kOverallRequestTimeoutMs = 30'000U;
 constexpr std::uint32_t kHeartbeatStorageWaitMs = 20'000U;
+constexpr std::uint32_t kLocalResourceRetryMs = 1500U;
 constexpr std::uint32_t kResponseReadPollMs = 10U;
 constexpr std::size_t kReadingBatchRecordLimit = 8U;
 constexpr std::size_t kEventBatchRecordLimit = 24U;
-
-struct TransportConfig {
-  std::string server_url;
-  std::string server_ca_pem;
-  std::string server_fingerprint;
-  std::array<std::string, 4> allowed_server_addresses{};
-};
-
-TransportConfig transportConfig(const ConfigService &config) {
-  // Limit the live request frame to transport-owned fields. RuntimeConfig has
-  // many strings and public-key values that TLS does not need.
-  RuntimeConfig active = config.config();
-  return {std::move(active.server_url), std::move(active.server_ca_pem),
-          std::move(active.server_fingerprint),
-          std::move(active.allowed_server_addresses)};
-}
 
 std::string enrolledDeviceId(const ConfigService &config) {
   return config.identity().device_id;
@@ -76,6 +62,10 @@ void recordSyncTaskCheckpoint(SyncMetrics &metrics, Diagnostics &diagnostics,
       task_config::kServerSyncStackBytes, high_water_bytes);
   metrics.free_internal_heap_bytes = free_internal;
   metrics.largest_internal_block_bytes = largest_internal;
+  if (metrics.minimum_free_internal_heap_bytes == 0U ||
+      free_internal < metrics.minimum_free_internal_heap_bytes) {
+    metrics.minimum_free_internal_heap_bytes = free_internal;
+  }
   diagnostics.setSyncMetrics(metrics);
   PM_LOG_DEBUG(
       "TASK", "SYNC_TASK_STACK",
@@ -98,7 +88,9 @@ void recordSyncTaskCheckpoint(SyncMetrics &metrics, Diagnostics &diagnostics,
       static_cast<unsigned long>(free_internal),
       static_cast<unsigned long>(largest_internal),
       static_cast<unsigned long>(ESP.getFreePsram()));
-  if (metrics.stack_margin_percent < task_config::kMinimumStackMarginPercent &&
+  if (!sync_policy::stackMarginHealthy(
+          task_config::kServerSyncStackBytes, high_water_bytes,
+          task_config::kMinimumStackMarginPercent) &&
       diag::SerialLogger::instance().allow("server_sync_stack_low", 30'000U)) {
     PM_LOG_WARN(
         "TASK", "STACK_LOW",
@@ -126,8 +118,9 @@ public:
                  static_cast<unsigned long>(request_id_));
     if (http_begun_) {
       http_.end();
+    } else {
+      client_.stop();
     }
-    client_.stop();
     PM_LOG_DEBUG("SYNC", "SYNC_CLEANUP_COMPLETE",
                  "request_id=%lu http_ended=%s tls_stopped=true",
                  static_cast<unsigned long>(request_id_),
@@ -151,13 +144,16 @@ public:
                          const std::string &problem_code,
                          const std::string &tls_category,
                          const std::uint32_t &retry_after_ms,
+                         const bool &local_resource_deferred,
                          const std::string &response_body,
                          const std::uint64_t started_ms)
       : gate_(gate), metrics_(metrics), diagnostics_(diagnostics),
         clock_(clock), request_id_(request_id), method_(method),
         endpoint_(endpoint), status_(status), error_(error),
         problem_code_(problem_code), tls_category_(tls_category),
-        retry_after_ms_(retry_after_ms), response_body_(response_body),
+        retry_after_ms_(retry_after_ms),
+        local_resource_deferred_(local_resource_deferred),
+        response_body_(response_body),
         started_ms_(started_ms) {}
 
   ~SyncTransactionCleanup() {
@@ -165,6 +161,8 @@ public:
     const bool success = status_ >= 200 && status_ < 300;
     if (success) {
       ++metrics_.transactions_completed;
+    } else if (local_resource_deferred_) {
+      ++metrics_.local_resource_deferrals;
     } else {
       ++metrics_.transactions_failed;
       if (!error_.empty()) {
@@ -178,9 +176,20 @@ public:
     metrics_.sync_pending = gate_.pending();
     metrics_.active_request_id = 0U;
     recordSyncTaskCheckpoint(metrics_, diagnostics_,
-                             success ? "TRANSACTION_COMPLETE"
-                                     : "TRANSACTION_FAILED");
-    if (status_ > 0) {
+                             success
+                                 ? "TRANSACTION_COMPLETE"
+                                 : (local_resource_deferred_
+                                        ? "TRANSACTION_DEFERRED"
+                                        : "TRANSACTION_FAILED"));
+    if (local_resource_deferred_) {
+      PM_LOG_WARN(
+          "SYNC", "LOCAL_RESOURCE_DEFERRED",
+          "request_id=%lu method=%s endpoint=%s reason=%s retry_in_ms=%lu "
+          "external_failure=false",
+          static_cast<unsigned long>(request_id_), method_, endpoint_.c_str(),
+          error_.empty() ? "local_resource_unavailable" : error_.c_str(),
+          static_cast<unsigned long>(kLocalResourceRetryMs));
+    } else if (status_ > 0) {
       PM_LOG_INFO(
           "HTTP", "HTTP_COMPLETE",
           "request_id=%lu method=%s endpoint=%s status=%d category=%s "
@@ -208,7 +217,9 @@ public:
     PM_LOG_INFO(
         "SYNC",
         success ? "SYNC_COMPLETE"
-                : (timed_out ? "SYNC_TIMEOUT" : "SYNC_FAILED"),
+                : (local_resource_deferred_ ? "SYNC_DEFERRED"
+                                            : (timed_out ? "SYNC_TIMEOUT"
+                                                         : "SYNC_FAILED")),
         "request_id=%lu status=%d elapsed_ms=%llu pending=%s "
         "transactions_started=%llu transactions_completed=%llu "
         "transactions_failed=%llu",
@@ -233,6 +244,7 @@ private:
   const std::string &problem_code_;
   const std::string &tls_category_;
   const std::uint32_t &retry_after_ms_;
+  const bool &local_resource_deferred_;
   const std::string &response_body_;
   std::uint64_t started_ms_;
 };
@@ -491,7 +503,8 @@ bool stationConfigurationChanged(const RuntimeConfig &before,
          before.static_dns != after.static_dns;
 }
 
-bool hostAllowed(const TransportConfig &config, const std::string &host) {
+bool hostAllowed(const ServerTransportConfig &config,
+                 const std::string &host) {
   bool constrained = false;
   for (const auto &allowed : config.allowed_server_addresses) {
     if (allowed.empty())
@@ -648,6 +661,7 @@ void ServerSync::tick() {
     }
   }
   const NetworkStatus network = network_.status();
+  const ServerSyncRuntimeConfig sync_config = config_.serverSyncRuntimeConfig();
 
   // Validate a remotely changed station configuration even while the new
   // configuration is offline. Keeping this state behind the normal online
@@ -702,7 +716,7 @@ void ServerSync::tick() {
     }
   }
 
-  const ConnectionMode configured_mode = config_.config().connection_mode;
+  const ConnectionMode configured_mode = sync_config.connection_mode;
   if (configured_mode != ConnectionMode::Push) {
     metrics_.last_error = "connection_mode_unsupported";
     network_.setServerStatus(false, false);
@@ -718,7 +732,7 @@ void ServerSync::tick() {
   }
 
   if (!network.station_connected || !clock_.synchronized() ||
-      config_.config().server_url.empty() || now < next_retry_ms_) {
+      !sync_config.server_configured || now < next_retry_ms_) {
     if (offline_since_ms_ == 0)
       offline_since_ms_ = now;
     if (diag::SerialLogger::instance().allow("server_offline", 60'000U)) {
@@ -729,7 +743,7 @@ void ServerSync::tick() {
           static_cast<unsigned long long>(now - offline_since_ms_),
           network.station_connected ? "connected" : "offline",
           clock_.synchronized() ? "true" : "false",
-          config_.config().server_url.empty() ? "false" : "true",
+          sync_config.server_configured ? "true" : "false",
           static_cast<unsigned long long>(
               now < next_retry_ms_ ? next_retry_ms_ - now : 0),
           static_cast<unsigned long>(retry_attempt_),
@@ -751,9 +765,14 @@ void ServerSync::tick() {
   if (!config_.identity().enrolled) {
     std::uint32_t retry_after_ms = 0;
     if (!config_.enrollmentToken().empty() && !enroll(retry_after_ms)) {
-      const std::uint32_t retry_delay_ms = retryDelayMs(retry_after_ms);
-      next_retry_ms_ = now + retry_delay_ms;
-      retry_after_gate_ms_ = retry_after_ms == 0U ? 0U : next_retry_ms_;
+      if (last_operation_locally_deferred_) {
+        next_retry_ms_ = now + kLocalResourceRetryMs;
+        retry_after_gate_ms_ = 0U;
+      } else {
+        const std::uint32_t retry_delay_ms = retryDelayMs(retry_after_ms);
+        next_retry_ms_ = now + retry_delay_ms;
+        retry_after_gate_ms_ = retry_after_ms == 0U ? 0U : next_retry_ms_;
+      }
     }
     diagnostics_.setSyncMetrics(metrics_);
     return;
@@ -770,13 +789,22 @@ void ServerSync::tick() {
                 "due_ms=%llu interval_seconds=%lu automatic=true",
                 static_cast<unsigned long long>(next_heartbeat_ms_),
                 static_cast<unsigned long>(
-                    config_.config().heartbeat_interval_seconds));
+                    sync_config.heartbeat_interval_seconds));
     std::uint32_t retry_after_ms = 0;
     if (heartbeat(retry_after_ms)) {
       retry_attempt_ = 0;
       retry_after_gate_ms_ = 0;
       next_heartbeat_ms_ = now + heartbeatDelayMs();
     } else {
+      if (last_operation_locally_deferred_) {
+        next_heartbeat_ms_ = now + kLocalResourceRetryMs;
+        PM_LOG_WARN("SERVER", "LOCAL_RESOURCE_RETRY_SCHEDULED",
+                    "operation=heartbeat retry_in_ms=%lu "
+                    "external_backoff_unchanged=true",
+                    static_cast<unsigned long>(kLocalResourceRetryMs));
+        diagnostics_.setSyncMetrics(metrics_);
+        return;
+      }
       const std::uint32_t retry_delay_ms = retryDelayMs(retry_after_ms);
       next_retry_ms_ = now + retry_delay_ms;
       retry_after_gate_ms_ = retry_after_ms == 0U ? 0U : next_retry_ms_;
@@ -809,15 +837,20 @@ void ServerSync::tick() {
   }
   if (now >= next_config_poll_ms_) {
     fetchConfiguration();
-    next_config_poll_ms_ = now + static_cast<std::uint64_t>(
-                                     config_.config().sync_interval_seconds) *
-                                     1000U;
+    next_config_poll_ms_ =
+        now + (last_operation_locally_deferred_
+                   ? kLocalResourceRetryMs
+                   : static_cast<std::uint64_t>(
+                         sync_config.sync_interval_seconds) *
+                         1000U);
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
   if (!config_.safeMode() && now >= next_manifest_poll_ms_) {
     checkFirmwareManifest();
-    next_manifest_poll_ms_ = now + 3'600'000U;
+    next_manifest_poll_ms_ =
+        now + (last_operation_locally_deferred_ ? kLocalResourceRetryMs
+                                                : 3'600'000U);
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
@@ -861,6 +894,7 @@ std::string ServerSync::availableFirmwareVersion() const {
 }
 
 bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
+  last_operation_locally_deferred_ = false;
   retry_after_ms = 0;
   const StorageHealth storage = storage_.health();
   const bool storage_ready =
@@ -885,7 +919,7 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
   document["token"] = config_.enrollmentToken();
   document["protocol_version"] = version::PROTOCOL;
   document["hardware_id"] = config_.identity().hardware_id;
-  document["requested_name"] = config_.config().friendly_name;
+  document["requested_name"] = config_.sensorStatusConfig().friendly_name;
   JsonObject capabilities = document["capabilities"].to<JsonObject>();
   capabilities["hardware_target"] = version::HARDWARE_TARGET;
   capabilities["pzem_model"] = "PZEM-004T V4";
@@ -901,8 +935,16 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
   serializeJson(document, body);
   const HttpResult response = request("POST", "/api/v1/device-enrollment/claim",
                                       std::move(body), false);
+  last_operation_locally_deferred_ = response.local_resource_deferred;
   retry_after_ms = response.retry_after_ms;
   if (response.status != 201) {
+    if (response.local_resource_deferred) {
+      PM_LOG_WARN("ENROLL", "ENROLLMENT_DEFERRED",
+                  "reason=%s retry_in_ms=%lu external_failure=false",
+                  response.error.c_str(),
+                  static_cast<unsigned long>(kLocalResourceRetryMs));
+      return false;
+    }
     metrics_.last_error =
         !response.problem_code.empty()
             ? response.problem_code
@@ -1044,7 +1086,7 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
               "device=%s friendly_name=%s config_version=%lu "
               "config_generation=%llu credentials=stored",
               diag::maskIdentifier(device_id).c_str(),
-              config_.config().friendly_name.c_str(),
+              config_.sensorStatusConfig().friendly_name.c_str(),
               static_cast<unsigned long>(config_.config().config_version),
               static_cast<unsigned long long>(assigned_generation));
   next_heartbeat_ms_ = 0;
@@ -1052,6 +1094,7 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
 }
 
 bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
+  last_operation_locally_deferred_ = false;
   retry_after_ms = 0;
   PM_LOG_DEBUG("HEARTBEAT", "HEARTBEAT_BEGIN", "ack_sequence=%llu",
                static_cast<unsigned long long>(config_.serverAckSequence()));
@@ -1060,8 +1103,16 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
   logTaskCheckpoint("AFTER_JSON_BUILD");
   const HttpResult response = request("POST", "/api/v1/device-heartbeats",
                                       std::move(heartbeat_body), true);
+  last_operation_locally_deferred_ = response.local_resource_deferred;
   retry_after_ms = response.retry_after_ms;
   if (response.status != 200) {
+    if (response.local_resource_deferred) {
+      PM_LOG_WARN("HEARTBEAT", "HEARTBEAT_DEFERRED",
+                  "reason=%s retry_in_ms=%lu external_failure=false",
+                  response.error.c_str(),
+                  static_cast<unsigned long>(kLocalResourceRetryMs));
+      return false;
+    }
     ++metrics_.heartbeat_failures;
     metrics_.last_error =
         !response.problem_code.empty()
@@ -1313,6 +1364,14 @@ bool ServerSync::pushReadings() {
   const HttpResult response =
       request("POST", "/api/v1/device-readings/batch", std::move(body), true);
   if (response.status != 200) {
+    if (response.local_resource_deferred) {
+      next_reading_push_ms_ = clock_.monotonicMs() + kLocalResourceRetryMs;
+      PM_LOG_WARN("SYNC", "READ_BATCH_DEFERRED",
+                  "reason=%s retry_in_ms=%lu external_failure=false",
+                  response.error.c_str(),
+                  static_cast<unsigned long>(kLocalResourceRetryMs));
+      return true;
+    }
     ++metrics_.batch_failures;
     metrics_.last_error =
         !response.problem_code.empty()
@@ -1600,6 +1659,14 @@ bool ServerSync::pushEvents() {
   logTaskCheckpoint("AFTER_JSON_BUILD");
   const HttpResult response =
       request("POST", "/api/v1/device-events/batch", std::move(body), true);
+  if (response.local_resource_deferred) {
+    next_event_push_ms_ = clock_.monotonicMs() + kLocalResourceRetryMs;
+    PM_LOG_WARN("SYNC", "EVENT_BATCH_DEFERRED",
+                "reason=%s retry_in_ms=%lu external_failure=false",
+                response.error.c_str(),
+                static_cast<unsigned long>(kLocalResourceRetryMs));
+    return true;
+  }
   if (response.status == 200) {
     logTaskCheckpoint("BEFORE_RESPONSE_PARSE");
     JsonDocument result;
@@ -1813,11 +1880,12 @@ bool ServerSync::reportConfiguration(const std::uint32_t version,
 }
 
 bool ServerSync::checkFirmwareManifest() {
+  const ServerSyncRuntimeConfig sync_config = config_.serverSyncRuntimeConfig();
   PM_LOG_DEBUG("OTA", "REMOTE_MANIFEST_CHECK_BEGIN", "channel=%s current=%s",
-               config_.config().ota_channel.c_str(), version::FIRMWARE);
+               sync_config.ota_channel.c_str(), version::FIRMWARE);
   const std::string endpoint =
       "/api/v1/device-firmware/manifest?channel=" +
-      crypto::percentEncode(config_.config().ota_channel) +
+      crypto::percentEncode(sync_config.ota_channel) +
       "&current=" + crypto::percentEncode(version::FIRMWARE);
   const HttpResult response = request("GET", endpoint, "", true);
   if (response.status != 200) {
@@ -1919,11 +1987,17 @@ ServerSync::HttpResult ServerSync::request(const char *method,
                                            const std::string &endpoint,
                                            std::string body,
                                            const bool authenticated) {
+  last_operation_locally_deferred_ = false;
   HttpResult result;
   const std::uint32_t request_id = ++request_sequence_;
+  const std::string correlation_id =
+      "pm-" + config_.identity().boot_id + "-" + std::to_string(request_id);
   const std::uint64_t started_ms = clock_.monotonicMs();
   if (!single_flight_.tryBegin()) {
     result.error = "sync_transaction_in_progress";
+    result.local_resource_deferred = true;
+    last_operation_locally_deferred_ = true;
+    ++metrics_.local_resource_deferrals;
     metrics_.sync_pending = single_flight_.pending();
     diagnostics_.setSyncMetrics(metrics_);
     PM_LOG_WARN("SYNC", "SYNC_COALESCED",
@@ -1938,9 +2012,9 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   ++metrics_.transactions_started;
   logTaskCheckpoint("TRANSACTION_START");
   PM_LOG_INFO("SYNC", "SYNC_STARTED",
-              "request_id=%lu owner=ServerSyncTask pending=%s "
+              "request_id=%lu correlation_id=%s owner=ServerSyncTask pending=%s "
               "transactions_started=%llu",
-              static_cast<unsigned long>(request_id),
+              static_cast<unsigned long>(request_id), correlation_id.c_str(),
               metrics_.sync_pending ? "true" : "false",
               static_cast<unsigned long long>(metrics_.transactions_started));
   PM_LOG_INFO("SYNC", "SYNC_BEGIN",
@@ -1950,7 +2024,8 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   SyncTransactionCleanup transaction(
       single_flight_, metrics_, diagnostics_, clock_, request_id, method,
       endpoint, result.status, result.error, result.problem_code,
-      result.tls_category, result.retry_after_ms, result.body, started_ms);
+      result.tls_category, result.retry_after_ms,
+      result.local_resource_deferred, result.body, started_ms);
   // StorageTask bounds and bulk-reads every history page, but it may already
   // own the shared FATFS/TLS memory gate when a heartbeat becomes due.  The
   // server-sync task is intentionally excluded from the task watchdog because
@@ -1964,7 +2039,9 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   HighMemoryLease high_memory_lease(diagnostics_, high_memory_wait);
   if (!high_memory_lease) {
     result.error = "high_memory_operation_busy";
-    result.tls_category = "MEMORY_EXHAUSTED";
+    result.tls_category = "LOCAL_RESOURCE_DEFERRED";
+    result.local_resource_deferred = true;
+    last_operation_locally_deferred_ = true;
     PM_LOG_WARN("MEMORY", "HIGH_MEMORY_GATE_TIMEOUT",
                 "error=PM-TLS-006 request_id=%lu retryable=true",
                 static_cast<unsigned long>(request_id));
@@ -1972,17 +2049,21 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   }
   PM_LOG_INFO(
       "HTTP", "HTTP_BEGIN",
-      "request_id=%lu method=%s endpoint=%s authenticated=%s request_bytes=%u",
-      static_cast<unsigned long>(request_id), method, endpoint.c_str(),
+      "request_id=%lu correlation_id=%s method=%s endpoint=%s "
+      "authenticated=%s request_bytes=%u",
+      static_cast<unsigned long>(request_id), correlation_id.c_str(), method,
+      endpoint.c_str(),
       authenticated ? "true" : "false", static_cast<unsigned>(body.size()));
-  if (body.size() > sync_policy::kMaximumResponseBytes) {
+  const std::size_t maximum_request_bytes =
+      sync_policy::maximumRequestBytes(endpoint);
+  if (body.size() > maximum_request_bytes) {
     result.error = "request_body_too_large";
     PM_LOG_ERROR("HTTP", "REQUEST_BODY_REJECTED",
                  "error=PM-HTTP-003 request_id=%lu request_bytes=%u "
                  "maximum_bytes=%u",
                  static_cast<unsigned long>(request_id),
                  static_cast<unsigned>(body.size()),
-                 static_cast<unsigned>(sync_policy::kMaximumResponseBytes));
+                 static_cast<unsigned>(maximum_request_bytes));
     return result;
   }
   if (!clock_.synchronized()) {
@@ -1992,7 +2073,7 @@ ServerSync::HttpResult ServerSync::request(const char *method,
                  static_cast<unsigned long>(request_id));
     return result;
   }
-  const TransportConfig active_config = transportConfig(config_);
+  const ServerTransportConfig active_config = config_.serverTransportConfig();
   if (active_config.server_ca_pem.empty()) {
     result.error = active_config.server_fingerprint.empty()
                        ? "tls_ca_not_configured"
@@ -2010,8 +2091,11 @@ ServerSync::HttpResult ServerSync::request(const char *method,
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!sync_policy::tlsMemoryReserveAvailable(initial_free_internal,
                                               initial_largest_internal)) {
+    ++metrics_.tls_requests_rejected_heap;
     result.error = "internal_heap_reserve_low";
-    result.tls_category = "MEMORY_EXHAUSTED";
+    result.tls_category = "LOCAL_RESOURCE_DEFERRED";
+    result.local_resource_deferred = true;
+    last_operation_locally_deferred_ = true;
     PM_LOG_WARN(
         "MEMORY", "HEAP_LOW",
         "error=PM-TLS-006 request_id=%lu stage=preflight "
@@ -2127,8 +2211,11 @@ ServerSync::HttpResult ServerSync::request(const char *method,
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!sync_policy::tlsMemoryReserveAvailable(free_internal,
                                               largest_internal)) {
+    ++metrics_.tls_requests_rejected_heap;
     result.error = "internal_heap_reserve_low";
-    result.tls_category = "MEMORY_EXHAUSTED";
+    result.tls_category = "LOCAL_RESOURCE_DEFERRED";
+    result.local_resource_deferred = true;
+    last_operation_locally_deferred_ = true;
     PM_LOG_WARN(
         "MEMORY", "HEAP_LOW",
         "error=PM-TLS-006 request_id=%lu stage=before_tls "
@@ -2147,23 +2234,13 @@ ServerSync::HttpResult ServerSync::request(const char *method,
     result.tls_category = "TIMEOUT";
     return result;
   }
-  const std::uint32_t pre_tls_stack_bytes =
-      static_cast<std::uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
-  if (pre_tls_stack_bytes <
-      task_config::kMinimumTlsStackHighWaterBytes) {
-    result.error = "sync_stack_reserve_low";
-    result.tls_category = "MEMORY_EXHAUSTED";
-    PM_LOG_ERROR(
-        "TASK", "TLS_STACK_PREFLIGHT_REJECTED",
-        "error=PM-TASK-003 request_id=%lu high_water_bytes=%lu "
-        "minimum_high_water_bytes=%lu action=request_deferred web_ui_preserved=true",
-        static_cast<unsigned long>(request_id),
-        static_cast<unsigned long>(pre_tls_stack_bytes),
-        static_cast<unsigned long>(
-            task_config::kMinimumTlsStackHighWaterBytes));
-    return result;
-  }
-  WiFiClientSecure client;
+  // A stack high-water mark is historical telemetry, not currently free
+  // stack. It must never become a latching admission gate. The checkpoint
+  // above records and warns on the measured margin without disabling future
+  // heartbeats.
+  ResolvedTlsClient client;
+  ++metrics_.tls_requests_admitted;
+  client.setResolvedEndpoint(resolved, target_host, target_port);
   client.setHandshakeTimeout(kTlsHandshakeTimeoutSeconds);
   client.setTimeout(kTcpConnectTimeoutMs / 1000U);
   client.setCACert(active_config.server_ca_pem.c_str());
@@ -2205,75 +2282,16 @@ ServerSync::HttpResult ServerSync::request(const char *method,
       static_cast<unsigned long>(free_internal),
       static_cast<unsigned long>(largest_internal),
       static_cast<unsigned long>(ESP.getFreePsram()));
-  errno = 0;
-  const bool tls_connected =
-      client.connect(resolved, target_port, target_host.c_str(),
-                     active_config.server_ca_pem.c_str(), nullptr,
-                     nullptr) == 1;
-  const int socket_error = errno;
-  if (!tls_connected) {
-    std::array<char, 192> tls_error{};
-    const int tls_error_code =
-        client.lastError(tls_error.data(), tls_error.size());
-    std::string detail =
-        tls_error_code == 0 ? std::string{} : std::string(tls_error.data());
-    if ((detail.empty() || tls_error_code == -1) && socket_error != 0) {
-      detail = std::strerror(socket_error);
-    }
-    if (detail.empty())
-      detail = "tls_connection_failed";
-    result.error = detail;
-    result.tls_category = diag::tlsErrorCategory(detail.c_str());
-    PM_LOG_ERROR(
-        "TCP", "TCP_FAILED",
-        "error=PM-TCP-001 request_id=%lu host=%s port=%u category=%s "
-        "socket_error=%d elapsed_ms=%llu transport=secure_client_combined",
-        static_cast<unsigned long>(request_id), target_host.c_str(),
-        static_cast<unsigned>(target_port), result.tls_category.c_str(),
-        socket_error,
-        static_cast<unsigned long long>(clock_.monotonicMs() - started_ms));
-    PM_LOG_ERROR(
-        "TLS", "TLS_FAILED",
-        "error=PM-TLS-004 request_id=%lu host=%s port=%u category=%s "
-        "tls_error=%d socket_error=%d detail=%s elapsed_ms=%llu",
-        static_cast<unsigned long>(request_id), target_host.c_str(),
-        static_cast<unsigned>(target_port), result.tls_category.c_str(),
-        tls_error_code, socket_error, detail.c_str(),
-        static_cast<unsigned long long>(clock_.monotonicMs() - started_ms));
-    if (cached_address) {
-      if (endpoint_address_cache_.recordTransportFailure()) {
-        PM_LOG_WARN("DNS", "DNS_CACHE_INVALIDATED",
-                    "request_id=%lu host=%s address=%s "
-                    "consecutive_transport_failures=2",
-                    static_cast<unsigned long>(request_id),
-                    target_host.c_str(), resolved.toString().c_str());
-      }
-    }
-    return result;
-  }
-  endpoint_address_cache_.recordTransportSuccess();
-  PM_LOG_INFO("TCP", "TCP_CONNECTED",
-              "request_id=%lu address=%s port=%u "
-              "transport=secure_client_combined",
-              static_cast<unsigned long>(request_id),
-              resolved.toString().c_str(), static_cast<unsigned>(target_port));
-  client.setTimeout(kHttpResponseTimeoutMs / 1000U);
-  PM_LOG_INFO(
-      "TLS", "TLS_SUCCESS",
-      "request_id=%lu host=%s address=%s port=%u ca_validation=true "
-      "hostname_validation=true heap_free=%lu heap_min=%lu elapsed_ms=%llu",
-      static_cast<unsigned long>(request_id), target_host.c_str(),
-      resolved.toString().c_str(), static_cast<unsigned>(target_port),
-      static_cast<unsigned long>(ESP.getFreeHeap()),
-      static_cast<unsigned long>(ESP.getMinFreeHeap()),
-      static_cast<unsigned long long>(clock_.monotonicMs() - started_ms));
-  logTaskCheckpoint("AFTER_TLS");
-  if (clock_.monotonicMs() - started_ms >= kOverallRequestTimeoutMs) {
-    result.error = "request_overall_timeout";
-    result.tls_category = "TIMEOUT";
-    return result;
-  }
+  // HTTPClient owns the one and only connect call. ResolvedTlsClient routes
+  // that call to the already-resolved address while preserving the original
+  // host for SNI and certificate hostname verification. Manually connecting
+  // here and then calling sendRequest caused intermittent
+  // "Connection already in progress" failures after a successful request.
   http.addHeader("Content-Type", "application/json");
+  // The server already treats X-Request-ID as a bounded correlation
+  // identifier. It is intentionally not a credential and is not part of the
+  // pm-protocol canonical signature, so existing HMAC vectors remain stable.
+  http.addHeader("X-Request-ID", correlation_id.c_str());
   if (authenticated) {
     logTaskCheckpoint("BEFORE_HMAC");
     crypto::Key32 outbound{};
@@ -2312,6 +2330,37 @@ ServerSync::HttpResult ServerSync::request(const char *method,
         reinterpret_cast<std::uint8_t *>(const_cast<char *>(body.data())),
         body.size());
   }
+  if (result.status > 0) {
+    endpoint_address_cache_.recordTransportSuccess();
+    PM_LOG_INFO(
+        "TLS", "TLS_SUCCESS",
+        "request_id=%lu host=%s address=%s port=%u ca_validation=true "
+        "hostname_validation=true heap_free=%lu heap_min=%lu elapsed_ms=%llu",
+        static_cast<unsigned long>(request_id), target_host.c_str(),
+        resolved.toString().c_str(), static_cast<unsigned>(target_port),
+        static_cast<unsigned long>(ESP.getFreeHeap()),
+        static_cast<unsigned long>(ESP.getMinFreeHeap()),
+        static_cast<unsigned long long>(clock_.monotonicMs() - started_ms));
+    logTaskCheckpoint("AFTER_TLS");
+  } else {
+    result.error = HTTPClient::errorToString(result.status).c_str();
+    result.tls_category = diag::tlsErrorCategory(result.error.c_str());
+    if (endpoint_address_cache_.recordTransportFailure()) {
+      PM_LOG_WARN("DNS", "DNS_CACHE_INVALIDATED",
+                  "request_id=%lu host=%s address=%s "
+                  "consecutive_transport_failures=2",
+                  static_cast<unsigned long>(request_id), target_host.c_str(),
+                  resolved.toString().c_str());
+    }
+    PM_LOG_ERROR(
+        "TLS", "TLS_FAILED",
+        "error=PM-TLS-004 request_id=%lu host=%s port=%u category=%s "
+        "detail=%s elapsed_ms=%llu",
+        static_cast<unsigned long>(request_id), target_host.c_str(),
+        static_cast<unsigned>(target_port), result.tls_category.c_str(),
+        result.error.c_str(),
+        static_cast<unsigned long long>(clock_.monotonicMs() - started_ms));
+  }
   // HTTPClient::sendRequest is synchronous. Once it returns, the signed bytes
   // have been sent and the outbound buffer can be released before a response
   // allocation is attempted.
@@ -2332,7 +2381,8 @@ ServerSync::HttpResult ServerSync::request(const char *method,
     result.retry_after_ms =
         retryAfterMilliseconds(http.header(retry_after_header));
     const int response_size = http.getSize();
-    if (!sync_policy::responseLengthAllowed(response_size, result.status)) {
+    if (!sync_policy::responseLengthAllowed(endpoint, response_size,
+                                             result.status)) {
       result.error =
           response_size < 0 ? "response_length_required" : "response_too_large";
       result.status = -1;
@@ -2343,7 +2393,9 @@ ServerSync::HttpResult ServerSync::request(const char *method,
                                                     MALLOC_CAP_8BIT),
                    response_size)) {
       result.error = "response_memory_reserve_low";
-      result.tls_category = "MEMORY_EXHAUSTED";
+      result.tls_category = "LOCAL_RESOURCE_DEFERRED";
+      result.local_resource_deferred = true;
+      last_operation_locally_deferred_ = true;
       result.status = -1;
       PM_LOG_WARN("MEMORY", "HEAP_LOW",
                   "error=PM-TLS-006 request_id=%lu stage=response_allocation "
@@ -2359,9 +2411,6 @@ ServerSync::HttpResult ServerSync::request(const char *method,
     } else if (result.status < 200 || result.status >= 300) {
       result.problem_code = problemCode(result.body);
     }
-  } else {
-    result.error = HTTPClient::errorToString(result.status).c_str();
-    result.tls_category = diag::tlsErrorCategory(result.error.c_str());
   }
   return result;
 }
@@ -2370,7 +2419,8 @@ std::string ServerSync::heartbeatBody() const {
   const NetworkStatus network = network_.status();
   const StorageHealth storage = storage_.health();
   const MeterMetrics meter = meter_.metrics();
-  const RuntimeConfig active_config = config_.config();
+  const ServerSyncRuntimeConfig active_config =
+      config_.serverSyncRuntimeConfig();
   const DeviceIdentity identity = config_.identity();
   MeasurementSnapshot latest;
   const bool has_latest = diagnostics_.latest(latest);
@@ -2451,7 +2501,7 @@ std::string ServerSync::heartbeatBody() const {
 std::uint32_t ServerSync::heartbeatDelayMs() const {
   const std::uint32_t seconds =
       heartbeat_interval_override_seconds_ == 0
-          ? config_.config().heartbeat_interval_seconds
+          ? config_.serverSyncRuntimeConfig().heartbeat_interval_seconds
           : heartbeat_interval_override_seconds_;
   const std::uint32_t base = seconds * 1000U;
   std::array<std::uint8_t, 2> random{};
@@ -2468,7 +2518,8 @@ std::uint32_t ServerSync::retryDelayMs(const std::uint32_t retry_after_ms) {
     ++retry_attempt_;
   }
   const std::uint64_t configured_maximum =
-      static_cast<std::uint64_t>(config_.config().sync_retry_max_seconds) *
+      static_cast<std::uint64_t>(
+          config_.serverSyncRuntimeConfig().sync_retry_max_seconds) *
       1000U;
   const std::uint32_t maximum =
       static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -2507,7 +2558,8 @@ ServerSync::operationRetryDelayMs(std::uint32_t &attempt,
                                   const std::uint32_t retry_after_ms,
                                   const char *operation) {
   const std::uint64_t configured_maximum =
-      static_cast<std::uint64_t>(config_.config().sync_retry_max_seconds) *
+      static_cast<std::uint64_t>(
+          config_.serverSyncRuntimeConfig().sync_retry_max_seconds) *
       1000U;
   const std::uint32_t maximum =
       static_cast<std::uint32_t>(std::min<std::uint64_t>(

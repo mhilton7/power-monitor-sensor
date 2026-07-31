@@ -49,5 +49,9 @@ env.Append(  # type: ignore[name-defined]
         ("PM_GIT_COMMIT", env.StringifyMacro(git_commit())),  # type: ignore[name-defined]
         ("PM_BUILD_TIMESTAMP", env.StringifyMacro(build_timestamp)),  # type: ignore[name-defined]
         ("PM_BUILD_UNIX_SECONDS", int(timestamp.timestamp())),
+        (
+            "PM_PLATFORMIO_ENVIRONMENT",
+            env.StringifyMacro(str(env.subst("$PIOENV"))),  # type: ignore[name-defined]
+        ),
     ]
 )
