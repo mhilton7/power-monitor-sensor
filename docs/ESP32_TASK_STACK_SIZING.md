@@ -44,6 +44,11 @@ It submits bounded history jobs to `StorageTask` through
 `StorageCoordinator`, then polls the result from later scheduler ticks. This
 keeps recursive FAT directory scans and SPI reads off the Wi-Fi core, so a
 large offline backlog cannot starve `NetworkTask` or the core idle task.
+On core 1, `StorageTask` runs at priority 2 while the watchdog-supervised
+`AggregationTask` runs at priority 3. Recovery also yields while scanning
+record bytes and records. This ordering is intentional: a slow 400 kHz card
+recovery must never prevent AggregationTask from waking, feeding its watchdog,
+and preserving the measurement pipeline.
 
 ## Measurement
 

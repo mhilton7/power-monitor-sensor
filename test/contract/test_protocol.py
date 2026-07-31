@@ -1054,10 +1054,63 @@ class ProtocolContractTests(unittest.TestCase):
             "digitalWrite(pins::SD_CS, HIGH)",
             "spi.transfer(0xFFU)",
             "const std::array<std::uint32_t, 3> attempt_hz",
+            "for (const std::uint32_t candidate_hz : attempt_hz)",
+            "delay(static_cast<std::uint32_t>(attempt) * 25U)",
             "format_on_failure=false",
             "format_attempted=false",
         ):
             self.assertIn(marker, source)
+        self.assertNotIn("candidate_hz == previous_hz", source)
+        for marker in (
+            "publishHealthSnapshot(health_);",
+            "publishHealthSnapshot(copy);",
+            "last_health_snapshot_",
+            "storage_health_snapshot_busy",
+            "std::size_t scanned_records = 0;",
+            "std::size_t scanned_bytes = 0;",
+            "std::size_t copied_chunks = 0;",
+            "scanned_records % kCooperativeScanRecords == 0U",
+            "scanned_bytes % kCooperativeScanBytes == 0U",
+            "copied_chunks % kCooperativeScanRecords == 0U",
+        ):
+            self.assertIn(marker, source)
+        coordinator = (
+            ROOT / "src/storage/StorageCoordinator.cpp"
+        ).read_text(encoding="utf-8")
+        for marker in (
+            "bool StorageCoordinator::remountStorage()",
+            "HighMemoryLease memory_lease(diagnostics_);",
+            "return storage_.remountPreferred();",
+            "HISTORY_DEFERRED_AT_RECOVERY_SPEED",
+            "request->events || !request->primary_sync",
+        ):
+            self.assertIn(marker, coordinator)
+        self.assertNotIn(
+            "storage_.remount(storage_.health().spi_hz)", coordinator
+        )
+        task_config = (ROOT / "include/app/TaskConfig.h").read_text(
+            encoding="utf-8"
+        )
+        application = (ROOT / "src/app/Application.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kAggregationPriority = 3U", task_config)
+        self.assertIn("kStoragePriority = 2U", task_config)
+        self.assertIn("task_config::kAggregationPriority", application)
+        self.assertIn("task_config::kStoragePriority", application)
+        header = (ROOT / "src/storage/SdStorage.h").read_text(encoding="utf-8")
+        self.assertIn("bool remountPreferred();", header)
+        self.assertIn("preferred_spi_hz_{0}", header)
+        self.assertIn("health_snapshot_mutex_", header)
+        self.assertIn("last_health_snapshot_", header)
+        self.assertIn("return remountPreferred();", source)
+        server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kHeartbeatStorageWaitMs = 20'000U", server_sync)
+        self.assertIn(
+            'endpoint == "/api/v1/device-heartbeats"', server_sync
+        )
 
     def test_sd_history_pages_are_globally_sequence_ordered(self) -> None:
         source = (ROOT / "src/storage/SdStorage.cpp").read_text(encoding="utf-8")

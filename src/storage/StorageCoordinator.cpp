@@ -232,6 +232,20 @@ bool StorageCoordinator::historyResult(const std::string &id, HistoryPage &page,
   return found;
 }
 
+bool StorageCoordinator::remountStorage() {
+  HighMemoryLease memory_lease(diagnostics_);
+  if (!memory_lease) {
+    PM_LOG_WARN("STORAGE", "REMOUNT_MEMORY_GATE_TIMEOUT",
+                "error=PM-STORAGE-014 retryable=true");
+    return false;
+  }
+  // A failed mount leaves health().spi_hz at the final 400 kHz recovery
+  // attempt. Retrying that observed value forever makes every history scan
+  // unnecessarily slow. Preserve the configured preferred speed and retry
+  // the complete preferred/fallback/recovery ladder on each mount cycle.
+  return storage_.remountPreferred();
+}
+
 void StorageCoordinator::taskLoop() {
   PM_LOG_INFO(
       "TASK", "TASK_STARTED",
@@ -251,26 +265,47 @@ void StorageCoordinator::taskLoop() {
         const bool local_deferred =
             !request->primary_sync &&
             (sync.last_heartbeat_utc_ms == 0U ||
-             sync.durable_reading_backlog);
+             sync.durable_reading_backlog ||
+             sync.primary_storage_pending);
         if (local_deferred) {
           page.error_code = "primary_sync_has_priority";
           PM_LOG_INFO(
               "STORAGE", "LOCAL_HISTORY_DEFERRED",
               "reason=%s events=%s retryable=true",
-              sync.last_heartbeat_utc_ms == 0U ? "first_heartbeat_pending"
-                                               : "reading_backlog_active",
+              sync.last_heartbeat_utc_ms == 0U
+                  ? "first_heartbeat_pending"
+                  : (sync.durable_reading_backlog
+                         ? "reading_backlog_active"
+                         : "server_storage_page_active"),
               request->events ? "true" : "false");
         } else {
-          HighMemoryLease memory_lease(diagnostics_);
-          if (memory_lease) {
-            page = request->events ? storage_.readEvents(request->query)
-                                   : storage_.readPage(request->query);
+          const StorageHealth storage_health = storage_.health();
+          const bool recovery_speed =
+              storage_health.spi_hz != 0U &&
+              storage_health.spi_hz <= 400'000U;
+          const bool preserve_primary_path =
+              recovery_speed && (request->events || !request->primary_sync);
+          if (preserve_primary_path) {
+            page.error_code = "storage_recovery_speed";
+            PM_LOG_INFO(
+                "STORAGE", "HISTORY_DEFERRED_AT_RECOVERY_SPEED",
+                "spi_hz=%lu events=%s primary_sync=%s retryable=true "
+                "reason=preserve_heartbeat_and_reading_sync",
+                static_cast<unsigned long>(storage_health.spi_hz),
+                request->events ? "true" : "false",
+                request->primary_sync ? "true" : "false");
           } else {
-            page.error_code = "high_memory_operation_busy";
-            PM_LOG_WARN(
-                "STORAGE", "HISTORY_MEMORY_GATE_TIMEOUT",
-                "error=PM-STORAGE-014 events=%s retryable=true",
-                request->events ? "true" : "false");
+            HighMemoryLease memory_lease(diagnostics_);
+            if (memory_lease) {
+              page = request->events ? storage_.readEvents(request->query)
+                                     : storage_.readPage(request->query);
+            } else {
+              page.error_code = "high_memory_operation_busy";
+              PM_LOG_WARN(
+                  "STORAGE", "HISTORY_MEMORY_GATE_TIMEOUT",
+                  "error=PM-STORAGE-014 events=%s retryable=true",
+                  request->events ? "true" : "false");
+            }
           }
         }
         bool published = false;
@@ -298,7 +333,7 @@ void StorageCoordinator::taskLoop() {
         }
         delete request;
       } else if (message.type == Type::Remount) {
-        storage_.remount(storage_.health().spi_hz);
+        remountStorage();
       }
       continue;
     }
@@ -330,7 +365,7 @@ void StorageCoordinator::taskLoop() {
         if (now >= next_remount_ms) {
           PM_LOG_WARN("STORAGE", "REMOUNT_SCHEDULED",
                       "error=PM-SD-002 retry_interval_ms=30000");
-          storage_.remount(storage_.health().spi_hz);
+          remountStorage();
           next_remount_ms = now + 30'000U;
         }
         next_record_retry_ms = now + 1000U;
@@ -359,7 +394,7 @@ void StorageCoordinator::taskLoop() {
       delete static_cast<HistoryData *>(message.payload);
       break;
     case Type::Remount:
-      storage_.remount(storage_.health().spi_hz);
+      remountStorage();
       break;
     }
   }

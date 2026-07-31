@@ -37,6 +37,7 @@ constexpr std::uint32_t kTlsHandshakeTimeoutSeconds = 8U;
 constexpr std::uint32_t kHttpResponseTimeoutMs = 10'000U;
 constexpr std::uint32_t kHttpBodyTimeoutMs = 5000U;
 constexpr std::uint32_t kOverallRequestTimeoutMs = 30'000U;
+constexpr std::uint32_t kHeartbeatStorageWaitMs = 20'000U;
 constexpr std::uint32_t kResponseReadPollMs = 10U;
 constexpr std::size_t kReadingBatchRecordLimit = 8U;
 constexpr std::size_t kEventBatchRecordLimit = 24U;
@@ -606,6 +607,8 @@ void ServerSync::tick() {
   const std::uint64_t now = clock_.monotonicMs();
   metrics_.durable_reading_backlog =
       config_.serverAckSequence() < storage_.health().newest_sequence;
+  metrics_.primary_storage_pending = !reading_page_job_id_.empty() ||
+                                     !event_page_job_id_.empty();
   const std::uint64_t reenrollment_generation =
       config_.reenrollmentGeneration();
   if (reenrollment_generation != observed_reenrollment_generation_) {
@@ -791,6 +794,8 @@ void ServerSync::tick() {
   const bool durable_reading_backlog = metrics_.durable_reading_backlog;
   if (now >= next_reading_push_ms_ && durable_reading_backlog) {
     immediate_sync_ = !pushReadings();
+    metrics_.primary_storage_pending = !reading_page_job_id_.empty() ||
+                                       !event_page_job_id_.empty();
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
@@ -799,18 +804,6 @@ void ServerSync::tick() {
     // its short polling deadline. Do not fall through into another TLS
     // transaction: FATFS scanning plus mbedTLS fragmented internal RAM and
     // previously invalidated an active Arduino File handle.
-    diagnostics_.setSyncMetrics(metrics_);
-    return;
-  }
-  // Diagnostic events remain durable on microSD, but they must not compete
-  // with the primary measurement path. In particular, a server that has not
-  // advanced the reading acknowledgement cursor can otherwise trigger a
-  // long FAT directory scan during reading retry backoff and temporarily
-  // consume the heap needed for heartbeat TLS.
-  if (!durable_reading_backlog && now >= next_event_push_ms_) {
-    if (pushEvents()) {
-      next_event_push_ms_ = now + 30'000U;
-    }
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
@@ -825,6 +818,26 @@ void ServerSync::tick() {
   if (!config_.safeMode() && now >= next_manifest_poll_ms_) {
     checkFirmwareManifest();
     next_manifest_poll_ms_ = now + 3'600'000U;
+    diagnostics_.setSyncMetrics(metrics_);
+    return;
+  }
+  // Diagnostic events remain durable on microSD, but configuration,
+  // firmware policy, and the primary measurement path have priority. A
+  // server that has not advanced the reading acknowledgement cursor can
+  // otherwise trigger a long FAT directory scan during reading retry
+  // backoff and temporarily consume the heap needed for heartbeat TLS.
+  if (!durable_reading_backlog && now >= next_event_push_ms_) {
+    const bool event_operation_succeeded = pushEvents();
+    // pushEvents owns the short 250 ms deadline while its StorageTask page
+    // job is pending. Overwriting that deadline with the idle interval made
+    // completed pages expire before they were consumed, retriggering the
+    // same expensive scan indefinitely.
+    if (sync_policy::shouldScheduleEventIdleDelay(
+            event_operation_succeeded, !event_page_job_id_.empty())) {
+      next_event_push_ms_ = now + 30'000U;
+    }
+    metrics_.primary_storage_pending = !reading_page_job_id_.empty() ||
+                                       !event_page_job_id_.empty();
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
@@ -1123,8 +1136,12 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
   }
   immediate_sync_ = document["immediate_sync_requested"].as<bool>();
   if (sync_policy::shouldReleaseReadingBackoff(
-          immediate_sync_, acknowledgement, newest_sequence)) {
+          immediate_sync_, acknowledgement, newest_sequence,
+          immediate_sync_release_recorded_,
+          last_immediate_sync_release_ack_)) {
     const bool was_deferred = next_reading_push_ms_ > clock_.monotonicMs();
+    immediate_sync_release_recorded_ = true;
+    last_immediate_sync_release_ack_ = acknowledgement;
     next_reading_push_ms_ = 0;
     PM_LOG_INFO(
         "SYNC", "READING_BACKOFF_RELEASED",
@@ -1133,6 +1150,17 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
         static_cast<unsigned long long>(acknowledgement),
         static_cast<unsigned long long>(newest_sequence),
         was_deferred ? "true" : "false",
+        static_cast<unsigned long>(reading_retry_attempt_));
+  } else if (immediate_sync_ && acknowledgement < newest_sequence &&
+             next_reading_push_ms_ > clock_.monotonicMs()) {
+    PM_LOG_DEBUG(
+        "SYNC", "READING_BACKOFF_RETAINED",
+        "reason=acknowledgement_unchanged acknowledgement=%llu newest=%llu "
+        "retry_in_ms=%llu retry_attempt=%lu",
+        static_cast<unsigned long long>(acknowledgement),
+        static_cast<unsigned long long>(newest_sequence),
+        static_cast<unsigned long long>(next_reading_push_ms_ -
+                                        clock_.monotonicMs()),
         static_cast<unsigned long>(reading_retry_attempt_));
   }
   const std::uint32_t recommended =
@@ -1177,6 +1205,8 @@ bool ServerSync::pushReadings() {
       return false;
     }
     next_reading_push_ms_ = clock_.monotonicMs() + 250U;
+    metrics_.primary_storage_pending = true;
+    diagnostics_.setSyncMetrics(metrics_);
     PM_LOG_DEBUG("SYNC", "READ_BATCH_LOAD_QUEUED",
                  "job=%s owner=StorageTask", reading_page_job_id_.c_str());
     return true;
@@ -1368,15 +1398,43 @@ bool ServerSync::pushReadings() {
     const std::uint64_t now = clock_.monotonicMs();
     next_reading_push_ms_ =
         now + operationRetryDelayMs(reading_retry_attempt_, 0, "readings");
-    PM_LOG_WARN("SYNC", "READ_BATCH_NO_PROGRESS",
-                "error=PM-SYNC-007 records=%u cursor_retained=%llu "
-                "missing_ranges=%u failures=%llu retry_in_ms=%llu",
-                static_cast<unsigned>(record_count),
-                static_cast<unsigned long long>(current_ack),
-                static_cast<unsigned>(
-                    result["missing_ranges"].as<JsonArrayConst>().size()),
-                static_cast<unsigned long long>(metrics_.batch_failures),
-                static_cast<unsigned long long>(next_reading_push_ms_ - now));
+    const JsonArrayConst missing_ranges =
+        result["missing_ranges"].as<JsonArrayConst>();
+    std::uint64_t first_missing_start = 0;
+    std::uint64_t first_missing_end = 0;
+    if (!missing_ranges.isNull() && missing_ranges.size() != 0U) {
+      const JsonArrayConst first_range = missing_ranges[0].as<JsonArrayConst>();
+      if (first_range.size() == 2U) {
+        first_missing_start = first_range[0].as<std::uint64_t>();
+        first_missing_end = first_range[1].as<std::uint64_t>();
+      }
+    }
+    PM_LOG_WARN(
+        "SYNC", "READ_BATCH_NO_PROGRESS",
+        "error=PM-SYNC-007 records=%u first_sequence=%llu last_sequence=%llu "
+        "cursor_retained=%llu missing_ranges=%u first_missing_start=%llu "
+        "first_missing_end=%llu failures=%llu retry_in_ms=%llu",
+        static_cast<unsigned>(record_count),
+        static_cast<unsigned long long>(page.first_sequence),
+        static_cast<unsigned long long>(page.last_sequence),
+        static_cast<unsigned long long>(current_ack),
+        static_cast<unsigned>(missing_ranges.size()),
+        static_cast<unsigned long long>(first_missing_start),
+        static_cast<unsigned long long>(first_missing_end),
+        static_cast<unsigned long long>(metrics_.batch_failures),
+        static_cast<unsigned long long>(next_reading_push_ms_ - now));
+    if (reading_retry_attempt_ == 1U) {
+      for (std::size_t index = 0;
+           index < page.unavailable_sequence_ranges.size(); ++index) {
+        const auto &range = page.unavailable_sequence_ranges[index];
+        PM_LOG_WARN(
+            "SYNC", "READ_BATCH_UNAVAILABLE_RANGE",
+            "index=%u start_sequence=%llu end_sequence=%llu",
+            static_cast<unsigned>(index),
+            static_cast<unsigned long long>(range.start_sequence),
+            static_cast<unsigned long long>(range.end_sequence));
+      }
+    }
     logTaskCheckpoint("AFTER_RESPONSE_PARSE");
     return false;
   }
@@ -1452,6 +1510,8 @@ bool ServerSync::pushEvents() {
       return false;
     }
     next_event_push_ms_ = clock_.monotonicMs() + 250U;
+    metrics_.primary_storage_pending = true;
+    diagnostics_.setSyncMetrics(metrics_);
     PM_LOG_DEBUG("SYNC", "EVENT_BATCH_LOAD_QUEUED",
                  "job=%s owner=StorageTask", event_page_job_id_.c_str());
     return true;
@@ -1897,7 +1957,11 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   // a verified TLS transaction can also exceed five seconds.  Wait for the
   // bounded storage operation instead of reporting a false transport outage
   // and delaying the authoritative heartbeat behind exponential backoff.
-  HighMemoryLease high_memory_lease(diagnostics_, pdMS_TO_TICKS(5000));
+  const TickType_t high_memory_wait =
+      endpoint == "/api/v1/device-heartbeats"
+          ? pdMS_TO_TICKS(kHeartbeatStorageWaitMs)
+          : pdMS_TO_TICKS(5000);
+  HighMemoryLease high_memory_lease(diagnostics_, high_memory_wait);
   if (!high_memory_lease) {
     result.error = "high_memory_operation_busy";
     result.tls_category = "MEMORY_EXHAUSTED";

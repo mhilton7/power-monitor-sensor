@@ -54,6 +54,8 @@ private:
     void *payload;
   };
 
+  bool remountStorage();
+
   SdStorage &storage_;
   Diagnostics &diagnostics_;
   QueueHandle_t write_queue_{nullptr};

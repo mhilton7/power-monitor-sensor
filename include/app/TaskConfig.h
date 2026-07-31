@@ -12,6 +12,12 @@ inline constexpr std::uint32_t kMeterStackBytes = 6144U;
 inline constexpr std::uint32_t kDiagnosticLoggerStackBytes = 4096U;
 inline constexpr std::uint32_t kAggregationStackBytes = 8192U;
 inline constexpr std::uint32_t kStorageStackBytes = 8192U;
+// Storage recovery may scan a large card at the 400 kHz recovery clock.
+// Keep it below AggregationTask so a long scan cannot starve the watchdog-
+// supervised measurement pipeline even when same-priority time slicing is
+// unavailable or an SD operation spans multiple scheduler ticks.
+inline constexpr std::uint32_t kAggregationPriority = 3U;
+inline constexpr std::uint32_t kStoragePriority = 2U;
 inline constexpr std::uint32_t kNetworkStackBytes = 6144U;
 // mbedTLS certificate verification and HTTP/HMAC framing share this task.
 // Production traces showed fewer than 1 KiB remaining during a heartbeat at

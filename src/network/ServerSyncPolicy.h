@@ -12,7 +12,7 @@ constexpr std::size_t kMaximumResponseBytes = 24U * 1024U;
 constexpr std::size_t kReadingBatchPayloadBytes = 8U * 1024U;
 constexpr std::size_t kEventBatchPayloadBytes = 16U * 1024U;
 constexpr std::uint32_t kMinimumInternalHeapBytes = 80U * 1024U;
-constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 42U * 1024U;
+constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 36U * 1024U;
 constexpr std::uint32_t kMinimumPostResponseInternalHeapBytes = 24U * 1024U;
 
 enum class QueueResult : std::uint8_t {
@@ -100,12 +100,21 @@ constexpr AcknowledgementDisposition classifyAcknowledgement(
 }
 constexpr bool shouldReleaseReadingBackoff(
     const bool immediate_sync_requested, const std::uint64_t acknowledgement,
-    const std::uint64_t newest_stored_sequence) {
-  return immediate_sync_requested && acknowledgement < newest_stored_sequence;
+    const std::uint64_t newest_stored_sequence,
+    const bool previous_release_recorded,
+    const std::uint64_t previous_release_acknowledgement) {
+  return immediate_sync_requested &&
+         acknowledgement < newest_stored_sequence &&
+         (!previous_release_recorded ||
+          acknowledgement != previous_release_acknowledgement);
 }
 constexpr bool secondaryOperationsAllowed(
     const bool durable_reading_backlog) {
   return !durable_reading_backlog;
+}
+constexpr bool shouldScheduleEventIdleDelay(
+    const bool operation_succeeded, const bool page_job_pending) {
+  return operation_succeeded && !page_job_pending;
 }
 
 } // namespace sync_policy

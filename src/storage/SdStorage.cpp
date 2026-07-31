@@ -80,6 +80,7 @@ constexpr std::uint32_t kSdFallbackClockHz = 1'000'000U;
 constexpr std::size_t kSdIdleClockBytes = 10U;
 constexpr std::uint64_t kSyncCoverageWindow = 500U;
 constexpr std::size_t kCooperativeScanRecords = 8U;
+constexpr std::size_t kCooperativeScanBytes = 256U;
 
 bool syncableInterval(const std::uint64_t start_utc_ms,
                       const std::uint64_t end_utc_ms,
@@ -118,16 +119,27 @@ void prepareSdSpiBus(SPIClass &spi) {
 
 SdStorage::SdStorage() : spi_(FSPI) {
   mutex_ = xSemaphoreCreateRecursiveMutex();
+  health_snapshot_mutex_ = xSemaphoreCreateMutex();
 }
 
-bool SdStorage::begin(const std::uint32_t spi_hz) { return remount(spi_hz); }
+bool SdStorage::begin(const std::uint32_t spi_hz) {
+  preferred_spi_hz_ = std::min(spi_hz, build::MAX_SD_SPI_HZ);
+  return remountPreferred();
+}
 
 bool SdStorage::remount(const std::uint32_t spi_hz) {
+  preferred_spi_hz_ = std::min(spi_hz, build::MAX_SD_SPI_HZ);
+  return remountPreferred();
+}
+
+bool SdStorage::remountPreferred() {
+  const std::uint32_t requested_hz =
+      preferred_spi_hz_ == 0U ? kSdRecoveryClockHz : preferred_spi_hz_;
   PM_LOG_INFO("SD", "MOUNT_BEGIN",
               "bus=FSPI cs_gpio=%d sck_gpio=%d miso_gpio=%d mosi_gpio=%d "
               "requested_hz=%lu",
               pins::SD_CS, pins::SD_SCK, pins::SD_MISO, pins::SD_MOSI,
-              static_cast<unsigned long>(spi_hz));
+              static_cast<unsigned long>(requested_hz));
   if (!lock()) {
     PM_LOG_WARN("SD", "MOUNT_LOCK_TIMEOUT", "error=PM-SD-010");
     return false;
@@ -138,19 +150,13 @@ bool SdStorage::remount(const std::uint32_t spi_hz) {
   digitalWrite(pins::SD_CS, HIGH);
   health_.mounted = health_.writable = health_.present = false;
   health_.prepared_for_removal = false;
-  const std::uint32_t requested_hz = std::min(spi_hz, build::MAX_SD_SPI_HZ);
   const std::array<std::uint32_t, 3> attempt_hz{
       requested_hz, std::min(requested_hz, kSdFallbackClockHz),
       std::min(requested_hz, kSdRecoveryClockHz)};
   ++health_.mount_cycles;
   bool mounted = false;
-  std::uint32_t previous_hz = 0U;
   std::size_t attempt = 0U;
   for (const std::uint32_t candidate_hz : attempt_hz) {
-    if (candidate_hz == previous_hz) {
-      continue;
-    }
-    previous_hz = candidate_hz;
     ++attempt;
     health_.spi_hz = candidate_hz;
     prepareSdSpiBus(spi_);
@@ -166,7 +172,10 @@ bool SdStorage::remount(const std::uint32_t spi_hz) {
     SD.end();
     spi_.end();
     digitalWrite(pins::SD_CS, HIGH);
-    delay(25U);
+    // Do not collapse repeated frequencies. A configuration already at the
+    // 400 kHz recovery speed still needs three independent command/reset
+    // attempts after a CPU-only reset interrupts an SD transaction.
+    delay(static_cast<std::uint32_t>(attempt) * 25U);
   }
   if (!mounted) {
     health_.last_error = "sd_mount_failed";
@@ -176,6 +185,7 @@ bool SdStorage::remount(const std::uint32_t spi_hz) {
         "format_attempted=false hint=check_card_fat32_wiring_and_power",
         static_cast<unsigned>(attempt),
         static_cast<unsigned long>(health_.spi_hz));
+    publishHealthSnapshot(health_);
     unlock();
     return false;
   }
@@ -198,6 +208,7 @@ bool SdStorage::remount(const std::uint32_t spi_hz) {
       layout_ok ? "ok" : "failed", self_test_ok ? "ok" : "failed",
       recovery_ok ? "ok" : "failed",
       static_cast<unsigned long long>(next_sequence_));
+  publishHealthSnapshot(health_);
   unlock();
   return health_.writable;
 }
@@ -316,6 +327,7 @@ bool SdStorage::append(IntervalRecord &record) {
                 static_cast<unsigned long long>(health_.free_bytes),
                 health_.index_healthy ? "true" : "false");
   }
+  publishHealthSnapshot(health_);
   unlock();
   return true;
 }
@@ -596,19 +608,43 @@ bool SdStorage::prepareRemoval() {
   spi_.end();
   health_.mounted = false;
   PM_LOG_INFO("SD", "CARD_REMOVAL_READY", "buffers_flushed=true mounted=false");
+  publishHealthSnapshot(health_);
   unlock();
   return true;
 }
 
 StorageHealth SdStorage::health() const {
   if (!lock(pdMS_TO_TICKS(100))) {
-    StorageHealth copy = health_;
-    copy.last_error = "storage_health_busy";
-    return copy;
+    // A remount/recovery scan updates the sequence bounds in stages while it
+    // owns the storage mutex. Never expose that partial state: for example,
+    // oldest_sequence may already be populated while newest_sequence is not,
+    // which makes an otherwise valid heartbeat fail the server contract.
+    // Return the last complete snapshot through its independent mutex. This
+    // remains race-free without turning an active, writable card into a false
+    // outage merely because a bounded scan currently owns the SD mutex.
+    if (health_snapshot_mutex_ != nullptr &&
+        xSemaphoreTake(health_snapshot_mutex_, pdMS_TO_TICKS(25)) == pdTRUE) {
+      const StorageHealth snapshot = last_health_snapshot_;
+      xSemaphoreGive(health_snapshot_mutex_);
+      return snapshot;
+    }
+    StorageHealth unavailable;
+    unavailable.spi_hz = kSdRecoveryClockHz;
+    unavailable.last_error = "storage_health_snapshot_busy";
+    return unavailable;
   }
   const StorageHealth copy = health_;
   unlock();
+  publishHealthSnapshot(copy);
   return copy;
+}
+
+void SdStorage::publishHealthSnapshot(const StorageHealth &snapshot) const {
+  if (health_snapshot_mutex_ != nullptr &&
+      xSemaphoreTake(health_snapshot_mutex_, pdMS_TO_TICKS(25)) == pdTRUE) {
+    last_health_snapshot_ = snapshot;
+    xSemaphoreGive(health_snapshot_mutex_);
+  }
 }
 
 std::uint64_t SdStorage::nextSequence() const { return next_sequence_; }
@@ -719,12 +755,18 @@ bool SdStorage::recoverFile(const std::string &path,
   }
   std::uint64_t valid_end = 0;
   bool complete_corruption = false;
+  std::size_t scanned_records = 0;
+  std::size_t scanned_bytes = 0;
   while (file.available() > 0) {
     std::string line;
     bool newline = false;
     while (file.available() > 0) {
       const char value = static_cast<char>(file.read());
       line.push_back(value);
+      ++scanned_bytes;
+      if (scanned_bytes % kCooperativeScanBytes == 0U) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
       if (value == '\n') {
         newline = true;
         break;
@@ -743,6 +785,7 @@ bool SdStorage::recoverFile(const std::string &path,
       std::array<std::uint8_t, 512> copy_buffer{};
       std::uint64_t remaining = valid_end;
       bool repaired = source && repair;
+      std::size_t copied_chunks = 0;
       while (repaired && remaining > 0) {
         const std::size_t wanted =
             std::min<std::uint64_t>(copy_buffer.size(), remaining);
@@ -751,6 +794,10 @@ bool SdStorage::recoverFile(const std::string &path,
                                    static_cast<std::size_t>(read);
         if (read > 0)
           remaining -= static_cast<std::uint64_t>(read);
+        ++copied_chunks;
+        if (copied_chunks % kCooperativeScanRecords == 0U) {
+          vTaskDelay(pdMS_TO_TICKS(1));
+        }
       }
       if (repair)
         repair.flush();
@@ -799,6 +846,10 @@ bool SdStorage::recoverFile(const std::string &path,
               : std::min(health_.oldest_syncable_sequence, sequence);
     }
     valid_end += line.size();
+    ++scanned_records;
+    if (scanned_records % kCooperativeScanRecords == 0U) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
   }
   file.close();
   if (complete_corruption) {
@@ -970,9 +1021,9 @@ HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
       std::min<std::size_t>(query.limit, build::MAX_HISTORY_PAGE);
   std::vector<Candidate> candidates;
   candidates.reserve(limit);
-  std::vector<std::uint64_t> unavailable_sequences;
+  std::vector<std::uint64_t> observed_syncable_sequences;
   if (query.require_syncable) {
-    unavailable_sequences.reserve(kSyncCoverageWindow);
+    observed_syncable_sequences.reserve(kSyncCoverageWindow);
   }
   std::size_t payload_bytes = 0;
   std::size_t eligible_records = 0;
@@ -1013,8 +1064,10 @@ HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
       return true;
     }
     if (query.require_syncable && !syncableDocument(document)) {
-      unavailable_sequences.push_back(sequence);
       return true;
+    }
+    if (query.require_syncable) {
+      observed_syncable_sequences.push_back(sequence);
     }
     ++eligible_records;
     if (payload.size() > query.maximum_payload_bytes) {
@@ -1089,6 +1142,27 @@ HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
     file.close();
   }
 
+  if (query.require_syncable) {
+    std::vector<std::uint64_t> selected_syncable_sequences;
+    selected_syncable_sequences.reserve(candidates.size());
+    for (const auto &candidate : candidates) {
+      selected_syncable_sequences.push_back(candidate.sequence);
+    }
+    const std::uint64_t maximum_scanned_sequence =
+        std::min(health_.newest_sequence, scan_ceiling);
+    const SyncCoveragePlan coverage = deriveSyncCoverage(
+        query.after_sequence, maximum_scanned_sequence,
+        selected_syncable_sequences, observed_syncable_sequences, 500U);
+    candidates.erase(
+        std::remove_if(candidates.begin(), candidates.end(),
+                       [&coverage](const Candidate &candidate) {
+                         return candidate.sequence > coverage.end_sequence;
+                       }),
+        candidates.end());
+    page.unavailable_sequence_ranges =
+        coverage.unavailable_sequence_ranges;
+  }
+
   page.records.reserve(candidates.size());
   for (auto &candidate : candidates) {
     if (page.records.empty()) {
@@ -1097,24 +1171,8 @@ HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
     page.last_sequence = candidate.sequence;
     page.records.push_back(std::move(candidate.payload));
   }
-  if (query.require_syncable && !unavailable_sequences.empty()) {
-    std::sort(unavailable_sequences.begin(), unavailable_sequences.end());
-    unavailable_sequences.erase(
-        std::unique(unavailable_sequences.begin(), unavailable_sequences.end()),
-        unavailable_sequences.end());
-    SequenceRange current{unavailable_sequences.front(),
-                          unavailable_sequences.front()};
-    for (std::size_t index = 1; index < unavailable_sequences.size();
-         ++index) {
-      const std::uint64_t sequence = unavailable_sequences[index];
-      if (sequence == current.end_sequence + 1U) {
-        current.end_sequence = sequence;
-        continue;
-      }
-      page.unavailable_sequence_ranges.push_back(current);
-      current = {sequence, sequence};
-    }
-    page.unavailable_sequence_ranges.push_back(current);
+  if (query.require_syncable &&
+      !page.unavailable_sequence_ranges.empty()) {
     if (page.first_sequence == 0U) {
       page.first_sequence =
           page.unavailable_sequence_ranges.front().start_sequence;

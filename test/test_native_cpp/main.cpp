@@ -22,6 +22,7 @@
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
 #include "storage/RecordFormat.h"
+#include "storage/SyncCoverage.h"
 
 namespace {
 int failures = 0;
@@ -429,13 +430,15 @@ void testServerSyncPolicy() {
   check(pm::sync_policy::tlsMemoryReserveAvailable(
             pm::sync_policy::kMinimumInternalHeapBytes,
             pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
+            pm::sync_policy::tlsMemoryReserveAvailable(92'696U, 39'924U) &&
             !pm::sync_policy::tlsMemoryReserveAvailable(
                 pm::sync_policy::kMinimumInternalHeapBytes - 1U,
                 pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
             !pm::sync_policy::tlsMemoryReserveAvailable(
                 pm::sync_policy::kMinimumInternalHeapBytes,
                 pm::sync_policy::kMinimumLargestInternalBlockBytes - 1U),
-        "TLS admission requires free internal heap and a contiguous block");
+        "TLS admission accepts the measured post-catch-up heap while "
+        "enforcing free-heap and contiguous-block reserves");
   check(pm::sync_policy::responseLengthAllowed(
             static_cast<int>(pm::sync_policy::kMaximumResponseBytes), 200) &&
             !pm::sync_policy::responseLengthAllowed(
@@ -467,14 +470,27 @@ void testServerSyncPolicy() {
             pm::sync_policy::classifyHttpStatus(-1) ==
                 HttpDisposition::TransportFailure,
         "server sync retry policy classifies HTTP and transport outcomes");
-  check(pm::sync_policy::shouldReleaseReadingBackoff(true, 10U, 11U) &&
-            !pm::sync_policy::shouldReleaseReadingBackoff(false, 10U, 11U) &&
-            !pm::sync_policy::shouldReleaseReadingBackoff(true, 11U, 11U) &&
-            !pm::sync_policy::shouldReleaseReadingBackoff(true, 12U, 11U),
-        "server synchronize-now releases reading backoff only for backlog");
+  check(pm::sync_policy::shouldReleaseReadingBackoff(
+            true, 10U, 11U, false, 0U) &&
+            !pm::sync_policy::shouldReleaseReadingBackoff(
+                true, 10U, 11U, true, 10U) &&
+            pm::sync_policy::shouldReleaseReadingBackoff(
+                true, 11U, 12U, true, 10U) &&
+            !pm::sync_policy::shouldReleaseReadingBackoff(
+                false, 10U, 11U, false, 0U) &&
+            !pm::sync_policy::shouldReleaseReadingBackoff(
+                true, 11U, 11U, false, 0U) &&
+            !pm::sync_policy::shouldReleaseReadingBackoff(
+                true, 12U, 11U, false, 0U),
+        "server synchronize-now releases reading backoff once per cursor");
   check(!pm::sync_policy::secondaryOperationsAllowed(true) &&
             pm::sync_policy::secondaryOperationsAllowed(false),
         "durable reading backlog blocks secondary TLS operations");
+  check(!pm::sync_policy::shouldScheduleEventIdleDelay(true, true) &&
+            pm::sync_policy::shouldScheduleEventIdleDelay(true, false) &&
+            !pm::sync_policy::shouldScheduleEventIdleDelay(false, false),
+        "event-page polling keeps its short deadline until the page is "
+        "consumed");
 
   pm::sync_policy::EndpointAddressCache address_cache;
   std::uint32_t cached_address = 99U;
@@ -875,6 +891,37 @@ void testProtocolCanonicalization() {
         "non-origin-form request target is rejected");
 }
 
+void testSyncCoverage() {
+  const pm::SyncCoveragePlan recovered = pm::deriveSyncCoverage(
+      244U, 756U, {463U, 533U}, {463U, 533U}, 500U);
+  check(
+      recovered.end_sequence == 533U &&
+          recovered.unavailable_sequence_ranges.size() == 2U &&
+          recovered.unavailable_sequence_ranges[0].start_sequence == 245U &&
+          recovered.unavailable_sequence_ranges[0].end_sequence == 462U &&
+          recovered.unavailable_sequence_ranges[1].start_sequence == 464U &&
+          recovered.unavailable_sequence_ranges[1].end_sequence == 532U,
+      "sync coverage declares missing local sequence holes before selected "
+      "readings");
+
+  const pm::SyncCoveragePlan bounded =
+      pm::deriveSyncCoverage(0U, 600U, {600U}, {600U}, 500U);
+  check(bounded.end_sequence == 500U &&
+            bounded.unavailable_sequence_ranges.size() == 1U &&
+            bounded.unavailable_sequence_ranges[0].start_sequence == 1U &&
+            bounded.unavailable_sequence_ranges[0].end_sequence == 500U,
+        "sync coverage respects the protocol unavailable-sequence limit");
+
+  const pm::SyncCoveragePlan unsent_syncable =
+      pm::deriveSyncCoverage(0U, 5U, {5U}, {3U, 5U}, 500U);
+  check(unsent_syncable.end_sequence == 2U &&
+            unsent_syncable.unavailable_sequence_ranges.size() == 1U &&
+            unsent_syncable.unavailable_sequence_ranges[0].start_sequence ==
+                1U &&
+            unsent_syncable.unavailable_sequence_ranges[0].end_sequence == 2U,
+        "sync coverage never declares an unselected retained reading lost");
+}
+
 void testAuthenticationPolicy() {
   std::int64_t parsed = 0;
   check(pm::auth_policy::parseTimestamp("9223372036854775807", parsed) &&
@@ -967,6 +1014,7 @@ int main() {
   testConfigRecovery();
   testConfigValidationHelpers();
   testAtomicConfigStore();
+  testSyncCoverage();
   testProtocolCanonicalization();
   testAuthenticationPolicy();
   testProvisioningTransaction();

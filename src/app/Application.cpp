@@ -1227,10 +1227,12 @@ bool Application::createTasks() {
                                 task_config::kMeterStackBytes, this, 4,
                                 &meter_task_, 1);
   ok &= xTaskCreatePinnedToCore(aggregationTaskEntry, "AggregationTask",
-                                task_config::kAggregationStackBytes, this, 3,
+                                task_config::kAggregationStackBytes, this,
+                                task_config::kAggregationPriority,
                                 &aggregation_task_, 1);
   ok &= xTaskCreatePinnedToCore(storageTaskEntry, "StorageTask",
-                                task_config::kStorageStackBytes, this, 3,
+                                task_config::kStorageStackBytes, this,
+                                task_config::kStoragePriority,
                                 &storage_task_, 1);
   ok &= xTaskCreatePinnedToCore(networkTaskEntry, "NetworkTask",
                                 task_config::kNetworkStackBytes, this, 2,

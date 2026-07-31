@@ -33,6 +33,7 @@ struct SyncMetrics {
   std::uint32_t largest_internal_block_bytes{0};
   bool sync_in_progress{false};
   bool sync_pending{false};
+  bool primary_storage_pending{false};
   bool durable_reading_backlog{false};
   std::string last_error;
 };

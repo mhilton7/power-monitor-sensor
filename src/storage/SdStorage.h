@@ -8,6 +8,7 @@
 #include <SPI.h>
 
 #include "core/Models.h"
+#include "storage/SyncCoverage.h"
 
 namespace pm {
 
@@ -46,11 +47,6 @@ struct HistoryQuery {
   bool require_syncable{false};
 };
 
-struct SequenceRange {
-  std::uint64_t start_sequence{0};
-  std::uint64_t end_sequence{0};
-};
-
 struct HistoryPage {
   bool ok{false};
   bool gone{false};
@@ -68,6 +64,7 @@ public:
   SdStorage();
   bool begin(std::uint32_t spi_hz);
   bool remount(std::uint32_t spi_hz);
+  bool remountPreferred();
   bool append(IntervalRecord &record);
   bool appendEvent(const std::string &code, const std::string &severity,
                    const std::string &detail, std::uint64_t utc_ms,
@@ -105,11 +102,15 @@ private:
   void updateCapacity();
   bool lock(TickType_t timeout = pdMS_TO_TICKS(5000)) const;
   void unlock() const;
+  void publishHealthSnapshot(const StorageHealth &snapshot) const;
 
   SPIClass spi_;
   mutable SemaphoreHandle_t mutex_{nullptr};
+  mutable SemaphoreHandle_t health_snapshot_mutex_{nullptr};
   StorageHealth health_;
+  mutable StorageHealth last_health_snapshot_;
   std::uint64_t next_sequence_{1};
+  std::uint32_t preferred_spi_hz_{0};
 };
 
 } // namespace pm

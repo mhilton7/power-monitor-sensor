@@ -76,6 +76,7 @@ private:
   std::uint64_t next_event_push_ms_{0};
   std::uint64_t offline_since_ms_{0};
   std::uint64_t event_cursor_{0};
+  std::uint64_t last_immediate_sync_release_ack_{0};
   std::string reading_page_job_id_;
   std::string event_page_job_id_;
   std::uint32_t request_sequence_{0};
@@ -94,6 +95,7 @@ private:
   sync_policy::SingleFlightGate single_flight_;
   sync_policy::EndpointAddressCache endpoint_address_cache_;
   bool immediate_sync_{false};
+  bool immediate_sync_release_recorded_{false};
   std::string available_firmware_version_;
 };
 

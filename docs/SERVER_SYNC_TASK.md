@@ -60,7 +60,7 @@ The repair addresses ownership and peak live memory:
 - HTTP response `Content-Length` is required and capped at 24 KiB.
 - Response bytes are read through a bounded stream loop, not `getString()`.
 - TLS admission requires at least 80 KiB of free internal heap and a largest
-  contiguous internal block of at least 42 KiB.
+  contiguous internal block of at least 36 KiB.
 - Local JSON and embedded-asset responses send `Connection: close`. This
   bounds AsyncTCP connection lifetime under concurrent WebUI/health polling
   instead of weakening the TLS admission reserve when clients retain idle
@@ -75,14 +75,27 @@ The repair addresses ownership and peak live memory:
   the reading acknowledgement cursor. This keeps low-priority evidence scans
   from competing with heartbeat TLS or primary measurements.
 - A heartbeat response with `immediate_sync_requested=true` releases the
-  reading retry deadline when the server acknowledgement is behind the newest
-  stored sequence. The retry counter remains intact, so a persistent local or
-  protocol fault stays observable while a repaired server can recover on the
-  next heartbeat without waiting through a stale backoff window.
+  reading retry deadline at most once for each distinct server
+  acknowledgement while that acknowledgement is behind the newest stored
+  sequence. A stalled acknowledgement therefore honors the operation backoff
+  instead of retrying a failed batch after every heartbeat. When the server
+  cursor advances, one new immediate release permits prompt catch-up without
+  hiding persistent local or protocol faults.
+- Reading-page coverage includes both retained-but-unsyncable records and
+  sequence holes that no longer exist on the card. The signed unavailable
+  ranges plus the selected readings form contiguous coverage from the server
+  acknowledgement through the end of the page, so a locally missing interval
+  cannot strand the server cursor forever. No more than the protocol's
+  500 unavailable sequences are declared in one request.
 - A durable reading backlog is a strict secondary-work barrier. While a
   microSD page is queued or the reading retry deadline is pending, the task
   does not fall through into configuration, firmware, or event HTTPS work.
   This prevents mbedTLS from running concurrently with the page scan.
+- Configuration and firmware policy checks run before diagnostic event
+  uploads. While an event page is being prepared, its 250 ms poll deadline
+  remains authoritative; the 30-second idle interval begins only after the
+  page is consumed. This prevents a completed page from expiring and avoids
+  repeatedly rescanning the same event files.
 - TLS and microSD history scans share a high-memory-operation gate. Server
   synchronization waits up to five seconds for an already-running bounded
   storage scan so a harmless memory-owner race does not turn a due heartbeat
@@ -92,13 +105,43 @@ The repair addresses ownership and peak live memory:
   queued ahead of local browser history, and local history is deferred while
   the first heartbeat or a durable reading backlog is pending. Local result
   pages are limited to 8 KiB each and the TLS preflight requires 80 KiB free
-  internal RAM plus a 42 KiB contiguous block. This admits the measured
-  44,020-byte post-boot ESP32-S3 heap layout without returning to the former
-  unsafe 32 KiB reserve.
+  internal RAM plus a 36 KiB contiguous block. This admits the measured
+  39,924-byte layout seen after a complete 1,300-record catch-up while the
+  local WebUI was active, with approximately 3 KiB of allocator variation,
+  while retaining more protection than the former unsafe 32 KiB reserve.
+  A server-owned storage page keeps local browser history deferred until the
+  page has been consumed and its HTTPS transaction finishes. This closes the
+  page-publication race where a second local scan could take the memory gate
+  between server page consumption and event upload.
 - A successful DNS result is cached for the unchanged host and port. TLS still
   receives the configured hostname for SNI and SAN validation. Two consecutive
   cached-address transport failures invalidate the cache and force a fresh
   lookup, so a server address change remains recoverable.
+- microSD recovery always performs all three advertised reset/mount attempts.
+- Runtime recovery retries the configured preferred SPI speed before the
+  fallback and 400 kHz recovery speeds; it never treats the last failed
+  recovery frequency as the new permanent preference.
+- At the 400 kHz recovery speed, secondary local-history reads and diagnostic
+  event uploads remain durable on the card but are deferred so they cannot
+  retain the shared TLS-memory lease across heartbeat intervals. Primary
+  reading synchronization retains priority.
+- A heartbeat may wait up to 20 seconds for an already-running bounded primary
+  storage page. This remains inside the 30-second request budget and avoids
+  reporting a false server outage during recovery.
+- Storage health readers use a separately locked last-known-complete snapshot
+  while FAT recovery or a history page owns the SD mutex. They never copy
+  partially updated sequence bounds, and they do not report a writable card
+  as unavailable merely because a scan is active.
+  A sensor configured at the 400 kHz recovery speed no longer collapses those
+  attempts into one merely because all fallback frequencies are equal. Each
+  attempt deasserts chip select and supplies a fresh 80 idle clocks. While a
+  recovery scan owns storage, heartbeat status uses a conservative unavailable
+  snapshot rather than exposing partially reconstructed sequence bounds.
+  Remount and recovery also hold the shared high-memory lease, preventing TLS
+  handshakes or local history scans from overlapping a multi-file FAT repair.
+  Record validation and repair copying yield cooperatively every eight records
+  or 512-byte chunks, so recovery cannot starve the watchdog-protected meter
+  and aggregation tasks on their shared CPU core.
 - Wi-Fi station sleep is disabled because the sensor is an always-on network
   appliance. This avoids multi-second receive latency for ICMP and AsyncTCP
   while a DNS or TLS operation is active.
