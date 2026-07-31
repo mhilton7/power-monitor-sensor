@@ -430,15 +430,17 @@ void testServerSyncPolicy() {
   check(pm::sync_policy::tlsMemoryReserveAvailable(
             pm::sync_policy::kMinimumInternalHeapBytes,
             pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
-            pm::sync_policy::tlsMemoryReserveAvailable(92'696U, 39'924U) &&
-            !pm::sync_policy::tlsMemoryReserveAvailable(
-                pm::sync_policy::kMinimumInternalHeapBytes - 1U,
-                pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
+              pm::sync_policy::tlsMemoryReserveAvailable(92'696U, 39'924U) &&
+              pm::sync_policy::tlsMemoryReserveAvailable(88'424U, 33'780U) &&
+              pm::sync_policy::tlsMemoryReserveAvailable(81'508U, 52'212U) &&
+              !pm::sync_policy::tlsMemoryReserveAvailable(
+                 pm::sync_policy::kMinimumInternalHeapBytes - 1U,
+                 pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
             !pm::sync_policy::tlsMemoryReserveAvailable(
                 pm::sync_policy::kMinimumInternalHeapBytes,
                 pm::sync_policy::kMinimumLargestInternalBlockBytes - 1U),
-        "TLS admission accepts the measured post-catch-up heap while "
-        "enforcing free-heap and contiguous-block reserves");
+        "TLS admission accepts measured post-catch-up, live-PZEM, and "
+        "storage-boundary heap while enforcing both memory reserves");
   check(pm::sync_policy::responseLengthAllowed(
             static_cast<int>(pm::sync_policy::kMaximumResponseBytes), 200) &&
             !pm::sync_policy::responseLengthAllowed(

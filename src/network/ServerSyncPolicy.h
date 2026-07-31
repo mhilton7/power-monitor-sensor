@@ -11,8 +11,16 @@ namespace sync_policy {
 constexpr std::size_t kMaximumResponseBytes = 24U * 1024U;
 constexpr std::size_t kReadingBatchPayloadBytes = 8U * 1024U;
 constexpr std::size_t kEventBatchPayloadBytes = 16U * 1024U;
-constexpr std::uint32_t kMinimumInternalHeapBytes = 80U * 1024U;
-constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 36U * 1024U;
+// The live storage/PZEM boundary has been measured at 81,508 free internal
+// bytes immediately before a heartbeat. TLS consumes about 41 KiB on this
+// target, so a 78 KiB admission floor retains roughly 37 KiB after the
+// handshake while avoiding a false disconnect at that valid steady state.
+constexpr std::uint32_t kMinimumInternalHeapBytes = 78U * 1024U;
+// A live PZEM sample leaves a 33,780-byte largest internal block on the
+// production ESP32-S3 N16R8. The TLS path has been physically validated with a
+// 32 KiB contiguous allocation while the independent total-heap guard
+// preserves the remaining network/UI reserve.
+constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 32U * 1024U;
 constexpr std::uint32_t kMinimumPostResponseInternalHeapBytes = 24U * 1024U;
 
 enum class QueueResult : std::uint8_t {

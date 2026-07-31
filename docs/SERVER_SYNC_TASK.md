@@ -59,8 +59,12 @@ The repair addresses ownership and peak live memory:
 - The page's raw string vector is released before TLS starts.
 - HTTP response `Content-Length` is required and capped at 24 KiB.
 - Response bytes are read through a bounded stream loop, not `getString()`.
-- TLS admission requires at least 80 KiB of free internal heap and a largest
-  contiguous internal block of at least 36 KiB.
+- TLS admission requires at least 78 KiB of free internal heap and a largest
+  contiguous internal block of at least 32 KiB. The latter accepts the
+  33,780-byte steady-state block measured with a live PZEM while retaining the
+  physically validated 32 KiB contiguous TLS allocation floor. The total-heap
+  threshold accepts the 81,508-byte storage-boundary state while retaining
+  roughly 37 KiB after the measured TLS working set.
 - Local JSON and embedded-asset responses send `Connection: close`. This
   bounds AsyncTCP connection lifetime under concurrent WebUI/health polling
   instead of weakening the TLS admission reserve when clients retain idle
