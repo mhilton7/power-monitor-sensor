@@ -8,6 +8,7 @@
 #include <SPI.h>
 
 #include "core/Models.h"
+#include "storage/StoragePolicy.h"
 #include "storage/SyncCoverage.h"
 
 namespace pm {
@@ -24,6 +25,8 @@ struct StorageHealth {
   std::uint64_t oldest_sequence{0};
   std::uint64_t oldest_syncable_sequence{0};
   std::uint64_t newest_sequence{0};
+  std::uint64_t oldest_event_sequence{0};
+  std::uint64_t newest_event_sequence{0};
   std::uint64_t writes{0};
   std::uint64_t reads{0};
   std::uint64_t reading_record_reads{0};
@@ -35,8 +38,40 @@ struct StorageHealth {
   std::uint32_t last_write_latency_ms{0};
   std::uint32_t spi_hz{0};
   std::uint64_t last_write_utc_ms{0};
+  std::uint64_t server_ack_sequence{0};
+  std::uint64_t event_ack_sequence{0};
+  std::uint64_t reclaimable_bytes{0};
+  std::uint64_t protected_unacknowledged_bytes{0};
+  std::uint64_t protected_untrusted_bytes{0};
+  std::uint64_t last_cleanup_utc_ms{0};
+  std::uint64_t last_cleanup_reclaimed_bytes{0};
+  std::uint64_t dropped_interval_count{0};
+  std::uint64_t first_dropped_interval_utc_ms{0};
+  std::uint64_t last_dropped_interval_utc_ms{0};
+  std::uint64_t growth_bytes_per_day{0};
+  std::int64_t estimated_days_remaining{-1};
+  std::uint32_t segment_count{0};
+  std::uint32_t eligible_segment_count{0};
+  std::uint32_t protected_segment_count{0};
+  std::uint32_t open_segment_count{0};
+  std::uint32_t closed_segment_count{0};
+  std::uint32_t untrusted_segment_count{0};
+  std::uint32_t event_segment_count{0};
+  std::uint32_t export_count{0};
+  std::uint32_t repair_artifact_count{0};
+  std::uint32_t temporary_artifact_count{0};
+  std::uint8_t free_percent{0};
+  bool acknowledgement_verified{false};
+  bool cleanup_in_progress{false};
+  bool cleanup_recovery_required{false};
+  bool storage_full{false};
   std::string filesystem{"FAT32"};
+  std::string card_type{"unknown"};
   std::string current_file;
+  std::string pressure_state{"failed"};
+  std::string pressure_reason{"not_initialized"};
+  std::string last_cleanup_result{"never"};
+  std::string last_cleanup_reason;
   std::string last_error;
 };
 
@@ -76,8 +111,15 @@ public:
   bool selfTest();
   bool rebuildIndexes();
   bool applyRetention(std::uint64_t server_ack_sequence,
-                      std::uint64_t now_utc_ms, std::uint16_t retention_days);
+                      bool acknowledgement_verified,
+                      std::uint64_t event_ack_sequence,
+                      std::uint64_t now_utc_ms,
+                      const StoragePolicy &policy,
+                      const std::string &reason);
   bool prepareRemoval();
+  bool reserveUnavailableIntervals(std::uint64_t count,
+                                   std::uint64_t first_utc_ms,
+                                   std::uint64_t last_utc_ms);
   StorageHealth health() const;
   std::uint64_t nextSequence() const;
   bool advanceSequenceFloor(std::uint64_t acknowledged_sequence);
@@ -85,9 +127,11 @@ public:
 private:
   bool initializeLayout();
   bool recover();
+  bool recoverCleanupJournal();
   bool recoverFile(const std::string &path, std::uint64_t &maximum_sequence);
   bool writeManifest();
   bool persistSequence(std::uint64_t committed_sequence);
+  bool persistEventSequence(std::uint64_t committed_sequence);
   bool ensureDirectory(const std::string &path);
   std::string recordPath(const IntervalRecord &record) const;
   std::string indexPath(const IntervalRecord &record) const;
@@ -102,6 +146,25 @@ private:
                    std::uint64_t utc_ms, std::uint64_t offset,
                    std::uint32_t payload_crc);
   void updateCapacity();
+  bool loadSegmentMetadata(const std::string &path, bool event_segment,
+                           SegmentMetadata &metadata) const;
+  SegmentMetadata inspectSegment(const std::string &path) const;
+  SegmentMetadata inspectEventSegment(const std::string &path) const;
+  bool persistSegmentMetadata(const SegmentMetadata &metadata) const;
+  bool removeSegmentTransactionally(const SegmentMetadata &metadata,
+                                    std::uint64_t server_ack_sequence,
+                                    std::uint64_t now_utc_ms,
+                                    const std::string &reason);
+  bool persistCleanupJournal(const SegmentMetadata &metadata,
+                             const std::string &record_trash,
+                             const std::string &index_trash,
+                             std::uint64_t server_ack_sequence,
+                             std::uint64_t now_utc_ms,
+                             const std::string &reason,
+                             const char *stage) const;
+  bool clearCleanupJournal() const;
+  void cleanupTemporaryArtifacts(std::uint64_t now_utc_ms);
+  std::string metadataPath(const std::string &record_path) const;
   bool lock(TickType_t timeout = pdMS_TO_TICKS(5000)) const;
   void unlock() const;
   void publishHealthSnapshot(const StorageHealth &snapshot) const;
@@ -112,7 +175,10 @@ private:
   StorageHealth health_;
   mutable StorageHealth last_health_snapshot_;
   std::uint64_t next_sequence_{1};
+  std::uint64_t next_event_sequence_{1};
   std::uint32_t preferred_spi_hz_{0};
+  StoragePolicy active_policy_{};
+  StorageGrowthEstimator growth_estimator_{};
 };
 
 } // namespace pm

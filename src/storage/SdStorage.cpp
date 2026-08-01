@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <numeric>
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -82,6 +83,30 @@ constexpr std::size_t kSdIdleClockBytes = 10U;
 constexpr std::uint64_t kSyncCoverageWindow = 500U;
 constexpr std::size_t kCooperativeScanRecords = 8U;
 constexpr std::size_t kCooperativeScanBytes = 256U;
+constexpr const char *kCleanupJournalPath =
+    "/POWERMON/state/retention.journal";
+constexpr const char *kCleanupTrashDirectory =
+    "/POWERMON/recovery/retention-trash";
+
+std::string pairedIndexPath(const std::string &record_path) {
+  std::string output = record_path;
+  const std::size_t records_pos = output.find("/records/");
+  if (records_pos == std::string::npos || !endsWith(output, ".pmr")) {
+    return {};
+  }
+  output.replace(records_pos, 9, "/indexes/");
+  output.replace(output.size() - 4U, 4U, ".idx");
+  return output;
+}
+
+std::string pathToken(const std::string &path) {
+  const std::uint32_t checksum = record::crc32(
+      reinterpret_cast<const std::uint8_t *>(path.data()), path.size());
+  char token[16]{};
+  std::snprintf(token, sizeof(token), "%08lx",
+                static_cast<unsigned long>(checksum));
+  return token;
+}
 
 bool syncableInterval(const std::uint64_t start_utc_ms,
                       const std::uint64_t end_utc_ms,
@@ -192,9 +217,11 @@ bool SdStorage::remountPreferred() {
   }
   health_.present = true;
   health_.mounted = true;
+  health_.card_type = cardTypeName(SD.cardType());
   const bool layout_ok = initializeLayout();
   const bool self_test_ok = layout_ok && selfTest();
-  const bool recovery_ok = self_test_ok && recover();
+  const bool cleanup_recovery_ok = self_test_ok && recoverCleanupJournal();
+  const bool recovery_ok = cleanup_recovery_ok && recover();
   health_.writable = layout_ok && self_test_ok && recovery_ok;
   updateCapacity();
   PM_LOG_INFO(
@@ -236,6 +263,27 @@ bool SdStorage::append(IntervalRecord &record) {
   record.sequence = next_sequence_;
   const std::string payload = serializeRecord(record);
   const std::string envelope = record::encodeEnvelope(payload);
+  updateCapacity();
+  const std::uint64_t write_reserve =
+      conservativeWriteReserveBytes(envelope.size());
+  if (health_.free_bytes < write_reserve) {
+    ++health_.write_failures;
+    health_.last_error = "storage_write_reserve_unavailable";
+    health_.pressure_state = storagePressureStateName(
+        health_.free_bytes == 0U ? StoragePressureState::Full
+                                : StoragePressureState::Emergency);
+    health_.pressure_reason = "record_index_journal_reserve_unavailable";
+    PM_LOG_ERROR(
+        "SD", "WRITE_RESERVE_BLOCKED",
+        "error=PM-SD-021 sequence=%llu free=%llu required_reserve=%llu "
+        "partial_write_attempted=false",
+        static_cast<unsigned long long>(record.sequence),
+        static_cast<unsigned long long>(health_.free_bytes),
+        static_cast<unsigned long long>(write_reserve));
+    publishHealthSnapshot(health_);
+    unlock();
+    return false;
+  }
   const std::string path = recordPath(record);
   const std::size_t slash = path.find_last_of('/');
   if (slash == std::string::npos || !ensureDirectory(path.substr(0, slash))) {
@@ -284,14 +332,15 @@ bool SdStorage::append(IntervalRecord &record) {
                 "error=PM-SD-006 sequence=%llu recovery=rebuild_indexes",
                 static_cast<unsigned long long>(record.sequence));
   }
-  if (!persistSequence(record.sequence)) {
+  const bool sequence_journal_persisted = persistSequence(record.sequence);
+  if (!sequence_journal_persisted) {
     ++health_.write_failures;
-    health_.last_error = "sequence_journal_failed";
-    PM_LOG_ERROR("SD", "SEQUENCE_JOURNAL_FAILED",
-                 "error=PM-SD-007 sequence=%llu",
-                 static_cast<unsigned long long>(record.sequence));
-    unlock();
-    return false;
+    health_.last_error = "sequence_journal_degraded";
+    PM_LOG_ERROR(
+        "SD", "SEQUENCE_JOURNAL_DEGRADED",
+        "error=PM-SD-007 sequence=%llu record_durable=true "
+        "next_sequence_advanced=true recovery=scan_record_floor",
+        static_cast<unsigned long long>(record.sequence));
   }
   health_.oldest_sequence =
       health_.oldest_sequence == 0
@@ -348,7 +397,8 @@ bool SdStorage::appendEvent(const std::string &code,
   }
   JsonDocument document;
   document["schema_version"] = 1;
-  document["event_sequence"] = static_cast<std::uint64_t>(health_.writes + 1);
+  const std::uint64_t event_sequence = next_event_sequence_;
+  document["event_sequence"] = event_sequence;
   document["timestamp_utc"] = isoUtc(utc_ms);
   document["timestamp_utc_ms"] = utc_ms;
   document["boot_id"] = boot_id;
@@ -358,6 +408,17 @@ bool SdStorage::appendEvent(const std::string &code,
   std::string payload;
   serializeJson(document, payload);
   const std::string envelope = record::encodeEnvelope(payload);
+  updateCapacity();
+  if (health_.free_bytes < conservativeWriteReserveBytes(envelope.size())) {
+    ++health_.write_failures;
+    health_.last_error = "storage_event_write_reserve_unavailable";
+    health_.pressure_state = storagePressureStateName(
+        health_.free_bytes == 0U ? StoragePressureState::Full
+                                : StoragePressureState::Emergency);
+    publishHealthSnapshot(health_);
+    unlock();
+    return false;
+  }
   const std::string path = eventPath(utc_ms, boot_id);
   const std::size_t slash = path.find_last_of('/');
   const bool directory_ok =
@@ -371,9 +432,90 @@ bool SdStorage::appendEvent(const std::string &code,
     file.flush();
     file.close();
   }
-  ok ? ++health_.writes : ++health_.write_failures;
+  const bool event_journal_persisted =
+      ok && persistEventSequence(event_sequence);
+  if (ok) {
+    health_.oldest_event_sequence =
+        health_.oldest_event_sequence == 0U
+            ? event_sequence
+            : std::min(health_.oldest_event_sequence, event_sequence);
+    health_.newest_event_sequence = event_sequence;
+    ++next_event_sequence_;
+    ++health_.writes;
+    if (!event_journal_persisted) {
+      ++health_.write_failures;
+      health_.last_error = "event_sequence_journal_degraded";
+      PM_LOG_ERROR(
+          "SD", "EVENT_SEQUENCE_JOURNAL_DEGRADED",
+          "event_sequence=%llu event_durable=true "
+          "next_event_sequence_advanced=true recovery=scan_event_floor",
+          static_cast<unsigned long long>(event_sequence));
+    }
+  } else {
+    ++health_.write_failures;
+  }
   unlock();
-  return ok;
+  return ok && health_.newest_event_sequence == event_sequence;
+}
+
+bool SdStorage::reserveUnavailableIntervals(const std::uint64_t count,
+                                            const std::uint64_t first_utc_ms,
+                                            const std::uint64_t last_utc_ms) {
+  if (count == 0U) {
+    return true;
+  }
+  if (!lock()) {
+    return false;
+  }
+  if (!health_.mounted || !health_.writable ||
+      health_.prepared_for_removal ||
+      count > std::numeric_limits<std::uint64_t>::max() - next_sequence_) {
+    unlock();
+    return false;
+  }
+  updateCapacity();
+  if (health_.free_bytes < conservativeWriteReserveBytes(0U)) {
+    health_.last_error = "storage_gap_journal_reserve_unavailable";
+    health_.pressure_state = storagePressureStateName(
+        health_.free_bytes == 0U ? StoragePressureState::Full
+                                : StoragePressureState::Emergency);
+    publishHealthSnapshot(health_);
+    unlock();
+    return false;
+  }
+  const std::uint64_t first_sequence = next_sequence_;
+  const std::uint64_t last_sequence = first_sequence + count - 1U;
+  if (!persistSequence(last_sequence)) {
+    ++health_.write_failures;
+    health_.last_error = "dropped_interval_sequence_journal_failed";
+    publishHealthSnapshot(health_);
+    unlock();
+    return false;
+  }
+  next_sequence_ = last_sequence + 1U;
+  health_.newest_sequence = std::max(health_.newest_sequence, last_sequence);
+  health_.dropped_interval_count += count;
+  if (first_utc_ms != 0U) {
+    health_.first_dropped_interval_utc_ms =
+        health_.first_dropped_interval_utc_ms == 0U
+            ? first_utc_ms
+            : std::min(health_.first_dropped_interval_utc_ms, first_utc_ms);
+  }
+  health_.last_dropped_interval_utc_ms =
+      std::max(health_.last_dropped_interval_utc_ms, last_utc_ms);
+  health_.last_error = "durable_intervals_dropped";
+  PM_LOG_ERROR(
+      "HISTORY", "storage.interval_gap_reserved",
+      "first_sequence=%llu last_sequence=%llu count=%llu first_utc_ms=%llu "
+      "last_utc_ms=%llu",
+      static_cast<unsigned long long>(first_sequence),
+      static_cast<unsigned long long>(last_sequence),
+      static_cast<unsigned long long>(count),
+      static_cast<unsigned long long>(first_utc_ms),
+      static_cast<unsigned long long>(last_utc_ms));
+  publishHealthSnapshot(health_);
+  unlock();
+  return true;
 }
 
 HistoryPage SdStorage::readPage(const HistoryQuery &query) {
@@ -519,82 +661,909 @@ bool SdStorage::rebuildIndexes() {
   return ok;
 }
 
-bool SdStorage::applyRetention(const std::uint64_t server_ack_sequence,
-                               const std::uint64_t now_utc_ms,
-                               const std::uint16_t retention_days) {
-  if (!lock())
+SegmentMetadata SdStorage::inspectSegment(const std::string &path) const {
+  SegmentMetadata metadata;
+  metadata.record_path = path;
+  metadata.index_path = pairedIndexPath(path);
+  File input = SD.open(path.c_str(), FILE_READ);
+  metadata.complete = static_cast<bool>(input);
+  metadata.all_times_trusted = true;
+  metadata.closed = true;
+  if (input) {
+    metadata.payload_bytes = input.size();
+  }
+  while (metadata.complete && input && input.available() > 0) {
+    std::string line;
+    bool newline = false;
+    while (input.available() > 0 && line.size() <= 8192U) {
+      const char value = static_cast<char>(input.read());
+      line.push_back(value);
+      if (value == '\n') {
+        newline = true;
+        break;
+      }
+    }
+    std::string payload;
+    std::uint32_t checksum = 0;
+    JsonDocument document;
+    if (!newline || !record::decodeEnvelope(line, payload, checksum) ||
+        deserializeJson(document, payload) ||
+        !document["sequence"].is<std::uint64_t>()) {
+      metadata.complete = false;
+      break;
+    }
+    const std::uint64_t sequence =
+        document["sequence"].as<std::uint64_t>();
+    const std::uint64_t start = document["start_utc_ms"] | 0ULL;
+    const std::uint64_t end = document["end_utc_ms"] | 0ULL;
+    metadata.first_sequence = metadata.first_sequence == 0U
+                                  ? sequence
+                                  : std::min(metadata.first_sequence, sequence);
+    metadata.last_sequence = std::max(metadata.last_sequence, sequence);
+    if (start != 0U) {
+      metadata.first_utc_ms = metadata.first_utc_ms == 0U
+                                  ? start
+                                  : std::min(metadata.first_utc_ms, start);
+    }
+    metadata.last_utc_ms = std::max(metadata.last_utc_ms, end);
+    metadata.all_times_trusted =
+        metadata.all_times_trusted && (document["time_trusted"] | false);
+    metadata.integrity_crc ^= checksum;
+    ++metadata.record_count;
+    if (metadata.record_count % kCooperativeScanRecords == 0U) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+  if (input) {
+    input.close();
+  }
+  metadata.complete = metadata.complete && metadata.record_count > 0U;
+
+  File index = metadata.index_path.empty()
+                   ? File{}
+                   : SD.open(metadata.index_path.c_str(), FILE_READ);
+  std::uint32_t index_count = 0U;
+  std::uint64_t index_first = 0U;
+  std::uint64_t index_last = 0U;
+  bool index_well_formed = static_cast<bool>(index);
+  if (index) {
+    metadata.index_bytes = index.size();
+  }
+  while (index_well_formed && index && index.available() > 0) {
+    const String raw = index.readStringUntil('\n');
+    unsigned long long sequence = 0U;
+    unsigned long long timestamp = 0U;
+    unsigned long long offset = 0U;
+    unsigned checksum = 0U;
+    if (std::sscanf(raw.c_str(), "%llu,%llu,%llu,%x", &sequence, &timestamp,
+                    &offset, &checksum) != 4) {
+      index_well_formed = false;
+      break;
+    }
+    const std::uint64_t value = static_cast<std::uint64_t>(sequence);
+    index_first = index_first == 0U ? value : std::min(index_first, value);
+    index_last = std::max(index_last, value);
+    ++index_count;
+  }
+  if (index) {
+    index.close();
+  }
+  metadata.index_valid = index_well_formed && index_count == metadata.record_count &&
+                         index_first == metadata.first_sequence &&
+                         index_last == metadata.last_sequence;
+  return metadata;
+}
+
+SegmentMetadata SdStorage::inspectEventSegment(const std::string &path) const {
+  SegmentMetadata metadata;
+  metadata.record_path = path;
+  metadata.index_valid = true;
+  metadata.all_times_trusted = true;
+  metadata.closed = true;
+  File input = SD.open(path.c_str(), FILE_READ);
+  metadata.complete = static_cast<bool>(input);
+  if (input) {
+    metadata.payload_bytes = input.size();
+  }
+  while (metadata.complete && input && input.available() > 0) {
+    const String raw = input.readStringUntil('\n');
+    std::string payload;
+    std::uint32_t checksum = 0U;
+    JsonDocument document;
+    if (!record::decodeEnvelope(raw.c_str(), payload, checksum) ||
+        deserializeJson(document, payload) ||
+        !document["event_sequence"].is<std::uint64_t>()) {
+      metadata.complete = false;
+      break;
+    }
+    const std::uint64_t sequence =
+        document["event_sequence"].as<std::uint64_t>();
+    const std::uint64_t timestamp = document["timestamp_utc_ms"] | 0ULL;
+    metadata.first_sequence = metadata.first_sequence == 0U
+                                  ? sequence
+                                  : std::min(metadata.first_sequence, sequence);
+    metadata.last_sequence = std::max(metadata.last_sequence, sequence);
+    if (timestamp != 0U) {
+      metadata.first_utc_ms = metadata.first_utc_ms == 0U
+                                  ? timestamp
+                                  : std::min(metadata.first_utc_ms, timestamp);
+    }
+    metadata.last_utc_ms = std::max(metadata.last_utc_ms, timestamp);
+    metadata.all_times_trusted =
+        metadata.all_times_trusted && timestamp != 0U;
+    metadata.integrity_crc ^= checksum;
+    ++metadata.record_count;
+  }
+  if (input) {
+    input.close();
+  }
+  metadata.complete = metadata.complete && metadata.record_count > 0U;
+  return metadata;
+}
+
+bool SdStorage::loadSegmentMetadata(const std::string &path,
+                                    const bool event_segment,
+                                    SegmentMetadata &metadata) const {
+  const std::string stored_path = metadataPath(path);
+  File input = SD.open(stored_path.c_str(), FILE_READ);
+  const String raw = input ? input.readStringUntil('\n') : String{};
+  if (input) {
+    input.close();
+  }
+  std::string payload;
+  std::uint32_t checksum = 0U;
+  JsonDocument document;
+  if (!record::decodeEnvelope(raw.c_str(), payload, checksum) ||
+      deserializeJson(document, payload) ||
+      (document["schema_version"] | 0) != 1 ||
+      (document["record_path"] | "") != path ||
+      !(document["closed"] | false) ||
+      !(document["complete"] | false)) {
     return false;
-  PM_LOG_INFO("SD", "RETENTION_BEGIN",
-              "server_ack_sequence=%llu now_utc_ms=%llu retention_days=%u",
-              static_cast<unsigned long long>(server_ack_sequence),
-              static_cast<unsigned long long>(now_utc_ms),
-              static_cast<unsigned>(retention_days));
-  if (!health_.mounted || retention_days == 0 || now_utc_ms == 0) {
+  }
+
+  const std::string expected_index =
+      event_segment ? std::string{} : pairedIndexPath(path);
+  if ((document["index_path"] | "") != expected_index) {
+    return false;
+  }
+  File record_file = SD.open(path.c_str(), FILE_READ);
+  if (!record_file) {
+    return false;
+  }
+  const std::uint64_t record_size = record_file.size();
+  record_file.close();
+  const std::uint64_t stored_record_size = document["payload_bytes"] | 0ULL;
+  if (stored_record_size == 0U || record_size != stored_record_size) {
+    return false;
+  }
+
+  std::uint64_t index_size = 0U;
+  if (!event_segment) {
+    File index_file = SD.open(expected_index.c_str(), FILE_READ);
+    if (!index_file) {
+      return false;
+    }
+    index_size = index_file.size();
+    index_file.close();
+    if (!(document["index_valid"] | false) ||
+        index_size != (document["index_bytes"] | 0ULL)) {
+      return false;
+    }
+  }
+
+  metadata.record_path = path;
+  metadata.index_path = expected_index;
+  metadata.first_sequence = document["first_sequence"] | 0ULL;
+  metadata.last_sequence = document["last_sequence"] | 0ULL;
+  metadata.first_utc_ms = document["first_utc_ms"] | 0ULL;
+  metadata.last_utc_ms = document["last_utc_ms"] | 0ULL;
+  metadata.payload_bytes = stored_record_size;
+  metadata.index_bytes = index_size;
+  metadata.record_count = document["record_count"] | 0U;
+  metadata.integrity_crc = document["integrity_crc"] | 0U;
+  metadata.all_times_trusted = document["all_times_trusted"] | false;
+  metadata.complete = true;
+  metadata.index_valid = event_segment || (document["index_valid"] | false);
+  metadata.closed = true;
+  return metadata.record_count > 0U && metadata.first_sequence > 0U &&
+         metadata.last_sequence >= metadata.first_sequence;
+}
+
+std::string SdStorage::metadataPath(const std::string &record_path) const {
+  return std::string("/POWERMON/state/segments/") + pathToken(record_path) +
+         ".json";
+}
+
+bool SdStorage::persistSegmentMetadata(
+    const SegmentMetadata &metadata) const {
+  JsonDocument document;
+  document["schema_version"] = 1;
+  document["record_path"] = metadata.record_path;
+  document["index_path"] = metadata.index_path;
+  document["first_sequence"] = metadata.first_sequence;
+  document["last_sequence"] = metadata.last_sequence;
+  document["first_utc_ms"] = metadata.first_utc_ms;
+  document["last_utc_ms"] = metadata.last_utc_ms;
+  document["payload_bytes"] = metadata.payload_bytes;
+  document["index_bytes"] = metadata.index_bytes;
+  document["record_count"] = metadata.record_count;
+  document["integrity_crc"] = metadata.integrity_crc;
+  document["all_times_trusted"] = metadata.all_times_trusted;
+  document["complete"] = metadata.complete;
+  document["index_valid"] = metadata.index_valid;
+  document["closed"] = metadata.closed;
+  std::string payload;
+  serializeJson(document, payload);
+  const std::string envelope = record::encodeEnvelope(payload);
+  const std::string target = metadataPath(metadata.record_path);
+  const std::string temporary = target + ".tmp";
+  SD.remove(temporary.c_str());
+  File output = SD.open(temporary.c_str(), FILE_WRITE);
+  const bool written =
+      output &&
+      output.write(reinterpret_cast<const std::uint8_t *>(envelope.data()),
+                   envelope.size()) == envelope.size();
+  if (output) {
+    output.flush();
+    output.close();
+  }
+  if (!written) {
+    SD.remove(temporary.c_str());
+    return false;
+  }
+  File verify = SD.open(temporary.c_str(), FILE_READ);
+  const String raw = verify ? verify.readStringUntil('\n') : String{};
+  if (verify) {
+    verify.close();
+  }
+  std::string verified_payload;
+  std::uint32_t checksum = 0U;
+  if (!record::decodeEnvelope(raw.c_str(), verified_payload, checksum) ||
+      verified_payload != payload) {
+    SD.remove(temporary.c_str());
+    return false;
+  }
+  SD.remove(target.c_str());
+  return SD.rename(temporary.c_str(), target.c_str());
+}
+
+bool SdStorage::persistCleanupJournal(
+    const SegmentMetadata &metadata, const std::string &record_trash,
+    const std::string &index_trash, const std::uint64_t server_ack_sequence,
+    const std::uint64_t now_utc_ms, const std::string &reason,
+    const char *stage) const {
+  JsonDocument document;
+  document["schema_version"] = 1;
+  document["stage"] = stage;
+  document["record_path"] = metadata.record_path;
+  document["index_path"] = metadata.index_path;
+  document["record_trash"] = record_trash;
+  document["index_trash"] = index_trash;
+  document["first_sequence"] = metadata.first_sequence;
+  document["last_sequence"] = metadata.last_sequence;
+  document["server_ack_sequence"] = server_ack_sequence;
+  document["started_utc_ms"] = now_utc_ms;
+  document["reason"] = reason;
+  std::string payload;
+  serializeJson(document, payload);
+  const std::string envelope = record::encodeEnvelope(payload);
+  const std::string temporary = std::string(kCleanupJournalPath) + ".tmp";
+  SD.remove(temporary.c_str());
+  File output = SD.open(temporary.c_str(), FILE_WRITE);
+  const bool written =
+      output &&
+      output.write(reinterpret_cast<const std::uint8_t *>(envelope.data()),
+                   envelope.size()) == envelope.size();
+  if (output) {
+    output.flush();
+    output.close();
+  }
+  if (!written) {
+    SD.remove(temporary.c_str());
+    return false;
+  }
+  SD.remove(kCleanupJournalPath);
+  return SD.rename(temporary.c_str(), kCleanupJournalPath);
+}
+
+bool SdStorage::clearCleanupJournal() const {
+  const std::string temporary = std::string(kCleanupJournalPath) + ".tmp";
+  const bool target_ok = !SD.exists(kCleanupJournalPath) ||
+                         SD.remove(kCleanupJournalPath);
+  const bool temporary_ok = !SD.exists(temporary.c_str()) ||
+                            SD.remove(temporary.c_str());
+  return target_ok && temporary_ok;
+}
+
+bool SdStorage::recoverCleanupJournal() {
+  const auto recover_atomic_temp = [](const std::string &target) {
+    const std::string temporary = target + ".tmp";
+    if (!SD.exists(temporary.c_str())) {
+      return true;
+    }
+    if (SD.exists(target.c_str())) {
+      return SD.remove(temporary.c_str());
+    }
+    return SD.rename(temporary.c_str(), target.c_str());
+  };
+  bool temporary_recovery_ok =
+      recover_atomic_temp("/POWERMON/state/sequence.journal") &&
+      recover_atomic_temp("/POWERMON/state/event-sequence.journal") &&
+      recover_atomic_temp(kCleanupJournalPath);
+  std::vector<std::string> metadata_temps;
+  collectFiles("/POWERMON/state/segments", ".tmp", metadata_temps);
+  for (const auto &temporary : metadata_temps) {
+    const std::string target =
+        temporary.substr(0U, temporary.size() - std::strlen(".tmp"));
+    temporary_recovery_ok =
+        (SD.exists(target.c_str()) ? SD.remove(temporary.c_str())
+                                  : SD.rename(temporary.c_str(), target.c_str())) &&
+        temporary_recovery_ok;
+  }
+  std::vector<std::string> repair_temps;
+  collectFiles("/POWERMON/records", ".repair", repair_temps);
+  for (const auto &temporary : repair_temps) {
+    const std::string target =
+        temporary.substr(0U, temporary.size() - std::strlen(".repair"));
+    temporary_recovery_ok =
+        (SD.exists(target.c_str()) ? SD.remove(temporary.c_str())
+                                  : SD.rename(temporary.c_str(), target.c_str())) &&
+        temporary_recovery_ok;
+  }
+  if (!temporary_recovery_ok) {
+    health_.last_error = "temporary_artifact_recovery_failed";
+    health_.pressure_state = storagePressureStateName(StoragePressureState::ReadOnly);
+    return false;
+  }
+  if (!SD.exists(kCleanupJournalPath)) {
+    health_.cleanup_recovery_required = false;
+    return true;
+  }
+  health_.cleanup_recovery_required = true;
+  health_.pressure_state = storagePressureStateName(
+      StoragePressureState::CleanupRecovering);
+  File input = SD.open(kCleanupJournalPath, FILE_READ);
+  const String raw = input ? input.readStringUntil('\n') : String{};
+  if (input) {
+    input.close();
+  }
+  std::string payload;
+  std::uint32_t checksum = 0U;
+  JsonDocument document;
+  if (!record::decodeEnvelope(raw.c_str(), payload, checksum) ||
+      deserializeJson(document, payload)) {
+    health_.last_error = "cleanup_journal_invalid";
+    health_.pressure_state = storagePressureStateName(StoragePressureState::ReadOnly);
+    PM_LOG_ERROR("SD", "CLEANUP_RECOVERY_BLOCKED",
+                 "error=PM-SD-020 reason=journal_invalid action=preserve_all_files");
+    return false;
+  }
+  const std::string stage = document["stage"] | "";
+  const std::string record_path = document["record_path"] | "";
+  const std::string index_path = document["index_path"] | "";
+  const std::string record_trash = document["record_trash"] | "";
+  const std::string index_trash = document["index_trash"] | "";
+  const bool event_segment =
+      record_path.rfind("/POWERMON/events/", 0U) == 0U;
+  const bool paths_safe =
+      (record_path.rfind("/POWERMON/records/", 0U) == 0U || event_segment) &&
+      ((event_segment && index_path.empty() && index_trash.empty()) ||
+       (index_path.rfind("/POWERMON/indexes/", 0U) == 0U &&
+        index_trash.rfind(kCleanupTrashDirectory, 0U) == 0U)) &&
+      record_trash.rfind(kCleanupTrashDirectory, 0U) == 0U &&
+      !record_trash.empty();
+  if (!paths_safe) {
+    health_.last_error = "cleanup_journal_path_invalid";
+    health_.pressure_state = storagePressureStateName(StoragePressureState::ReadOnly);
+    PM_LOG_ERROR("SD", "CLEANUP_RECOVERY_BLOCKED",
+                 "error=PM-SD-020 reason=unsafe_path action=preserve_all_files");
+    return false;
+  }
+
+  const CleanupRecoverySnapshot snapshot{
+      stage,
+      !index_path.empty(),
+      SD.exists(record_path.c_str()),
+      SD.exists(record_trash.c_str()),
+      !index_path.empty() && SD.exists(index_path.c_str()),
+      !index_trash.empty() && SD.exists(index_trash.c_str()),
+  };
+  const CleanupRecoveryAction action = cleanupRecoveryAction(snapshot);
+  bool ok = action != CleanupRecoveryAction::Block;
+  if (action == CleanupRecoveryAction::ReverseMoves) {
+    if (snapshot.record_trash_exists) {
+      ok = SD.rename(record_trash.c_str(), record_path.c_str()) && ok;
+    }
+    if (snapshot.has_index && snapshot.index_trash_exists) {
+      ok = SD.rename(index_trash.c_str(), index_path.c_str()) && ok;
+    }
+  } else if (action == CleanupRecoveryAction::ForwardDelete) {
+    if (snapshot.record_trash_exists) {
+      ok = SD.remove(record_trash.c_str()) && ok;
+    }
+    if (snapshot.has_index && snapshot.index_trash_exists) {
+      ok = SD.remove(index_trash.c_str()) && ok;
+    }
+  }
+  if (ok) {
+    ok = clearCleanupJournal();
+  }
+  health_.cleanup_recovery_required = !ok;
+  health_.last_cleanup_result = ok ? "recovered" : "recovery_blocked";
+  if (!ok) {
+    health_.last_error = "cleanup_recovery_failed";
+    health_.pressure_state = storagePressureStateName(StoragePressureState::ReadOnly);
+  }
+  PM_LOG_INFO("SD", "CLEANUP_RECOVERY_COMPLETE",
+              "result=%s stage=%s", ok ? "success" : "blocked",
+              stage.c_str());
+  return ok;
+}
+
+bool SdStorage::removeSegmentTransactionally(
+    const SegmentMetadata &metadata, const std::uint64_t server_ack_sequence,
+    const std::uint64_t now_utc_ms, const std::string &reason) {
+  const std::string token = pathToken(metadata.record_path);
+  const std::string record_trash =
+      std::string(kCleanupTrashDirectory) + "/" + token + ".pmr.trash";
+  const std::string index_trash =
+      metadata.index_path.empty()
+          ? std::string{}
+          : std::string(kCleanupTrashDirectory) + "/" + token + ".idx.trash";
+  const bool has_index = !metadata.index_path.empty();
+  PM_LOG_INFO(
+      "STORAGE", "storage.cleanup_candidate_verified",
+      "transaction_id=%s first_sequence=%llu last_sequence=%llu "
+      "server_ack=%llu expected_bytes=%llu reason=%s",
+      token.c_str(), static_cast<unsigned long long>(metadata.first_sequence),
+      static_cast<unsigned long long>(metadata.last_sequence),
+      static_cast<unsigned long long>(server_ack_sequence),
+      static_cast<unsigned long long>(metadata.payload_bytes +
+                                      metadata.index_bytes),
+      reason.c_str());
+  if (!SD.exists(metadata.record_path.c_str()) ||
+      (has_index && !SD.exists(metadata.index_path.c_str())) ||
+      SD.exists(record_trash.c_str()) ||
+      (has_index && SD.exists(index_trash.c_str())) ||
+      !persistCleanupJournal(metadata, record_trash, index_trash,
+                             server_ack_sequence, now_utc_ms, reason,
+                             "planned")) {
+    return false;
+  }
+  const bool record_moved =
+      SD.rename(metadata.record_path.c_str(), record_trash.c_str());
+  const bool index_moved =
+      record_moved &&
+      (!has_index ||
+       SD.rename(metadata.index_path.c_str(), index_trash.c_str()));
+  if (!record_moved || !index_moved) {
+    recoverCleanupJournal();
+    return false;
+  }
+  PM_LOG_INFO(
+      "STORAGE", "storage.cleanup_segment_staged",
+      "transaction_id=%s first_sequence=%llu last_sequence=%llu",
+      token.c_str(), static_cast<unsigned long long>(metadata.first_sequence),
+      static_cast<unsigned long long>(metadata.last_sequence));
+  if (!persistCleanupJournal(metadata, record_trash, index_trash,
+                             server_ack_sequence, now_utc_ms, reason,
+                             "files_moved")) {
+    recoverCleanupJournal();
+    return false;
+  }
+  if (!SD.remove(record_trash.c_str()) ||
+      !persistCleanupJournal(metadata, record_trash, index_trash,
+                             server_ack_sequence, now_utc_ms, reason,
+                             "record_deleted") ||
+      (has_index && !SD.remove(index_trash.c_str()))) {
+    health_.cleanup_recovery_required = true;
+    return false;
+  }
+  SD.remove(metadataPath(metadata.record_path).c_str());
+  if (!persistCleanupJournal(metadata, record_trash, index_trash,
+                             server_ack_sequence, now_utc_ms, reason,
+                             "complete")) {
+    health_.cleanup_recovery_required = true;
+    return false;
+  }
+  const bool cleared = clearCleanupJournal();
+  if (cleared) {
+    PM_LOG_INFO(
+        "STORAGE", "storage.cleanup_segment_removed",
+        "transaction_id=%s first_sequence=%llu last_sequence=%llu",
+        token.c_str(), static_cast<unsigned long long>(metadata.first_sequence),
+        static_cast<unsigned long long>(metadata.last_sequence));
+  }
+  return cleared;
+}
+
+bool SdStorage::applyRetention(
+    const std::uint64_t server_ack_sequence,
+    const bool acknowledgement_verified,
+    const std::uint64_t event_ack_sequence,
+    const std::uint64_t now_utc_ms, const StoragePolicy &policy,
+    const std::string &reason) {
+  if (!lock()) {
+    return false;
+  }
+  active_policy_ = policy;
+  health_.server_ack_sequence = server_ack_sequence;
+  health_.event_ack_sequence = event_ack_sequence;
+  health_.acknowledgement_verified = acknowledgement_verified;
+  updateCapacity();
+  PM_LOG_INFO(
+      "SD", "RETENTION_BEGIN",
+      "mode=%s reason=%s server_ack_sequence=%llu ack_verified=%s "
+      "event_ack_sequence=%llu free=%llu capacity=%llu",
+      retentionModeName(policy.mode), reason.c_str(),
+      static_cast<unsigned long long>(server_ack_sequence),
+      acknowledgement_verified ? "true" : "false",
+      static_cast<unsigned long long>(event_ack_sequence),
+      static_cast<unsigned long long>(health_.free_bytes),
+      static_cast<unsigned long long>(health_.capacity_bytes));
+  if (!health_.mounted || !validateStoragePolicy(policy).valid) {
+    health_.last_cleanup_result = "invalid_request";
+    health_.last_cleanup_reason = reason;
     unlock();
     return false;
   }
-  const std::uint64_t retention_ms =
-      static_cast<std::uint64_t>(retention_days) * 86'400'000ULL;
-  const std::uint64_t cutoff =
-      now_utc_ms > retention_ms ? now_utc_ms - retention_ms : 0;
+
   std::vector<std::string> files;
   collectFiles("/POWERMON/records", ".pmr", files);
-  bool ok = true;
-  bool removed = false;
+  std::vector<SegmentMetadata> segments;
+  segments.reserve(files.size());
+  std::vector<bool> segment_metadata_loaded;
+  segment_metadata_loaded.reserve(files.size());
+  std::uint64_t newest_sequence = 0U;
   for (const auto &path : files) {
-    File input = SD.open(path.c_str(), FILE_READ);
-    bool complete = static_cast<bool>(input);
-    bool trusted = true;
-    std::uint64_t newest_sequence = 0;
-    std::uint64_t newest_utc_ms = 0;
-    while (complete && input.available() > 0) {
-      std::string line;
-      while (input.available() > 0 && line.size() <= 8192) {
-        const char value = static_cast<char>(input.read());
-        line.push_back(value);
-        if (value == '\n')
-          break;
-      }
-      std::string payload;
-      std::uint32_t checksum = 0;
-      JsonDocument document;
-      if (!record::decodeEnvelope(line, payload, checksum) ||
-          deserializeJson(document, payload)) {
-        complete = false;
-        break;
-      }
-      newest_sequence =
-          std::max(newest_sequence, document["sequence"].as<std::uint64_t>());
-      newest_utc_ms =
-          std::max(newest_utc_ms, document["end_utc_ms"].as<std::uint64_t>());
-      trusted = trusted && (document["time_trusted"] | false);
+    SegmentMetadata metadata;
+    const bool loaded = loadSegmentMetadata(path, false, metadata);
+    if (!loaded) {
+      metadata = inspectSegment(path);
     }
-    if (input)
-      input.close();
-    if (!retentionEligible(complete, trusted, newest_sequence,
-                           server_ack_sequence, newest_utc_ms, cutoff)) {
-      continue;
-    }
-    std::string index_path = path;
-    const std::size_t records_pos = index_path.find("/records/");
-    if (records_pos != std::string::npos) {
-      index_path.replace(records_pos, 9, "/indexes/");
-      index_path.replace(index_path.size() - 4, 4, ".idx");
-    }
-    const bool record_removed = SD.remove(path.c_str());
-    const bool index_removed =
-        !SD.exists(index_path.c_str()) || SD.remove(index_path.c_str());
-    ok = record_removed && index_removed && ok;
-    removed = record_removed || removed;
+    newest_sequence = std::max(newest_sequence, metadata.last_sequence);
+    segments.push_back(std::move(metadata));
+    segment_metadata_loaded.push_back(loaded);
   }
-  if (removed) {
+  for (std::size_t index = 0; index < segments.size(); ++index) {
+    auto &metadata = segments[index];
+    metadata.active = metadata.record_path == health_.current_file ||
+                      (newest_sequence != 0U &&
+                       metadata.last_sequence == newest_sequence);
+    metadata.closed = !metadata.active;
+    const bool metadata_unchanged =
+        segment_metadata_loaded[index] && metadata.closed;
+    if (!metadata_unchanged && !persistSegmentMetadata(metadata)) {
+      PM_LOG_WARN("SD", "SEGMENT_METADATA_PERSIST_FAILED",
+                  "file=%s deletion_protected=true",
+                  metadata.record_path.c_str());
+      metadata.complete = false;
+    }
+  }
+  health_.open_segment_count = 0U;
+  health_.closed_segment_count = 0U;
+  health_.untrusted_segment_count = 0U;
+  for (const auto &metadata : segments) {
+    if (metadata.active) {
+      ++health_.open_segment_count;
+    } else {
+      ++health_.closed_segment_count;
+    }
+    if (!metadata.all_times_trusted) {
+      ++health_.untrusted_segment_count;
+    }
+  }
+  // Time-untrusted files cannot use an age window. Preserve the two newest
+  // closed files as a bounded sequence/file window even during emergency
+  // continuous cleanup.
+  std::vector<std::size_t> by_newest_sequence(segments.size());
+  std::iota(by_newest_sequence.begin(), by_newest_sequence.end(), 0U);
+  std::sort(by_newest_sequence.begin(), by_newest_sequence.end(),
+            [&segments](const std::size_t left, const std::size_t right) {
+              return segments[left].last_sequence >
+                     segments[right].last_sequence;
+            });
+  std::size_t protected_closed = 0U;
+  for (const std::size_t index : by_newest_sequence) {
+    if (!segments[index].active && protected_closed < 2U) {
+      segments[index].minimum_window_protected = true;
+      ++protected_closed;
+    }
+  }
+
+  const std::uint64_t retention_ms =
+      static_cast<std::uint64_t>(policy.retention_days) * 86'400'000ULL;
+  const std::uint64_t minimum_ms =
+      static_cast<std::uint64_t>(policy.minimum_local_history_days) *
+      86'400'000ULL;
+  const StoragePressureState pressure = classifyStoragePressure(
+      health_.capacity_bytes, health_.free_bytes, policy);
+  RetentionContext context;
+  context.mode = policy.mode;
+  context.emergency_pressure =
+      pressure == StoragePressureState::Critical ||
+      pressure == StoragePressureState::Emergency ||
+      pressure == StoragePressureState::Full;
+  context.acknowledgement_verified = acknowledgement_verified;
+  context.server_ack_sequence = server_ack_sequence;
+  context.retention_cutoff_utc_ms =
+      now_utc_ms > retention_ms ? now_utc_ms - retention_ms : 0U;
+  context.minimum_history_cutoff_utc_ms =
+      now_utc_ms > minimum_ms ? now_utc_ms - minimum_ms : 0U;
+  const std::uint64_t target = cleanupTargetFreeBytes(
+      health_.capacity_bytes, policy);
+  CleanupPlan plan = buildCleanupPlan(segments, context, health_.free_bytes,
+                                      context.emergency_pressure ? target : 0U);
+  health_.segment_count = static_cast<std::uint32_t>(segments.size());
+  health_.eligible_segment_count =
+      static_cast<std::uint32_t>(plan.candidate_indexes.size());
+  health_.protected_unacknowledged_bytes =
+      plan.protected_unacknowledged_bytes;
+  health_.protected_untrusted_bytes = plan.protected_untrusted_bytes;
+  health_.reclaimable_bytes = plan.eligible_bytes;
+  health_.protected_segment_count = 0U;
+  for (const auto &metadata : segments) {
+    const SegmentEligibility eligibility = segmentEligibility(metadata, context);
+    if (eligibility != SegmentEligibility::EligibleAge &&
+        eligibility != SegmentEligibility::EligibleEmergency) {
+      ++health_.protected_segment_count;
+    }
+  }
+
+  bool ok = true;
+  std::uint64_t reclaimed = 0U;
+  health_.cleanup_in_progress =
+      policy.mode != RetentionMode::Disabled &&
+      !plan.candidate_indexes.empty();
+  if (health_.cleanup_in_progress) {
+    health_.pressure_state =
+        storagePressureStateName(StoragePressureState::CleanupRunning);
+    PM_LOG_INFO("STORAGE", "storage.cleanup_started",
+                "reason=%s candidates=%u target_free_bytes=%llu",
+                reason.c_str(),
+                static_cast<unsigned>(plan.candidate_indexes.size()),
+                static_cast<unsigned long long>(target));
+  }
+  for (const std::size_t index : plan.candidate_indexes) {
+    if (policy.mode == RetentionMode::Disabled || index >= segments.size()) {
+      break;
+    }
+    const SegmentMetadata &metadata = segments[index];
+    SegmentMetadata verified = inspectSegment(metadata.record_path);
+    verified.active = metadata.active;
+    verified.closed = metadata.closed;
+    verified.cleanup_active = metadata.cleanup_active;
+    verified.minimum_window_protected = metadata.minimum_window_protected;
+    const bool metadata_matches =
+        verified.first_sequence == metadata.first_sequence &&
+        verified.last_sequence == metadata.last_sequence &&
+        verified.payload_bytes == metadata.payload_bytes &&
+        verified.index_bytes == metadata.index_bytes &&
+        verified.record_count == metadata.record_count &&
+        verified.integrity_crc == metadata.integrity_crc;
+    const SegmentEligibility eligibility =
+        metadata_matches ? segmentEligibility(verified, context)
+                         : SegmentEligibility::CorruptOrMissingIndex;
+    if (eligibility != SegmentEligibility::EligibleAge &&
+        eligibility != SegmentEligibility::EligibleEmergency) {
+      ok = false;
+      health_.last_error = metadata_matches
+                               ? "cleanup_eligibility_changed"
+                               : "cleanup_candidate_integrity_changed";
+      PM_LOG_ERROR(
+          "STORAGE", "storage.cleanup_candidate_rejected",
+          "first_sequence=%llu last_sequence=%llu reason=%s",
+          static_cast<unsigned long long>(metadata.first_sequence),
+          static_cast<unsigned long long>(metadata.last_sequence),
+          health_.last_error.c_str());
+      break;
+    }
+    const std::uint64_t before = health_.free_bytes;
+    if (!removeSegmentTransactionally(verified, server_ack_sequence,
+                                      now_utc_ms, reason)) {
+      ok = false;
+      health_.last_error = "cleanup_transaction_failed";
+      break;
+    }
+    updateCapacity();
+    const std::uint64_t actual = health_.free_bytes > before
+                                     ? health_.free_bytes - before
+                                     : metadata.payload_bytes +
+                                           metadata.index_bytes;
+    reclaimed += actual;
+    growth_estimator_.recordCleanup(actual);
+  }
+
+  // Event evidence has its own acknowledgement cursor and age window. It is
+  // never made eligible merely because reading data was acknowledged.
+  std::vector<std::string> event_files;
+  collectFiles("/POWERMON/events", ".events", event_files);
+  std::vector<SegmentMetadata> event_segments;
+  event_segments.reserve(event_files.size());
+  std::vector<bool> event_metadata_loaded;
+  event_metadata_loaded.reserve(event_files.size());
+  std::uint64_t newest_event_sequence = 0U;
+  for (const auto &path : event_files) {
+    SegmentMetadata metadata;
+    const bool loaded = loadSegmentMetadata(path, true, metadata);
+    if (!loaded) {
+      metadata = inspectEventSegment(path);
+    }
+    newest_event_sequence =
+        std::max(newest_event_sequence, metadata.last_sequence);
+    event_segments.push_back(std::move(metadata));
+    event_metadata_loaded.push_back(loaded);
+  }
+  for (std::size_t index = 0; index < event_segments.size(); ++index) {
+    auto &metadata = event_segments[index];
+    metadata.active = newest_event_sequence != 0U &&
+                      metadata.last_sequence == newest_event_sequence;
+    metadata.closed = !metadata.active;
+    const bool metadata_unchanged =
+        event_metadata_loaded[index] && metadata.closed;
+    if (!metadata_unchanged && !persistSegmentMetadata(metadata)) {
+      metadata.complete = false;
+    }
+  }
+  health_.event_segment_count =
+      static_cast<std::uint32_t>(event_segments.size());
+  std::vector<std::size_t> event_by_newest(event_segments.size());
+  std::iota(event_by_newest.begin(), event_by_newest.end(), 0U);
+  std::sort(event_by_newest.begin(), event_by_newest.end(),
+            [&event_segments](const std::size_t left,
+                              const std::size_t right) {
+              return event_segments[left].last_sequence >
+                     event_segments[right].last_sequence;
+            });
+  protected_closed = 0U;
+  for (const std::size_t index : event_by_newest) {
+    if (!event_segments[index].active && protected_closed < 2U) {
+      event_segments[index].minimum_window_protected = true;
+      ++protected_closed;
+    }
+  }
+  RetentionContext event_context = context;
+  event_context.acknowledgement_verified = event_ack_sequence > 0U;
+  event_context.server_ack_sequence = event_ack_sequence;
+  const std::uint64_t event_retention_ms =
+      static_cast<std::uint64_t>(policy.event_retention_days) *
+      86'400'000ULL;
+  event_context.retention_cutoff_utc_ms =
+      now_utc_ms > event_retention_ms ? now_utc_ms - event_retention_ms : 0U;
+  const CleanupPlan event_plan =
+      buildCleanupPlan(event_segments, event_context, health_.free_bytes,
+                       context.emergency_pressure ? target : 0U);
+  health_.segment_count +=
+      static_cast<std::uint32_t>(event_segments.size());
+  health_.eligible_segment_count +=
+      static_cast<std::uint32_t>(event_plan.candidate_indexes.size());
+  health_.reclaimable_bytes += event_plan.eligible_bytes;
+  health_.protected_unacknowledged_bytes +=
+      event_plan.protected_unacknowledged_bytes;
+  health_.protected_untrusted_bytes +=
+      event_plan.protected_untrusted_bytes;
+  for (const auto &metadata : event_segments) {
+    const SegmentEligibility eligibility =
+        segmentEligibility(metadata, event_context);
+    if (eligibility != SegmentEligibility::EligibleAge &&
+        eligibility != SegmentEligibility::EligibleEmergency) {
+      ++health_.protected_segment_count;
+    }
+  }
+  for (const std::size_t index : event_plan.candidate_indexes) {
+    if (!ok || policy.mode == RetentionMode::Disabled ||
+        index >= event_segments.size()) {
+      break;
+    }
+    const SegmentMetadata &metadata = event_segments[index];
+    SegmentMetadata verified = inspectEventSegment(metadata.record_path);
+    verified.active = metadata.active;
+    verified.closed = metadata.closed;
+    verified.cleanup_active = metadata.cleanup_active;
+    verified.minimum_window_protected = metadata.minimum_window_protected;
+    const bool metadata_matches =
+        verified.first_sequence == metadata.first_sequence &&
+        verified.last_sequence == metadata.last_sequence &&
+        verified.payload_bytes == metadata.payload_bytes &&
+        verified.record_count == metadata.record_count &&
+        verified.integrity_crc == metadata.integrity_crc;
+    const SegmentEligibility eligibility =
+        metadata_matches ? segmentEligibility(verified, event_context)
+                         : SegmentEligibility::CorruptOrMissingIndex;
+    if (eligibility != SegmentEligibility::EligibleAge &&
+        eligibility != SegmentEligibility::EligibleEmergency) {
+      ok = false;
+      health_.last_error = metadata_matches
+                               ? "event_cleanup_eligibility_changed"
+                               : "event_cleanup_candidate_integrity_changed";
+      PM_LOG_ERROR(
+          "STORAGE", "storage.cleanup_event_candidate_rejected",
+          "first_event_sequence=%llu last_event_sequence=%llu reason=%s",
+          static_cast<unsigned long long>(metadata.first_sequence),
+          static_cast<unsigned long long>(metadata.last_sequence),
+          health_.last_error.c_str());
+      break;
+    }
+    const std::uint64_t before = health_.free_bytes;
+    if (!removeSegmentTransactionally(verified, event_ack_sequence,
+                                      now_utc_ms, reason + "_events")) {
+      ok = false;
+      health_.last_error = "event_cleanup_transaction_failed";
+      break;
+    }
+    updateCapacity();
+    const std::uint64_t actual =
+        health_.free_bytes > before ? health_.free_bytes - before
+                                    : metadata.payload_bytes;
+    reclaimed += actual;
+    growth_estimator_.recordCleanup(actual);
+  }
+  cleanupTemporaryArtifacts(now_utc_ms);
+  health_.cleanup_in_progress = false;
+  health_.last_cleanup_utc_ms = now_utc_ms;
+  health_.last_cleanup_reclaimed_bytes = reclaimed;
+  health_.last_cleanup_reason = reason;
+  if (policy.mode == RetentionMode::Disabled) {
+    health_.last_cleanup_result = "disabled";
+  } else if (!ok) {
+    health_.last_cleanup_result = "failed";
+  } else if (reclaimed == 0U &&
+             (plan.protected_unacknowledged_bytes +
+                  event_plan.protected_unacknowledged_bytes >
+              0U) &&
+             context.emergency_pressure) {
+    health_.last_cleanup_result = "blocked_unacknowledged";
+    health_.pressure_state = storagePressureStateName(
+        StoragePressureState::CleanupBlockedUnacknowledged);
+  } else if (reclaimed == 0U &&
+             (plan.protected_untrusted_bytes +
+                  event_plan.protected_untrusted_bytes >
+              0U)) {
+    health_.last_cleanup_result = "blocked_untrusted";
+    health_.pressure_state = storagePressureStateName(
+        StoragePressureState::CleanupBlockedUntrusted);
+  } else {
+    health_.last_cleanup_result = reclaimed == 0U ? "not_needed" : "completed";
+  }
+  if (reclaimed > 0U) {
     ok = recover() && ok;
     updateCapacity();
   }
-  PM_LOG_INFO("SD", "RETENTION_COMPLETE",
-              "result=%s removed=%s scanned_files=%u",
-              ok ? "success" : "failed", removed ? "true" : "false",
-              static_cast<unsigned>(files.size()));
+  publishHealthSnapshot(health_);
+  PM_LOG_INFO(
+      "SD", "RETENTION_COMPLETE",
+      "result=%s cleanup_result=%s scanned_segments=%u eligible=%u "
+      "reclaimed=%llu protected_unacknowledged=%llu protected_untrusted=%llu "
+      "free=%llu",
+      ok ? "success" : "failed", health_.last_cleanup_result.c_str(),
+      static_cast<unsigned>(segments.size()),
+      static_cast<unsigned>(plan.candidate_indexes.size()),
+      static_cast<unsigned long long>(reclaimed),
+      static_cast<unsigned long long>(plan.protected_unacknowledged_bytes),
+      static_cast<unsigned long long>(plan.protected_untrusted_bytes),
+      static_cast<unsigned long long>(health_.free_bytes));
+  if (health_.last_cleanup_result == "blocked_unacknowledged") {
+    PM_LOG_WARN(
+        "STORAGE", "storage.cleanup_blocked_unacknowledged",
+        "server_ack=%llu protected_bytes=%llu free_bytes=%llu reason=%s",
+        static_cast<unsigned long long>(server_ack_sequence),
+        static_cast<unsigned long long>(
+            health_.protected_unacknowledged_bytes),
+        static_cast<unsigned long long>(health_.free_bytes), reason.c_str());
+  } else if (health_.last_cleanup_result == "blocked_untrusted") {
+    PM_LOG_WARN(
+        "STORAGE", "storage.cleanup_blocked_untrusted",
+        "protected_bytes=%llu free_bytes=%llu reason=%s",
+        static_cast<unsigned long long>(health_.protected_untrusted_bytes),
+        static_cast<unsigned long long>(health_.free_bytes), reason.c_str());
+  } else if (health_.last_cleanup_result == "completed") {
+    PM_LOG_INFO(
+        "STORAGE", "storage.cleanup_completed",
+        "reclaimed_bytes=%llu free_bytes=%llu reason=%s",
+        static_cast<unsigned long long>(health_.last_cleanup_reclaimed_bytes),
+        static_cast<unsigned long long>(health_.free_bytes), reason.c_str());
+  }
   unlock();
   return ok;
 }
@@ -608,7 +1577,8 @@ bool SdStorage::prepareRemoval() {
   SD.end();
   spi_.end();
   health_.mounted = false;
-  PM_LOG_INFO("SD", "CARD_REMOVAL_READY", "buffers_flushed=true mounted=false");
+  PM_LOG_INFO("SD", "storage.card_prepared",
+              "buffers_flushed=true mounted=false power_down_required=true");
   publishHealthSnapshot(health_);
   unlock();
   return true;
@@ -665,6 +1635,7 @@ bool SdStorage::advanceSequenceFloor(
   }
   const bool persisted = persistSequence(acknowledged_sequence);
   if (persisted) {
+    const bool blank_or_replaced_card = health_.newest_sequence == 0U;
     next_sequence_ = acknowledged_sequence + 1U;
     PM_LOG_WARN(
         "SYNC", "SEQUENCE_FLOOR_ADVANCED",
@@ -673,6 +1644,17 @@ bool SdStorage::advanceSequenceFloor(
         static_cast<unsigned long long>(acknowledged_sequence),
         static_cast<unsigned long long>(health_.newest_sequence),
         static_cast<unsigned long long>(next_sequence_));
+    PM_LOG_WARN(
+        "STORAGE", "storage.sequence_floor_restored",
+        "server_ack=%llu next_sequence=%llu blank_or_replaced_card=%s",
+        static_cast<unsigned long long>(acknowledged_sequence),
+        static_cast<unsigned long long>(next_sequence_),
+        blank_or_replaced_card ? "true" : "false");
+    if (blank_or_replaced_card) {
+      PM_LOG_WARN("STORAGE", "storage.card_replaced",
+                  "sequence_continuity=restored next_sequence=%llu",
+                  static_cast<unsigned long long>(next_sequence_));
+    }
   } else {
     ++health_.write_failures;
     health_.last_error = "sequence_floor_persist_failed";
@@ -689,6 +1671,8 @@ bool SdStorage::initializeLayout() {
                                                 "/POWERMON/state",
                                                 "/POWERMON/exports",
                                                 "/POWERMON/recovery",
+                                                "/POWERMON/recovery/retention-trash",
+                                                "/POWERMON/state/segments",
                                                 "/POWERMON/records/untrusted",
                                                 "/POWERMON/indexes/untrusted",
                                                 "/POWERMON/events/untrusted"};
@@ -732,6 +1716,48 @@ bool SdStorage::recover() {
     health_.oldest_sequence = first.first_sequence;
   }
   health_.index_healthy = all_valid;
+
+  std::uint64_t maximum_event_sequence = 0U;
+  std::uint64_t minimum_event_sequence = 0U;
+  std::vector<std::string> event_files;
+  collectFiles("/POWERMON/events", ".events", event_files);
+  for (const auto &path : event_files) {
+    File event_file = SD.open(path.c_str(), FILE_READ);
+    while (event_file && event_file.available() > 0) {
+      const String raw = event_file.readStringUntil('\n');
+      std::string event_payload;
+      std::uint32_t event_checksum = 0U;
+      JsonDocument event_document;
+      if (!record::decodeEnvelope(raw.c_str(), event_payload, event_checksum) ||
+          deserializeJson(event_document, event_payload) ||
+          !event_document["event_sequence"].is<std::uint64_t>()) {
+        all_valid = false;
+        health_.last_error = "event_record_corruption_detected";
+        break;
+      }
+      const std::uint64_t sequence =
+          event_document["event_sequence"].as<std::uint64_t>();
+      minimum_event_sequence = minimum_event_sequence == 0U
+                                   ? sequence
+                                   : std::min(minimum_event_sequence, sequence);
+      maximum_event_sequence = std::max(maximum_event_sequence, sequence);
+    }
+    if (event_file) {
+      event_file.close();
+    }
+  }
+  File event_journal =
+      SD.open("/POWERMON/state/event-sequence.journal", FILE_READ);
+  std::uint64_t event_journal_sequence = 0U;
+  if (event_journal) {
+    const String value = event_journal.readStringUntil('\n');
+    event_journal_sequence = std::strtoull(value.c_str(), nullptr, 10);
+    event_journal.close();
+  }
+  next_event_sequence_ =
+      std::max(maximum_event_sequence, event_journal_sequence) + 1U;
+  health_.oldest_event_sequence = minimum_event_sequence;
+  health_.newest_event_sequence = maximum_event_sequence;
   PM_LOG_INFO("SD", "RECOVERY_SCAN_COMPLETE",
               "result=%s files=%u oldest_sequence=%llu newest_sequence=%llu "
               "oldest_syncable_sequence=%llu journal_sequence=%llu "
@@ -904,6 +1930,28 @@ bool SdStorage::persistSequence(const std::uint64_t committed_sequence) {
   return SD.rename(temporary, target);
 }
 
+bool SdStorage::persistEventSequence(
+    const std::uint64_t committed_sequence) {
+  const std::string value = std::to_string(committed_sequence) + "\n";
+  const char *temporary = "/POWERMON/state/event-sequence.journal.tmp";
+  const char *target = "/POWERMON/state/event-sequence.journal";
+  SD.remove(temporary);
+  File file = SD.open(temporary, FILE_WRITE);
+  const bool written =
+      file && file.write(reinterpret_cast<const std::uint8_t *>(value.data()),
+                         value.size()) == value.size();
+  if (file) {
+    file.flush();
+    file.close();
+  }
+  if (!written) {
+    SD.remove(temporary);
+    return false;
+  }
+  SD.remove(target);
+  return SD.rename(temporary, target);
+}
+
 bool SdStorage::ensureDirectory(const std::string &path) {
   if (path.empty() || path[0] != '/') {
     return false;
@@ -1007,6 +2055,43 @@ void SdStorage::collectFiles(const std::string &directory, const char *suffix,
     entry = root.openNextFile();
   }
   root.close();
+}
+
+void SdStorage::cleanupTemporaryArtifacts(const std::uint64_t now_utc_ms) {
+  constexpr std::uint64_t kExportTtlMs = 86'400'000ULL;
+  std::vector<std::string> exports;
+  collectFiles("/POWERMON/exports", "", exports);
+  health_.export_count = static_cast<std::uint32_t>(exports.size());
+  health_.temporary_artifact_count = 0U;
+  for (const auto &path : exports) {
+    if (endsWith(path, ".tmp")) {
+      ++health_.temporary_artifact_count;
+    }
+    File artifact = SD.open(path.c_str(), FILE_READ);
+    const std::uint64_t modified_ms =
+        artifact ? static_cast<std::uint64_t>(artifact.getLastWrite()) * 1000U
+                 : 0U;
+    if (artifact) {
+      artifact.close();
+    }
+    if (modified_ms != 0U && now_utc_ms > modified_ms &&
+        now_utc_ms - modified_ms >= kExportTtlMs) {
+      if (SD.remove(path.c_str())) {
+        --health_.export_count;
+        if (endsWith(path, ".tmp") &&
+            health_.temporary_artifact_count > 0U) {
+          --health_.temporary_artifact_count;
+        }
+        PM_LOG_INFO("STORAGE", "storage.temporary_artifact_removed",
+                    "kind=export age_ms=%llu",
+                    static_cast<unsigned long long>(now_utc_ms - modified_ms));
+      }
+    }
+  }
+  std::vector<std::string> repairs;
+  collectFiles("/POWERMON/records", ".repair", repairs);
+  health_.repair_artifact_count =
+      static_cast<std::uint32_t>(repairs.size());
 }
 
 HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
@@ -1232,6 +2317,31 @@ void SdStorage::updateCapacity() {
   health_.free_bytes = health_.capacity_bytes >= health_.used_bytes
                            ? health_.capacity_bytes - health_.used_bytes
                            : 0;
+  health_.free_percent =
+      health_.capacity_bytes == 0U
+          ? 0U
+          : static_cast<std::uint8_t>(std::min<std::uint64_t>(
+                100U, health_.free_bytes * 100U / health_.capacity_bytes));
+  health_.storage_full = health_.capacity_bytes != 0U && health_.free_bytes == 0U;
+  const StoragePressureState pressure =
+      health_.prepared_for_removal
+          ? StoragePressureState::PreparedForRemoval
+          : (!health_.mounted
+                 ? StoragePressureState::Failed
+                 : classifyStoragePressure(health_.capacity_bytes,
+                                           health_.free_bytes,
+                                           active_policy_));
+  health_.pressure_state = storagePressureStateName(pressure);
+  health_.pressure_reason =
+      pressure == StoragePressureState::Healthy
+          ? "capacity_available"
+          : (pressure == StoragePressureState::PreparedForRemoval
+                 ? "operator_prepared_card_removal"
+                 : "free_capacity_threshold_crossed");
+  growth_estimator_.observe(health_.used_bytes, millis());
+  health_.growth_bytes_per_day = growth_estimator_.bytesPerDay();
+  health_.estimated_days_remaining = growth_estimator_.estimatedDaysRemaining(
+      health_.free_bytes, active_policy_.emergency_reserve_bytes);
 }
 
 bool SdStorage::lock(const TickType_t timeout) const {

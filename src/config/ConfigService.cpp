@@ -413,6 +413,7 @@ bool ConfigService::begin() {
         preferences_.getBytesLength("admin_hash") == crypto::Key32{}.size() &&
         preferences_.getBytesLength("admin_salt") == 16;
     server_ack_sequence_ = preferences_.getULong64("server_ack", 0);
+    server_event_ack_sequence_ = preferences_.getULong64("event_ack", 0);
     server_config_version_ = preferences_.getUInt("server_cfg", 0);
     energy_offset_wh_ = preferences_.getULong64("energy_off", 0);
   }
@@ -493,6 +494,10 @@ MeasurementRuntimeConfig ConfigService::measurementRuntimeConfig() const {
           config_.frequency_maximum_hz,
           config_.retention_enabled,
           config_.retention_days,
+          config_.storage_policy,
+          config_.storage_cleanup_request_id,
+          config_.storage_cleanup_reason,
+          config_.storage_prepare_removal_request_id,
           config_.diagnostic_log_level};
 }
 
@@ -702,6 +707,18 @@ ConfigService::validate(const RuntimeConfig &candidate,
   if (candidate.retention_days < 1 || candidate.retention_days > 3650) {
     return {false, "retention_days_invalid",
             "Retention must be 1 through 3650 days when enabled."};
+  }
+  const StoragePolicyValidation storage_validation =
+      validateStoragePolicy(candidate.storage_policy);
+  if (!storage_validation.valid) {
+    return {false, storage_validation.code,
+            "Storage pressure thresholds and protected retention limits are invalid."};
+  }
+  if (candidate.storage_cleanup_request_id.size() > 80U ||
+      candidate.storage_cleanup_reason.size() > 500U ||
+      candidate.storage_prepare_removal_request_id.size() > 80U) {
+    return {false, "storage_control_request_invalid",
+            "Storage request identifiers and reasons exceed their safe limits."};
   }
   if (candidate.timezone.empty() || candidate.timezone.size() > 64) {
     return {false, "timezone_invalid",
@@ -1089,6 +1106,7 @@ bool ConfigService::saveEnrollment(const std::string &device_id,
   }
   const std::uint64_t reenrollment_generation = reenrollmentGeneration();
   if (!writeULong64Checked(preferences_, "server_ack", 0) ||
+      !writeULong64Checked(preferences_, "event_ack", 0) ||
       !writeUIntChecked(preferences_, "server_cfg", 0)) {
     PM_LOG_ERROR("CONFIG", "ENROLLMENT_CURSOR_PREPARE_FAILED",
                  "error=PM-CONFIG-028 credentials_activated=false");
@@ -1118,6 +1136,7 @@ bool ConfigService::saveEnrollment(const std::string &device_id,
     if (!state)
       return false;
     server_ack_sequence_ = 0;
+    server_event_ack_sequence_ = 0;
     server_config_version_ = 0;
   }
   if (!clearEnrollmentToken()) {
@@ -1530,8 +1549,10 @@ bool ConfigService::beginReenrollment(const std::string &token) {
   const bool token_verified = setEnrollmentToken(token);
   const bool ack_cursor_verified =
       token_verified && writeULong64Checked(preferences_, "server_ack", 0);
+  const bool event_cursor_verified =
+      ack_cursor_verified && writeULong64Checked(preferences_, "event_ack", 0);
   const bool config_cursor_verified =
-      ack_cursor_verified && writeUIntChecked(preferences_, "server_cfg", 0);
+      event_cursor_verified && writeUIntChecked(preferences_, "server_cfg", 0);
   if (!reenrollmentPrerequisitesReady(token_verified, ack_cursor_verified,
                                       config_cursor_verified)) {
     PM_LOG_ERROR("CONFIG", "REENROLLMENT_PREPARE_FAILED",
@@ -1556,6 +1577,7 @@ bool ConfigService::beginReenrollment(const std::string &token) {
     if (!state)
       return false;
     server_ack_sequence_ = 0;
+    server_event_ack_sequence_ = 0;
     server_config_version_ = 0;
   }
   if (!clearEnrollmentToken()) {
@@ -1606,6 +1628,7 @@ bool ConfigService::factoryReset() {
     persistent_generation_ = generation;
     admin_password_configured_ = false;
     server_ack_sequence_ = 0;
+    server_event_ack_sequence_ = 0;
     server_config_version_ = 0;
     energy_offset_wh_ = 0;
     safe_mode_ = false;
@@ -1637,6 +1660,34 @@ bool ConfigService::setServerAckSequence(const std::uint64_t sequence) {
   if (!state)
     return false;
   server_ack_sequence_ = sequence;
+  return true;
+}
+
+std::uint64_t ConfigService::serverEventAckSequence() const {
+  RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+  return state ? server_event_ack_sequence_ : 0;
+}
+
+bool ConfigService::setServerEventAckSequence(const std::uint64_t sequence) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
+  if (!mutation) {
+    return false;
+  }
+  const std::uint64_t current = serverEventAckSequence();
+  if (sequence < current) {
+    return false;
+  }
+  if (sequence == current) {
+    return true;
+  }
+  if (!writeULong64Checked(preferences_, "event_ack", sequence)) {
+    return false;
+  }
+  RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+  if (!state) {
+    return false;
+  }
+  server_event_ack_sequence_ = sequence;
   return true;
 }
 
@@ -1969,8 +2020,11 @@ bool ConfigService::loadOrMigrateEnrollment() {
       const bool token_verified = setEnrollmentToken(pending_token);
       const bool ack_cursor_verified =
           token_verified && writeULong64Checked(preferences_, "server_ack", 0);
-      const bool config_cursor_verified =
+      const bool event_cursor_verified =
           ack_cursor_verified &&
+          writeULong64Checked(preferences_, "event_ack", 0);
+      const bool config_cursor_verified =
+          event_cursor_verified &&
           writeUIntChecked(preferences_, "server_cfg", 0);
       if (!reenrollmentPrerequisitesReady(token_verified, ack_cursor_verified,
                                           config_cursor_verified)) {
@@ -1994,6 +2048,7 @@ bool ConfigService::loadOrMigrateEnrollment() {
         if (!state)
           return false;
         server_ack_sequence_ = 0;
+        server_event_ack_sequence_ = 0;
         server_config_version_ = 0;
       }
       if (!clearEnrollmentToken()) {
@@ -2566,6 +2621,26 @@ std::string ConfigService::serializeConfig(const RuntimeConfig &value) const {
   document["storage_warning_free_bytes"] = value.storage_warning_free_bytes;
   document["retention_enabled"] = value.retention_enabled;
   document["retention_days"] = value.retention_days;
+  document["retention_mode"] = retentionModeName(value.storage_policy.mode);
+  document["minimum_local_history_days"] =
+      value.storage_policy.minimum_local_history_days;
+  document["storage_notice_percent"] = value.storage_policy.notice_percent;
+  document["storage_warning_percent"] = value.storage_policy.warning_percent;
+  document["storage_critical_percent"] = value.storage_policy.critical_percent;
+  document["storage_emergency_percent"] =
+      value.storage_policy.emergency_percent;
+  document["storage_emergency_reserve_bytes"] =
+      value.storage_policy.emergency_reserve_bytes;
+  document["storage_cleanup_target_percent"] =
+      value.storage_policy.cleanup_target_percent;
+  document["storage_cleanup_target_bytes"] =
+      value.storage_policy.cleanup_target_bytes;
+  document["event_retention_days"] = value.storage_policy.event_retention_days;
+  document["storage_cleanup_request_id"] =
+      value.storage_cleanup_request_id;
+  document["storage_cleanup_reason"] = value.storage_cleanup_reason;
+  document["storage_prepare_removal_request_id"] =
+      value.storage_prepare_removal_request_id;
   document["local_session_timeout_seconds"] =
       value.local_session_timeout_seconds;
   document["ota_channel"] = value.ota_channel;
@@ -2686,6 +2761,59 @@ bool ConfigService::parseConfig(const std::string &json, RuntimeConfig &value,
   value.retention_enabled =
       document["retention_enabled"] | value.retention_enabled;
   value.retention_days = document["retention_days"] | value.retention_days;
+  if (document["retention_mode"].is<const char *>()) {
+    RetentionMode retention_mode = value.storage_policy.mode;
+    if (!parseRetentionMode(document["retention_mode"].as<const char *>(),
+                            retention_mode)) {
+      result = {false, "storage_retention_mode_invalid",
+                "Retention mode must be disabled, strict_age, or continuous_protected."};
+      return false;
+    }
+    value.storage_policy.mode = retention_mode;
+  } else {
+    // Existing installations must keep their exact effective behaviour on
+    // upgrade. Continuous cleanup is only the default for a new config.
+    value.storage_policy.mode = value.retention_enabled
+                                    ? RetentionMode::StrictAge
+                                    : RetentionMode::Disabled;
+  }
+  value.storage_policy.retention_days = value.retention_days;
+  value.storage_policy.minimum_local_history_days =
+      document["minimum_local_history_days"] |
+      value.storage_policy.minimum_local_history_days;
+  value.storage_policy.notice_percent =
+      document["storage_notice_percent"] | value.storage_policy.notice_percent;
+  value.storage_policy.warning_percent = document["storage_warning_percent"] |
+                                         value.storage_policy.warning_percent;
+  value.storage_policy.critical_percent =
+      document["storage_critical_percent"] |
+      value.storage_policy.critical_percent;
+  value.storage_policy.emergency_percent =
+      document["storage_emergency_percent"] |
+      value.storage_policy.emergency_percent;
+  value.storage_policy.emergency_reserve_bytes =
+      document["storage_emergency_reserve_bytes"] |
+      value.storage_policy.emergency_reserve_bytes;
+  value.storage_policy.cleanup_target_percent =
+      document["storage_cleanup_target_percent"] |
+      value.storage_policy.cleanup_target_percent;
+  value.storage_policy.cleanup_target_bytes =
+      document["storage_cleanup_target_bytes"] |
+      value.storage_policy.cleanup_target_bytes;
+  value.storage_policy.event_retention_days =
+      document["event_retention_days"] |
+      value.storage_policy.event_retention_days;
+  value.storage_cleanup_request_id =
+      document["storage_cleanup_request_id"] |
+      value.storage_cleanup_request_id.c_str();
+  value.storage_cleanup_reason =
+      document["storage_cleanup_reason"] | value.storage_cleanup_reason.c_str();
+  value.storage_prepare_removal_request_id =
+      document["storage_prepare_removal_request_id"] |
+      value.storage_prepare_removal_request_id.c_str();
+  value.retention_enabled =
+      value.storage_policy.mode != RetentionMode::Disabled;
+  value.retention_days = value.storage_policy.retention_days;
   value.local_session_timeout_seconds =
       document["local_session_timeout_seconds"] |
       value.local_session_timeout_seconds;

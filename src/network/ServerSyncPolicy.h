@@ -110,12 +110,19 @@ constexpr AcknowledgementDisposition classifyAcknowledgement(
   if (server_acknowledgement < current_acknowledgement) {
     return AcknowledgementDisposition::Invalid;
   }
+  // The acknowledgement is persisted independently from microSD history. If
+  // the card is repaired, replaced, or reset while the enrolled identity is
+  // preserved, the stored acknowledgement can already equal the server's
+  // response while still sitting ahead of the local sequence journal. Advance
+  // the storage floor in that case so new durable records resume above the
+  // immutable server cursor instead of being mistaken for an empty backlog.
+  if (server_acknowledgement > newest_stored_sequence) {
+    return AcknowledgementDisposition::AdvanceSequenceFloor;
+  }
   if (server_acknowledgement == current_acknowledgement) {
     return AcknowledgementDisposition::Current;
   }
-  return server_acknowledgement <= newest_stored_sequence
-             ? AcknowledgementDisposition::Advance
-             : AcknowledgementDisposition::AdvanceSequenceFloor;
+  return AcknowledgementDisposition::Advance;
 }
 constexpr bool shouldReleaseReadingBackoff(
     const bool immediate_sync_requested, const std::uint64_t acknowledgement,

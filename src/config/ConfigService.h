@@ -13,6 +13,7 @@
 #include "config/AtomicConfigStore.h"
 #include "config/ProvisioningTransaction.h"
 #include "security/Crypto.h"
+#include "storage/StoragePolicy.h"
 
 namespace pm {
 
@@ -66,8 +67,14 @@ struct RuntimeConfig {
                                          "time.google.com", "pool.ntp.org"};
   std::uint32_t sd_spi_hz{4'000'000};
   std::uint64_t storage_warning_free_bytes{64ULL * 1024ULL * 1024ULL};
+  // Legacy fields remain serialized during the migration window so older
+  // servers and local exports can still understand the effective policy.
   bool retention_enabled{false};
   std::uint16_t retention_days{365};
+  StoragePolicy storage_policy{};
+  std::string storage_cleanup_request_id;
+  std::string storage_cleanup_reason;
+  std::string storage_prepare_removal_request_id;
   std::uint32_t local_session_timeout_seconds{900};
   std::string ota_channel{"stable"};
   // Offline firmware-signing trust is local-only configuration. The public
@@ -141,6 +148,10 @@ struct MeasurementRuntimeConfig {
   float frequency_maximum_hz{65.0F};
   bool retention_enabled{false};
   std::uint16_t retention_days{365};
+  StoragePolicy storage_policy{};
+  std::string storage_cleanup_request_id;
+  std::string storage_cleanup_reason;
+  std::string storage_prepare_removal_request_id;
   std::uint8_t diagnostic_log_level{PM_RELEASE_BUILD ? 2U : 1U};
 };
 
@@ -221,6 +232,8 @@ public:
 
   std::uint64_t serverAckSequence() const;
   bool setServerAckSequence(std::uint64_t sequence);
+  std::uint64_t serverEventAckSequence() const;
+  bool setServerEventAckSequence(std::uint64_t sequence);
   std::uint32_t serverConfigVersion() const;
   bool setServerConfigVersion(std::uint32_t version);
   std::uint64_t energyOffsetWh() const;
@@ -303,6 +316,7 @@ private:
   std::uint64_t reenrollment_generation_{0};
   std::uint64_t persistent_generation_{0};
   std::uint64_t server_ack_sequence_{0};
+  std::uint64_t server_event_ack_sequence_{0};
   std::uint32_t server_config_version_{0};
   std::uint64_t energy_offset_wh_{0};
   mutable SemaphoreHandle_t mutation_mutex_{nullptr};

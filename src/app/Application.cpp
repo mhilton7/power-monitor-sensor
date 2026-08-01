@@ -679,12 +679,121 @@ void Application::healthTask() {
                   static_cast<unsigned long>(
                       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     }
-    if (!config_.safeMode() && measurement_config.retention_enabled &&
-        clock_.synchronized() &&
-        (last_retention_ms == 0 || now - last_retention_ms >= 3'600'000U)) {
-      storage_.applyRetention(config_.serverAckSequence(), clock_.utcMs(),
-                              measurement_config.retention_days);
-      last_retention_ms = now;
+    const StorageHealth retention_health = storage_.health();
+    if (retention_health.pressure_state != last_storage_pressure_state_) {
+      const std::string previous = last_storage_pressure_state_.empty()
+                                       ? "unobserved"
+                                       : last_storage_pressure_state_;
+      const bool recovered = retention_health.pressure_state == "healthy";
+      char detail[448]{};
+      std::snprintf(
+          detail, sizeof(detail),
+          "previous=%s current=%s free_bytes=%llu capacity_bytes=%llu "
+          "free_percent=%u server_ack_sequence=%llu newest_sequence=%llu "
+          "reclaimable_bytes=%llu protected_unacknowledged_bytes=%llu",
+          previous.c_str(), retention_health.pressure_state.c_str(),
+          static_cast<unsigned long long>(retention_health.free_bytes),
+          static_cast<unsigned long long>(retention_health.capacity_bytes),
+          static_cast<unsigned>(retention_health.free_percent),
+          static_cast<unsigned long long>(retention_health.server_ack_sequence),
+          static_cast<unsigned long long>(retention_health.newest_sequence),
+          static_cast<unsigned long long>(retention_health.reclaimable_bytes),
+          static_cast<unsigned long long>(
+              retention_health.protected_unacknowledged_bytes));
+      PM_LOG_WARN("STORAGE", "storage.pressure_state_changed", "%s",
+                  detail);
+      storage_coordinator_.enqueueEvent(
+          recovered ? "storage.pressure_recovered"
+                    : "storage.pressure_changed",
+          recovered ? "info"
+                    : (retention_health.pressure_state == "notice"
+                           ? "warning"
+                           : "critical"),
+          detail, clock_.utcMs(), config_.identity().boot_id);
+      last_storage_pressure_state_ = retention_health.pressure_state;
+    }
+    if (retention_health.last_cleanup_utc_ms != 0U &&
+        retention_health.last_cleanup_utc_ms !=
+            last_storage_cleanup_observed_utc_ms_) {
+      char detail[384]{};
+      std::snprintf(
+          detail, sizeof(detail),
+          "result=%s reason=%s reclaimed_bytes=%llu free_bytes=%llu "
+          "reclaimable_bytes=%llu protected_unacknowledged_bytes=%llu",
+          retention_health.last_cleanup_result.c_str(),
+          retention_health.last_cleanup_reason.c_str(),
+          static_cast<unsigned long long>(
+              retention_health.last_cleanup_reclaimed_bytes),
+          static_cast<unsigned long long>(retention_health.free_bytes),
+          static_cast<unsigned long long>(retention_health.reclaimable_bytes),
+          static_cast<unsigned long long>(
+              retention_health.protected_unacknowledged_bytes));
+      storage_coordinator_.enqueueEvent(
+          retention_health.last_cleanup_result == "completed"
+              ? "storage.cleanup_completed"
+              : "storage.cleanup_attention",
+          retention_health.last_cleanup_result == "completed" ? "info"
+                                                                : "warning",
+          detail, clock_.utcMs(), config_.identity().boot_id);
+      last_storage_cleanup_observed_utc_ms_ =
+          retention_health.last_cleanup_utc_ms;
+    }
+    const bool pressure_cleanup =
+        retention_health.pressure_state == "critical" ||
+        retention_health.pressure_state == "emergency" ||
+        retention_health.pressure_state == "full" ||
+        retention_health.last_error.find("reserve_unavailable") !=
+            std::string::npos;
+    const std::uint64_t current_storage_ack = config_.serverAckSequence();
+    const bool acknowledgement_advanced_materially =
+        current_storage_ack > last_storage_cleanup_ack_sequence_ &&
+        (last_storage_cleanup_ack_sequence_ == 0U ||
+         current_storage_ack - last_storage_cleanup_ack_sequence_ >= 128U);
+    if (!measurement_config.storage_cleanup_request_id.empty() &&
+        measurement_config.storage_cleanup_request_id !=
+            last_storage_cleanup_request_id_) {
+      const std::uint64_t acknowledgement = config_.serverAckSequence();
+      if (storage_coordinator_.queueRetention(
+              acknowledgement, acknowledgement > 0U,
+              config_.serverEventAckSequence(), clock_.utcMs(),
+              measurement_config.storage_policy,
+              measurement_config.storage_cleanup_reason.empty()
+                  ? "operator_requested_cleanup"
+                  : measurement_config.storage_cleanup_reason,
+              true)) {
+        last_storage_cleanup_request_id_ =
+            measurement_config.storage_cleanup_request_id;
+      }
+    }
+    if (!measurement_config.storage_prepare_removal_request_id.empty() &&
+        measurement_config.storage_prepare_removal_request_id !=
+            last_storage_prepare_removal_request_id_ &&
+        storage_coordinator_.queuePrepareRemoval()) {
+      last_storage_prepare_removal_request_id_ =
+          measurement_config.storage_prepare_removal_request_id;
+    }
+    if (!config_.safeMode() && measurement_config.storage_policy.mode !=
+                                   RetentionMode::Disabled &&
+        (clock_.synchronized() ||
+         (pressure_cleanup && measurement_config.storage_policy.mode ==
+                                  RetentionMode::ContinuousProtected)) &&
+        (pressure_cleanup || last_retention_ms == 0 ||
+         now - last_retention_ms >= 3'600'000U ||
+         acknowledgement_advanced_materially)) {
+      const std::uint64_t acknowledgement = config_.serverAckSequence();
+      if (storage_coordinator_.queueRetention(
+              acknowledgement, acknowledgement > 0U,
+              config_.serverEventAckSequence(), clock_.utcMs(),
+              measurement_config.storage_policy,
+              pressure_cleanup
+                  ? "automatic_capacity_pressure"
+                  : (acknowledgement_advanced_materially
+                         ? "server_acknowledgement_advanced"
+                         : "automatic_scheduled_retention"),
+              pressure_cleanup)) {
+        last_retention_ms = now;
+        last_storage_cleanup_ack_sequence_ = acknowledgement;
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
@@ -1249,7 +1358,7 @@ void Application::executeMaintenance(const MaintenanceMessage &message) {
     ok = storage_.rebuildIndexes();
     break;
   case MaintenanceAction::PrepareCardRemoval:
-    ok = storage_.prepareRemoval();
+    ok = storage_coordinator_.queuePrepareRemoval();
     break;
   case MaintenanceAction::TestDns: {
     const std::string host = httpsHost(config_.config().server_url);

@@ -593,7 +593,8 @@ ServerSync::ServerSync(ConfigService &config, NetworkService &network,
     : config_(config), network_(network), clock_(clock), storage_(storage),
       storage_coordinator_(storage_coordinator), diagnostics_(diagnostics),
       meter_(meter),
-      maintenance_queue_(maintenance_queue) {}
+      maintenance_queue_(maintenance_queue),
+      event_cursor_(config.serverEventAckSequence()) {}
 
 void ServerSync::logTaskCheckpoint(const char *checkpoint) {
   recordSyncTaskCheckpoint(metrics_, diagnostics_, checkpoint);
@@ -1614,12 +1615,17 @@ bool ServerSync::pushEvents() {
               static_cast<unsigned long long>(page.last_sequence));
   const std::size_t event_count = page.records.size();
   const std::uint64_t page_last_sequence = page.last_sequence;
+  const StorageHealth storage_health = storage_.health();
   logTaskCheckpoint("BEFORE_JSON_BUILD");
   std::string body;
   {
     JsonDocument document;
     document["protocol_version"] = version::PROTOCOL;
     document["device_id"] = enrolledDeviceId(config_);
+    if (storage_health.oldest_event_sequence != 0U) {
+      document["first_stored_event_sequence"] =
+          storage_health.oldest_event_sequence;
+    }
     JsonArray events = document["events"].to<JsonArray>();
     for (const auto &encoded : page.records) {
       JsonDocument event_document;
@@ -1703,7 +1709,26 @@ bool ServerSync::pushEvents() {
       logTaskCheckpoint("AFTER_RESPONSE_PARSE");
       return false;
     }
-    event_cursor_ = page_last_sequence;
+    const std::uint64_t acknowledged_event_sequence =
+        result["highest_contiguous_event_sequence"].is<std::uint64_t>()
+            ? result["highest_contiguous_event_sequence"].as<std::uint64_t>()
+            : event_cursor_;
+    if (acknowledged_event_sequence < page_last_sequence ||
+        !config_.setServerEventAckSequence(acknowledged_event_sequence)) {
+      ++metrics_.events_failures;
+      metrics_.last_error = "event_acknowledgement_persist_failed";
+      next_event_push_ms_ =
+          clock_.monotonicMs() +
+          operationRetryDelayMs(event_retry_attempt_, 0, "events");
+      PM_LOG_ERROR("SYNC", "EVENT_ACK_PERSIST_FAILED",
+                   "page_last=%llu acknowledged=%llu cursor_retained=%llu",
+                   static_cast<unsigned long long>(page_last_sequence),
+                   static_cast<unsigned long long>(acknowledged_event_sequence),
+                   static_cast<unsigned long long>(event_cursor_));
+      logTaskCheckpoint("AFTER_RESPONSE_PARSE");
+      return false;
+    }
+    event_cursor_ = acknowledged_event_sequence;
     event_retry_attempt_ = 0;
     ++metrics_.events_successes;
     PM_LOG_INFO("SYNC", "EVENT_BATCH_COMPLETE",
@@ -2421,6 +2446,8 @@ std::string ServerSync::heartbeatBody() const {
   const MeterMetrics meter = meter_.metrics();
   const ServerSyncRuntimeConfig active_config =
       config_.serverSyncRuntimeConfig();
+  const MeasurementRuntimeConfig measurement_config =
+      config_.measurementRuntimeConfig();
   const DeviceIdentity identity = config_.identity();
   MeasurementSnapshot latest;
   const bool has_latest = diagnostics_.latest(latest);
@@ -2468,13 +2495,101 @@ std::string ServerSync::heartbeatBody() const {
   const bool storage_ok =
       storage.present && storage.mounted && storage.writable;
   storage_json["ok"] = storage_ok;
-  storage_json["status"] = storage_ok ? "healthy" : "storage_unavailable";
+  storage_json["status"] = storage_ok ? storage.pressure_state.c_str()
+                                      : "storage_unavailable";
   storage_json["error_count"] = storage.write_failures;
   JsonObject storage_details = storage_json["details"].to<JsonObject>();
   storage_details["present"] = storage.present;
   storage_details["mounted"] = storage.mounted;
   storage_details["writable"] = storage.writable;
+  storage_details["prepared_for_removal"] = storage.prepared_for_removal;
+  storage_details["card_type"] = storage.card_type;
+  storage_details["filesystem"] = storage.filesystem;
+  storage_details["capacity_bytes"] = storage.capacity_bytes;
+  storage_details["used_bytes"] = storage.used_bytes;
   storage_details["free_bytes"] = storage.free_bytes;
+  storage_details["free_percent"] = storage.free_percent;
+  storage_details["pressure_state"] = storage.pressure_state;
+  storage_details["pressure_reason"] = storage.pressure_reason;
+  storage_details["storage_full"] = storage.storage_full;
+  storage_details["retention_mode"] =
+      retentionModeName(measurement_config.storage_policy.mode);
+  storage_details["retention_days"] =
+      measurement_config.storage_policy.retention_days;
+  storage_details["minimum_local_history_days"] =
+      measurement_config.storage_policy.minimum_local_history_days;
+  storage_details["storage_notice_percent"] =
+      measurement_config.storage_policy.notice_percent;
+  storage_details["storage_warning_percent"] =
+      measurement_config.storage_policy.warning_percent;
+  storage_details["storage_critical_percent"] =
+      measurement_config.storage_policy.critical_percent;
+  storage_details["storage_emergency_percent"] =
+      measurement_config.storage_policy.emergency_percent;
+  storage_details["storage_emergency_reserve_bytes"] =
+      measurement_config.storage_policy.emergency_reserve_bytes;
+  storage_details["storage_cleanup_target_percent"] =
+      measurement_config.storage_policy.cleanup_target_percent;
+  storage_details["storage_cleanup_target_bytes"] =
+      measurement_config.storage_policy.cleanup_target_bytes;
+  storage_details["event_retention_days"] =
+      measurement_config.storage_policy.event_retention_days;
+  storage_details["server_ack_sequence"] = storage.server_ack_sequence;
+  storage_details["event_ack_sequence"] = config_.serverEventAckSequence();
+  storage_details["acknowledgement_verified"] =
+      storage.acknowledgement_verified;
+  storage_details["oldest_record_sequence"] = storage.oldest_sequence;
+  storage_details["newest_record_sequence"] = storage.newest_sequence;
+  storage_details["oldest_event_sequence"] = storage.oldest_event_sequence;
+  storage_details["newest_event_sequence"] = storage.newest_event_sequence;
+  storage_details["unacknowledged_record_count"] =
+      storage.newest_sequence >= config_.serverAckSequence()
+          ? storage.newest_sequence - config_.serverAckSequence()
+          : 0U;
+  storage_details["reclaimable_bytes"] = storage.reclaimable_bytes;
+  storage_details["protected_unacknowledged_bytes"] =
+      storage.protected_unacknowledged_bytes;
+  storage_details["protected_untrusted_bytes"] =
+      storage.protected_untrusted_bytes;
+  storage_details["segment_count"] = storage.segment_count;
+  storage_details["eligible_segment_count"] =
+      storage.eligible_segment_count;
+  storage_details["protected_segment_count"] =
+      storage.protected_segment_count;
+  storage_details["open_segment_count"] = storage.open_segment_count;
+  storage_details["closed_segment_count"] = storage.closed_segment_count;
+  storage_details["untrusted_segment_count"] =
+      storage.untrusted_segment_count;
+  storage_details["event_segment_count"] = storage.event_segment_count;
+  storage_details["export_count"] = storage.export_count;
+  storage_details["repair_artifact_count"] =
+      storage.repair_artifact_count;
+  storage_details["temporary_artifact_count"] =
+      storage.temporary_artifact_count;
+  storage_details["cleanup_in_progress"] = storage.cleanup_in_progress;
+  storage_details["cleanup_recovery_required"] =
+      storage.cleanup_recovery_required;
+  storage_details["last_cleanup_at"] =
+      storage.last_cleanup_utc_ms == 0U
+          ? ""
+          : isoUtc(storage.last_cleanup_utc_ms);
+  storage_details["last_cleanup_reclaimed_bytes"] =
+      storage.last_cleanup_reclaimed_bytes;
+  storage_details["last_cleanup_result"] = storage.last_cleanup_result;
+  storage_details["last_cleanup_reason"] = storage.last_cleanup_reason;
+  storage_details["dropped_interval_count"] =
+      storage.dropped_interval_count;
+  storage_details["first_dropped_interval_at"] =
+      storage.first_dropped_interval_utc_ms == 0U
+          ? ""
+          : isoUtc(storage.first_dropped_interval_utc_ms);
+  storage_details["last_dropped_interval_at"] =
+      storage.last_dropped_interval_utc_ms == 0U
+          ? ""
+          : isoUtc(storage.last_dropped_interval_utc_ms);
+  storage_details["growth_bytes_per_day"] = storage.growth_bytes_per_day;
+  storage_details["estimated_days_remaining"] =
+      storage.estimated_days_remaining;
   storage_details["last_error"] = storage.last_error;
   document["oldest_stored_sequence"] = storage.oldest_sequence;
   document["oldest_syncable_sequence"] = storage.oldest_syncable_sequence;

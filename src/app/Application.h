@@ -82,6 +82,11 @@ private:
   std::uint64_t sample_dropped_{0};
   std::uint64_t action_dropped_{0};
   std::uint64_t last_persisted_wifi_transition_{0};
+  std::string last_storage_cleanup_request_id_;
+  std::string last_storage_prepare_removal_request_id_;
+  std::string last_storage_pressure_state_;
+  std::uint64_t last_storage_cleanup_observed_utc_ms_{0};
+  std::uint64_t last_storage_cleanup_ack_sequence_{0};
 #if PM_PHYSICAL_ADMIN_RECOVERY
   std::string admin_recovery_request_id_;
   std::uint64_t admin_recovery_deadline_ms_{0};

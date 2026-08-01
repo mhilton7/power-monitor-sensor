@@ -18,6 +18,14 @@ public:
   bool enqueueEvent(const std::string &code, const std::string &severity,
                     const std::string &detail, std::uint64_t utc_ms,
                     const std::string &boot_id);
+  bool queueRetention(std::uint64_t server_ack_sequence,
+                      bool acknowledgement_verified,
+                      std::uint64_t event_ack_sequence,
+                      std::uint64_t now_utc_ms,
+                      const StoragePolicy &policy,
+                      const std::string &reason,
+                      bool high_priority = false);
+  bool queuePrepareRemoval();
   std::string queueHistory(const HistoryQuery &query, bool events = false,
                            bool primary_sync = false);
   bool historyResult(const std::string &id, HistoryPage &page, bool &complete,
@@ -28,7 +36,14 @@ public:
   std::uint64_t dropped() const;
 
 private:
-  enum class Type : std::uint8_t { Record, Event, History, Remount };
+  enum class Type : std::uint8_t {
+    Record,
+    Event,
+    History,
+    Remount,
+    Retention,
+    PrepareRemoval,
+  };
   struct EventData {
     std::string code;
     std::string severity;
@@ -41,6 +56,14 @@ private:
     HistoryQuery query;
     bool events{false};
     bool primary_sync{false};
+  };
+  struct RetentionData {
+    std::uint64_t server_ack_sequence{0};
+    std::uint64_t event_ack_sequence{0};
+    std::uint64_t now_utc_ms{0};
+    StoragePolicy policy{};
+    std::string reason;
+    bool acknowledgement_verified{false};
   };
   struct HistoryResult {
     bool used{false};
@@ -55,6 +78,7 @@ private:
   };
 
   bool remountStorage();
+  void recordDroppedInterval(const IntervalRecord &record);
 
   SdStorage &storage_;
   Diagnostics &diagnostics_;
@@ -67,6 +91,11 @@ private:
   std::array<HistoryResult, 2> history_results_{};
   std::atomic<std::uint32_t> next_history_id_{1};
   std::atomic<std::uint64_t> dropped_{0};
+  std::atomic<std::uint64_t> dropped_record_intervals_{0};
+  std::atomic<std::uint64_t> first_dropped_interval_utc_ms_{0};
+  std::atomic<std::uint64_t> last_dropped_interval_utc_ms_{0};
+  std::atomic<bool> retention_queued_{false};
+  std::atomic<bool> prepare_removal_queued_{false};
 };
 
 } // namespace pm

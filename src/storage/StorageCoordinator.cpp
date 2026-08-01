@@ -1,5 +1,6 @@
 #include "storage/StorageCoordinator.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <new>
 
@@ -61,6 +62,7 @@ bool StorageCoordinator::enqueueRecord(const IntervalRecord &record) {
   auto *copy = new (std::nothrow) IntervalRecord(record);
   if (copy == nullptr) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
+    recordDroppedInterval(record);
     PM_LOG_ERROR("QUEUE", "STORAGE_ALLOC_FAILED",
                  "error=PM-QUEUE-002 type=record dropped=%llu",
                  static_cast<unsigned long long>(dropped()));
@@ -70,6 +72,7 @@ bool StorageCoordinator::enqueueRecord(const IntervalRecord &record) {
   if (xQueueSend(write_queue_, &message, 0) != pdTRUE) {
     delete copy;
     dropped_.fetch_add(1, std::memory_order_relaxed);
+    recordDroppedInterval(record);
     if (diag::SerialLogger::instance().allow("storage_queue_full", 10'000U)) {
       PM_LOG_ERROR(
           "QUEUE", "STORAGE_QUEUE_FULL",
@@ -81,6 +84,32 @@ bool StorageCoordinator::enqueueRecord(const IntervalRecord &record) {
     return false;
   }
   return true;
+}
+
+void StorageCoordinator::recordDroppedInterval(const IntervalRecord &record) {
+  dropped_record_intervals_.fetch_add(1, std::memory_order_relaxed);
+  std::uint64_t first = first_dropped_interval_utc_ms_.load(
+      std::memory_order_relaxed);
+  while ((first == 0U || record.start_utc_ms < first) &&
+         !first_dropped_interval_utc_ms_.compare_exchange_weak(
+             first, record.start_utc_ms, std::memory_order_relaxed)) {
+  }
+  std::uint64_t last = last_dropped_interval_utc_ms_.load(
+      std::memory_order_relaxed);
+  while (record.end_utc_ms > last &&
+         !last_dropped_interval_utc_ms_.compare_exchange_weak(
+             last, record.end_utc_ms, std::memory_order_relaxed)) {
+  }
+  PM_LOG_ERROR(
+      "HISTORY", "storage.interval_dropped",
+      "reason=bounded_storage_queue_exhausted count=%llu first_utc_ms=%llu "
+      "last_utc_ms=%llu history_gap_required=true",
+      static_cast<unsigned long long>(
+          dropped_record_intervals_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(
+          first_dropped_interval_utc_ms_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(
+          last_dropped_interval_utc_ms_.load(std::memory_order_relaxed)));
 }
 
 bool StorageCoordinator::enqueueEvent(const std::string &code,
@@ -109,6 +138,61 @@ bool StorageCoordinator::enqueueEvent(const std::string &code,
           static_cast<unsigned>(build::OFFLINE_RECORD_QUEUE_DEPTH),
           static_cast<unsigned long long>(dropped()));
     }
+    return false;
+  }
+  return true;
+}
+
+bool StorageCoordinator::queueRetention(
+    const std::uint64_t server_ack_sequence,
+    const bool acknowledgement_verified,
+    const std::uint64_t event_ack_sequence,
+    const std::uint64_t now_utc_ms, const StoragePolicy &policy,
+    const std::string &reason, const bool high_priority) {
+  if (control_queue_ == nullptr) {
+    return false;
+  }
+  if (retention_queued_.exchange(true, std::memory_order_acq_rel)) {
+    return false;
+  }
+  auto *request = new (std::nothrow)
+      RetentionData{server_ack_sequence, event_ack_sequence, now_utc_ms,
+                    policy, reason, acknowledgement_verified};
+  if (request == nullptr) {
+    retention_queued_.store(false, std::memory_order_release);
+    return false;
+  }
+  const Message message{Type::Retention, request};
+  const BaseType_t queued =
+      high_priority ? xQueueSendToFront(control_queue_, &message, 0)
+                    : xQueueSend(control_queue_, &message, 0);
+  if (queued != pdTRUE) {
+    delete request;
+    retention_queued_.store(false, std::memory_order_release);
+    return false;
+  }
+  PM_LOG_INFO("STORAGE", "CLEANUP_QUEUED",
+              "reason=%s priority=%s ack=%llu",
+              reason.c_str(), high_priority ? "high" : "normal",
+              static_cast<unsigned long long>(server_ack_sequence));
+  PM_LOG_INFO("STORAGE", "storage.cleanup_queued",
+              "reason=%s priority=%s server_ack=%llu event_ack=%llu",
+              reason.c_str(), high_priority ? "high" : "normal",
+              static_cast<unsigned long long>(server_ack_sequence),
+              static_cast<unsigned long long>(event_ack_sequence));
+  return true;
+}
+
+bool StorageCoordinator::queuePrepareRemoval() {
+  if (control_queue_ == nullptr) {
+    return false;
+  }
+  if (prepare_removal_queued_.exchange(true, std::memory_order_acq_rel)) {
+    return false;
+  }
+  const Message message{Type::PrepareRemoval, nullptr};
+  if (xQueueSendToFront(control_queue_, &message, 0) != pdTRUE) {
+    prepare_removal_queued_.store(false, std::memory_order_release);
     return false;
   }
   return true;
@@ -254,10 +338,23 @@ void StorageCoordinator::taskLoop() {
       static_cast<unsigned>(task_config::kStorageStackBytes));
   Message message{};
   IntervalRecord *pending_record = nullptr;
+  std::uint64_t pending_gap_count = 0;
+  std::uint64_t pending_gap_first_utc_ms = 0;
+  std::uint64_t pending_gap_last_utc_ms = 0;
   std::uint64_t next_remount_ms = 0;
   std::uint64_t next_record_retry_ms = 0;
   for (;;) {
-    if (xQueueReceive(control_queue_, &message, 0) == pdTRUE) {
+    const StorageHealth scheduling_health = storage_.health();
+    const bool pending_capacity_blocked =
+        pending_record != nullptr &&
+        scheduling_health.last_error.find("reserve_unavailable") !=
+            std::string::npos;
+    const bool control_allowed =
+        pending_capacity_blocked ||
+        (pending_record == nullptr &&
+         uxQueueMessagesWaiting(write_queue_) == 0U);
+    if (control_allowed &&
+        xQueueReceive(control_queue_, &message, 0) == pdTRUE) {
       if (message.type == Type::History) {
         auto *request = static_cast<HistoryData *>(message.payload);
         HistoryPage page;
@@ -334,12 +431,59 @@ void StorageCoordinator::taskLoop() {
         delete request;
       } else if (message.type == Type::Remount) {
         remountStorage();
+      } else if (message.type == Type::Retention) {
+        auto *request = static_cast<RetentionData *>(message.payload);
+        storage_.applyRetention(
+            request->server_ack_sequence, request->acknowledgement_verified,
+            request->event_ack_sequence, request->now_utc_ms, request->policy,
+            request->reason);
+        delete request;
+        retention_queued_.store(false, std::memory_order_release);
+      } else if (message.type == Type::PrepareRemoval) {
+        storage_.prepareRemoval();
+        prepare_removal_queued_.store(false, std::memory_order_release);
       }
       continue;
     }
 
     const std::uint64_t now = millis();
     if (pending_record != nullptr && now >= next_record_retry_ms) {
+      const std::uint64_t new_gap_count =
+          dropped_record_intervals_.exchange(0, std::memory_order_acq_rel);
+      if (new_gap_count > 0U) {
+        const std::uint64_t new_first =
+            first_dropped_interval_utc_ms_.exchange(0,
+                                                    std::memory_order_acq_rel);
+        const std::uint64_t new_last =
+            last_dropped_interval_utc_ms_.exchange(0,
+                                                   std::memory_order_acq_rel);
+        pending_gap_count += new_gap_count;
+        pending_gap_first_utc_ms =
+            pending_gap_first_utc_ms == 0U
+                ? new_first
+                : std::min(pending_gap_first_utc_ms, new_first);
+        pending_gap_last_utc_ms =
+            std::max(pending_gap_last_utc_ms, new_last);
+      }
+      if (pending_gap_count > 0U &&
+          !storage_.reserveUnavailableIntervals(
+              pending_gap_count, pending_gap_first_utc_ms,
+              pending_gap_last_utc_ms)) {
+        PM_LOG_ERROR(
+            "HISTORY", "storage.interval_gap_reservation_blocked",
+            "count=%llu first_utc_ms=%llu last_utc_ms=%llu retry_ms=30000",
+            static_cast<unsigned long long>(pending_gap_count),
+            static_cast<unsigned long long>(pending_gap_first_utc_ms),
+            static_cast<unsigned long long>(pending_gap_last_utc_ms));
+        next_record_retry_ms = now + 30'000U;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      if (pending_gap_count > 0U) {
+        pending_gap_count = 0U;
+        pending_gap_first_utc_ms = 0U;
+        pending_gap_last_utc_ms = 0U;
+      }
       if (storage_.append(*pending_record)) {
         diagnostics_.setCommittedSequence(pending_record->sequence);
         PM_LOG_TRACE("STORAGE", "RECORD_COMMITTED",
@@ -360,15 +504,25 @@ void StorageCoordinator::taskLoop() {
         pending_record = nullptr;
         next_record_retry_ms = 0;
       } else {
+        const StorageHealth failed_health = storage_.health();
         PM_LOG_WARN("HISTORY", "sensor.sample_rejected",
-                    "reason=storage_append_failed retry_ms=1000");
-        if (now >= next_remount_ms) {
+                    "reason=%s retry_ms=%lu",
+                    failed_health.last_error.c_str(),
+                    static_cast<unsigned long>(
+                        failed_health.last_error.find("reserve_unavailable") !=
+                                std::string::npos
+                            ? 30'000U
+                            : 1000U));
+        const bool capacity_blocked =
+            failed_health.last_error.find("reserve_unavailable") !=
+            std::string::npos;
+        if (!capacity_blocked && now >= next_remount_ms) {
           PM_LOG_WARN("STORAGE", "REMOUNT_SCHEDULED",
                       "error=PM-SD-002 retry_interval_ms=30000");
           remountStorage();
           next_remount_ms = now + 30'000U;
         }
-        next_record_retry_ms = now + 1000U;
+        next_record_retry_ms = now + (capacity_blocked ? 30'000U : 1000U);
       }
     }
     if (pending_record != nullptr) {
@@ -395,6 +549,14 @@ void StorageCoordinator::taskLoop() {
       break;
     case Type::Remount:
       remountStorage();
+      break;
+    case Type::Retention:
+      // Retention messages use the dedicated control queue.
+      delete static_cast<RetentionData *>(message.payload);
+      retention_queued_.store(false, std::memory_order_release);
+      break;
+    case Type::PrepareRemoval:
+      prepare_removal_queued_.store(false, std::memory_order_release);
       break;
     }
   }

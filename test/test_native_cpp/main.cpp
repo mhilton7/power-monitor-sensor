@@ -23,6 +23,7 @@
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
 #include "storage/RecordFormat.h"
+#include "storage/StoragePolicy.h"
 #include "storage/SyncCoverage.h"
 
 namespace {
@@ -109,6 +110,12 @@ void testEnergyAndRecord() {
   check(pm::sync_policy::classifyAcknowledgement(5, 5, 8) ==
             AcknowledgementDisposition::AdvanceSequenceFloor,
         "authenticated server cursor can safely advance a regressed sequence floor");
+  check(pm::sync_policy::classifyAcknowledgement(2207, 92, 2207) ==
+            AcknowledgementDisposition::AdvanceSequenceFloor,
+        "persisted acknowledgement ahead of reset storage still advances the sequence floor");
+  check(pm::sync_policy::classifyAcknowledgement(5, 8, 5) ==
+            AcknowledgementDisposition::Current,
+        "matching acknowledgement remains current when retained history is not behind it");
   check(pm::sync_policy::classifyAcknowledgement(5, 8, 7) ==
             AcknowledgementDisposition::Advance,
         "acknowledgement advances within retained history");
@@ -1056,6 +1063,161 @@ void testProvisioningTransaction() {
             journal.admin_hash.empty(),
         "provisioning journal secrets are scrubbed after use");
 }
+
+void testStoragePolicy() {
+  pm::StoragePolicy policy;
+  check(pm::validateStoragePolicy(policy).valid,
+        "recommended storage policy is valid");
+  pm::StoragePolicy invalid = policy;
+  invalid.warning_percent = invalid.notice_percent;
+  check(!pm::validateStoragePolicy(invalid).valid,
+        "unordered pressure thresholds are rejected");
+
+  constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+  check(pm::classifyStoragePressure(64U * gib, 30U * gib, policy) ==
+            pm::StoragePressureState::Healthy,
+        "healthy storage is classified above notice threshold");
+  check(pm::classifyStoragePressure(64U * gib, 6U * gib, policy) ==
+            pm::StoragePressureState::Warning,
+        "ten-percent storage is warning");
+  check(pm::classifyStoragePressure(64U * gib, 400U * 1024U * 1024U,
+                                    policy) ==
+            pm::StoragePressureState::Emergency,
+        "absolute emergency reserve protects large cards");
+
+  pm::SegmentMetadata acknowledged;
+  acknowledged.record_path = "/POWERMON/records/2026/07/2026-07-01.pmr";
+  acknowledged.index_path = "/POWERMON/indexes/2026/07/2026-07-01.idx";
+  acknowledged.first_sequence = 1;
+  acknowledged.last_sequence = 100;
+  acknowledged.first_utc_ms = 1'700'000'000'000ULL;
+  acknowledged.last_utc_ms = 1'700'086'400'000ULL;
+  acknowledged.payload_bytes = 1000;
+  acknowledged.index_bytes = 100;
+  acknowledged.record_count = 100;
+  acknowledged.all_times_trusted = true;
+  acknowledged.complete = true;
+  acknowledged.index_valid = true;
+  acknowledged.closed = true;
+
+  pm::RetentionContext context;
+  context.mode = pm::RetentionMode::StrictAge;
+  context.acknowledgement_verified = true;
+  context.server_ack_sequence = 100;
+  context.retention_cutoff_utc_ms = 1'701'000'000'000ULL;
+  context.minimum_history_cutoff_utc_ms = 1'701'000'000'000ULL;
+  check(pm::segmentEligibility(acknowledged, context) ==
+            pm::SegmentEligibility::EligibleAge,
+        "complete trusted acknowledged old segment is eligible");
+  pm::SegmentMetadata unacknowledged = acknowledged;
+  unacknowledged.last_sequence = 101;
+  check(pm::segmentEligibility(unacknowledged, context) ==
+            pm::SegmentEligibility::Unacknowledged,
+        "one sequence beyond acknowledgement remains protected");
+  pm::SegmentMetadata active = acknowledged;
+  active.active = true;
+  check(pm::segmentEligibility(active, context) ==
+            pm::SegmentEligibility::Active,
+        "active segment is never eligible");
+  pm::SegmentMetadata missing_index = acknowledged;
+  missing_index.index_valid = false;
+  check(pm::segmentEligibility(missing_index, context) ==
+            pm::SegmentEligibility::CorruptOrMissingIndex,
+        "missing index triggers recovery instead of deletion");
+  pm::SegmentMetadata untrusted = acknowledged;
+  untrusted.all_times_trusted = false;
+  check(pm::segmentEligibility(untrusted, context) ==
+            pm::SegmentEligibility::TimeUntrusted,
+        "strict age protects untrusted-time history");
+  context.mode = pm::RetentionMode::ContinuousProtected;
+  context.emergency_pressure = true;
+  check(pm::segmentEligibility(untrusted, context) ==
+            pm::SegmentEligibility::EligibleEmergency,
+        "explicit continuous emergency mode can reclaim acknowledged untrusted segment");
+  untrusted.minimum_window_protected = true;
+  check(pm::segmentEligibility(untrusted, context) ==
+            pm::SegmentEligibility::MinimumWindow,
+        "emergency cleanup preserves the minimum sequence/file window");
+  untrusted.minimum_window_protected = false;
+  pm::SegmentMetadata recent = acknowledged;
+  recent.last_utc_ms = context.minimum_history_cutoff_utc_ms + 1U;
+  check(pm::segmentEligibility(recent, context) ==
+            pm::SegmentEligibility::TooRecent,
+        "minimum recent history is protected during emergency cleanup");
+
+  std::vector<pm::SegmentMetadata> segments{acknowledged, unacknowledged};
+  const pm::CleanupPlan plan =
+      pm::buildCleanupPlan(segments, context, 100U, 1000U);
+  check(plan.candidate_indexes.size() == 1U &&
+            plan.expected_reclaimed_bytes == 1100U &&
+            plan.protected_unacknowledged_bytes == 1100U,
+        "cleanup selects only the oldest eligible bytes and reports protected backlog");
+  const pm::CleanupPlan target_already_met =
+      pm::buildCleanupPlan(segments, context, 1000U, 1000U);
+  check(target_already_met.candidate_indexes.empty() &&
+            target_already_met.eligible_bytes == 1100U,
+        "pressure cleanup stops without deleting eligible evidence once the free-space target is met");
+  const pm::CleanupPlan ordinary_age_cleanup =
+      pm::buildCleanupPlan(segments, context, 1000U, 0U);
+  check(ordinary_age_cleanup.candidate_indexes.size() == 1U,
+        "ordinary age cleanup still selects all age-eligible segments without a pressure target");
+  check(pm::conservativeWriteReserveBytes(4096U) > 300U * 1024U,
+        "write reserve includes journals and filesystem overhead");
+
+  pm::StorageGrowthEstimator growth;
+  growth.observe(1'000U, 1'000U);
+  growth.observe(2'000U, 86'401'000U);
+  growth.observe(3'000U, 172'801'000U);
+  check(growth.bytesPerDay() == 1000U &&
+            growth.estimatedDaysRemaining(20'000U, 5'000U) == 15,
+        "growth estimate uses bounded daily precision");
+}
+
+void testCleanupRecoveryPolicy() {
+  using pm::CleanupRecoveryAction;
+  using pm::CleanupRecoverySnapshot;
+  using pm::cleanupRecoveryAction;
+
+  CleanupRecoverySnapshot snapshot{"planned", true, true, false, true, false};
+  check(cleanupRecoveryAction(snapshot) ==
+            CleanupRecoveryAction::ClearJournal,
+        "untouched planned cleanup only clears its journal");
+  snapshot = {"planned", true, false, true, true, false};
+  check(cleanupRecoveryAction(snapshot) ==
+            CleanupRecoveryAction::ReverseMoves,
+        "partial pre-commit move is rolled back");
+  snapshot = {"planned", true, false, true, false, true};
+  check(cleanupRecoveryAction(snapshot) ==
+            CleanupRecoveryAction::ReverseMoves,
+        "complete pre-commit move is rolled back");
+  snapshot = {"planned", true, true, true, true, false};
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
+        "ambiguous duplicate record copies block cleanup recovery");
+  snapshot = {"planned", true, false, false, true, false};
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
+        "missing record copies block cleanup recovery");
+  snapshot = {"planned", true, true, false, false, false};
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
+        "missing index copies block cleanup recovery");
+  snapshot = {"files_moved", true, false, true, false, true};
+  check(cleanupRecoveryAction(snapshot) ==
+            CleanupRecoveryAction::ForwardDelete,
+        "committed moved files are deleted forward");
+  snapshot = {"record_deleted", true, false, false, false, true};
+  check(cleanupRecoveryAction(snapshot) ==
+            CleanupRecoveryAction::ForwardDelete,
+        "committed remaining index trash is deleted forward");
+  snapshot = {"complete", true, false, false, false, false};
+  check(cleanupRecoveryAction(snapshot) ==
+            CleanupRecoveryAction::ClearJournal,
+        "complete clean transaction clears its journal");
+  snapshot = {"files_moved", true, true, false, false, true};
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
+        "an original reappearing after commit blocks cleanup recovery");
+  snapshot = {"unknown", false, true, false, false, false};
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
+        "unknown cleanup stage is fail-safe");
+}
 } // namespace
 
 int main() {
@@ -1073,6 +1235,8 @@ int main() {
   testProtocolCanonicalization();
   testAuthenticationPolicy();
   testMemoryPressurePolicy();
+  testStoragePolicy();
+  testCleanupRecoveryPolicy();
   testProvisioningTransaction();
   if (failures == 0) {
     std::cout << "native C++ tests passed\n";

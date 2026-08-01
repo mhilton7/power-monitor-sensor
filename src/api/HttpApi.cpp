@@ -1520,6 +1520,7 @@ void HttpApi::registerReadRoutes() {
                document["mounted"] = value.mounted;
                document["writable"] = value.writable;
                document["prepared_for_removal"] = value.prepared_for_removal;
+               document["card_type"] = value.card_type;
                document["filesystem"] = value.filesystem;
                document["capacity_bytes"] = value.capacity_bytes;
                document["used_bytes"] = value.used_bytes;
@@ -1532,11 +1533,57 @@ void HttpApi::registerReadRoutes() {
                document["oldest_sequence"] = value.oldest_sequence;
                document["newest_sequence"] = value.newest_sequence;
                document["server_ack_sequence"] = config_.serverAckSequence();
+               document["event_ack_sequence"] =
+                   config_.serverEventAckSequence();
                document["unsynchronized_estimate"] =
                    value.newest_sequence >= config_.serverAckSequence()
                        ? value.newest_sequence - config_.serverAckSequence()
                        : 0;
                document["spi_hz"] = value.spi_hz;
+               document["pressure_state"] = value.pressure_state;
+               document["pressure_reason"] = value.pressure_reason;
+               document["retention_mode"] =
+                   retentionModeName(config_.measurementRuntimeConfig()
+                                         .storage_policy.mode);
+               document["retention_days"] = config_.measurementRuntimeConfig()
+                                                  .storage_policy.retention_days;
+               document["minimum_local_history_days"] =
+                   config_.measurementRuntimeConfig()
+                       .storage_policy.minimum_local_history_days;
+               document["segment_count"] = value.segment_count;
+               document["open_segment_count"] = value.open_segment_count;
+               document["closed_segment_count"] = value.closed_segment_count;
+               document["eligible_segment_count"] =
+                   value.eligible_segment_count;
+               document["protected_segment_count"] =
+                   value.protected_segment_count;
+               document["untrusted_segment_count"] =
+                   value.untrusted_segment_count;
+               document["event_segment_count"] = value.event_segment_count;
+               document["export_count"] = value.export_count;
+               document["repair_artifact_count"] =
+                   value.repair_artifact_count;
+               document["temporary_artifact_count"] =
+                   value.temporary_artifact_count;
+               document["cleanup_journal_state"] =
+                   value.cleanup_recovery_required ? "recovery_required"
+                                                   : "clear";
+               document["last_cleanup_result"] = value.last_cleanup_result;
+               document["last_cleanup_utc_ms"] = value.last_cleanup_utc_ms;
+               document["last_cleanup_reclaimed_bytes"] =
+                   value.last_cleanup_reclaimed_bytes;
+               document["write_failures"] = value.write_failures;
+               document["read_failures"] = value.read_failures;
+               document["estimated_growth_bytes_per_day"] =
+                   value.growth_bytes_per_day;
+               document["estimated_days_remaining"] =
+                   value.estimated_days_remaining;
+               document["dropped_interval_count"] =
+                   value.dropped_interval_count;
+               document["first_dropped_interval_utc_ms"] =
+                   value.first_dropped_interval_utc_ms;
+               document["last_dropped_interval_utc_ms"] =
+                   value.last_dropped_interval_utc_ms;
                document["last_error"] = value.last_error;
                std::string body;
                serializeJson(document, body);
