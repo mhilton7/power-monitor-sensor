@@ -271,7 +271,28 @@ bool Application::begin() {
   config_.recordBootStarted();
   clock_.begin();
   clock_.update();
-  const bool storage_started = storage_.begin(config_.config().sd_spi_hz);
+  const DeviceIdentity storage_identity = config_.identity();
+  const std::uint64_t required_sequence_floor =
+      std::max({config_.serverAckSequence(),
+                config_.serverMaximumSeenSequence(),
+                config_.preparedRemovalSequence()});
+  bool storage_started = storage_.begin(
+      config_.config().sd_spi_hz,
+      storage_identity.device_id.empty() ? storage_identity.hardware_id
+                                         : storage_identity.device_id,
+      storage_identity.hardware_id, required_sequence_floor);
+  if (!storage_started) {
+    // A firmware upload or watchdog reset does not power-cycle the card. The
+    // first complete recovery ladder can therefore encounter a card that is
+    // still leaving an interrupted SPI transaction. Retry synchronously,
+    // before watchdog-supervised runtime tasks exist, so the card cannot enter
+    // a slow remount scan on the live measurement path.
+    PM_LOG_WARN("STORAGE", "BOOT_MOUNT_RETRY",
+                "reason=initial_recovery_failed delay_ms=500 "
+                "format_attempted=false");
+    delay(500U);
+    storage_started = storage_.remountPreferred();
+  }
   if (!storage_coordinator_.begin()) {
     PM_LOG_FATAL("STORAGE", "QUEUE_INIT_FAILED",
                  "error=PM-STORAGE-001 depth=%u",
@@ -529,7 +550,18 @@ void Application::healthTask() {
       "name=HealthTask core=%d priority=%u stack_bytes=%lu watchdog=false",
       xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
       static_cast<unsigned long>(task_config::kHealthStackBytes));
-  std::uint64_t last_retention_ms = 0;
+  // Mount/recovery already calculates pressure and validates the card. Do not
+  // immediately replay a stale one-shot cleanup request or start the hourly
+  // full-card retention scan during boot reconciliation. Capacity pressure
+  // can still bypass this interval below.
+  const MeasurementRuntimeConfig startup_measurement_config =
+      config_.measurementRuntimeConfig();
+  std::uint64_t last_retention_ms = clock_.monotonicMs();
+  last_storage_cleanup_ack_sequence_ = config_.serverAckSequence();
+  last_storage_cleanup_request_id_ =
+      startup_measurement_config.storage_cleanup_request_id;
+  last_storage_prepare_removal_request_id_ =
+      startup_measurement_config.storage_prepare_removal_request_id;
   std::uint64_t last_health_ms = 0;
   for (;;) {
     diagnostics_.setQueueDepths(
@@ -768,6 +800,7 @@ void Application::healthTask() {
     if (!measurement_config.storage_prepare_removal_request_id.empty() &&
         measurement_config.storage_prepare_removal_request_id !=
             last_storage_prepare_removal_request_id_ &&
+        config_.setPreparedRemovalSequence(storage_.health().newest_sequence) &&
         storage_coordinator_.queuePrepareRemoval()) {
       last_storage_prepare_removal_request_id_ =
           measurement_config.storage_prepare_removal_request_id;
@@ -1260,9 +1293,9 @@ void Application::captureTaskDiagnostics() const {
       {"MeterTask", meter_task_, task_config::kMeterStackBytes, 1, true},
       {"AggregationTask", aggregation_task_,
        task_config::kAggregationStackBytes, 1, true},
-      {"StorageTask", storage_task_, task_config::kStorageStackBytes, 1,
+      {"StorageTask", storage_task_, task_config::kStorageStackBytes, 0,
        false},
-      {"NetworkTask", network_task_, task_config::kNetworkStackBytes, 0,
+      {"NetworkTask", network_task_, task_config::kNetworkStackBytes, 1,
        true},
       {"ServerSyncTask", sync_task_, task_config::kServerSyncStackBytes, 0,
        false},
@@ -1349,16 +1382,17 @@ void Application::executeMaintenance(const MaintenanceMessage &message) {
     }
     break;
   case MaintenanceAction::TestSd:
-    ok = storage_.selfTest();
+    ok = storage_coordinator_.queueSelfTest();
     break;
   case MaintenanceAction::RemountSd:
-    ok = storage_.remount(config_.config().sd_spi_hz);
+    ok = storage_coordinator_.queueRemount();
     break;
   case MaintenanceAction::RebuildIndex:
-    ok = storage_.rebuildIndexes();
+    ok = storage_coordinator_.queueRebuildIndexes();
     break;
   case MaintenanceAction::PrepareCardRemoval:
-    ok = storage_coordinator_.queuePrepareRemoval();
+    ok = config_.setPreparedRemovalSequence(storage_.health().newest_sequence) &&
+         storage_coordinator_.queuePrepareRemoval();
     break;
   case MaintenanceAction::TestDns: {
     const std::string host = httpsHost(config_.config().server_url);
@@ -1450,13 +1484,13 @@ bool Application::createTasks() {
   ok &= xTaskCreatePinnedToCore(storageTaskEntry, "StorageTask",
                                 task_config::kStorageStackBytes, this,
                                 task_config::kStoragePriority,
-                                &storage_task_, 1);
+                                &storage_task_, 0);
   ok &= xTaskCreatePinnedToCore(networkTaskEntry, "NetworkTask",
                                 task_config::kNetworkStackBytes, this, 2,
-                                &network_task_, 0);
+                                &network_task_, 1);
   ok &= xTaskCreatePinnedToCore(syncTaskEntry, "ServerSyncTask",
                                 task_config::kServerSyncStackBytes, this, 2,
-                                &sync_task_, 0);
+                                &sync_task_, 1);
   ok &= xTaskCreatePinnedToCore(healthTaskEntry, "HealthTask",
                                 task_config::kHealthStackBytes, this, 1,
                                 &health_task_, 0);

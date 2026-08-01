@@ -26,6 +26,10 @@ public:
                       const std::string &reason,
                       bool high_priority = false);
   bool queuePrepareRemoval();
+  bool queueSelfTest();
+  bool queueRemount();
+  bool queueRebuildIndexes();
+  bool queueSequenceReconciliation(std::uint64_t required_sequence_floor);
   std::string queueHistory(const HistoryQuery &query, bool events = false,
                            bool primary_sync = false);
   bool historyResult(const std::string &id, HistoryPage &page, bool &complete,
@@ -41,8 +45,11 @@ private:
     Event,
     History,
     Remount,
+    SelfTest,
+    RebuildIndexes,
     Retention,
     PrepareRemoval,
+    ReconcileSequence,
   };
   struct EventData {
     std::string code;
@@ -96,6 +103,8 @@ private:
   std::atomic<std::uint64_t> last_dropped_interval_utc_ms_{0};
   std::atomic<bool> retention_queued_{false};
   std::atomic<bool> prepare_removal_queued_{false};
+  std::atomic<bool> sequence_reconciliation_queued_{false};
+  std::atomic<std::uint64_t> required_sequence_floor_{0};
 };
 
 } // namespace pm

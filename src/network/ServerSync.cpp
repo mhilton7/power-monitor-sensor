@@ -39,7 +39,10 @@ constexpr std::uint32_t kHttpResponseTimeoutMs = 10'000U;
 constexpr std::uint32_t kHttpBodyTimeoutMs = 5000U;
 constexpr std::uint32_t kOverallRequestTimeoutMs = 30'000U;
 constexpr std::uint32_t kHeartbeatStorageWaitMs = 20'000U;
-constexpr std::uint32_t kLocalResourceRetryMs = 1500U;
+// Local memory/storage contention is not an external outage. Give the owning
+// task time to release its bounded allocation before rebuilding another JSON
+// request; rapid 1.5-second retries fragmented the steady-state heap.
+constexpr std::uint32_t kLocalResourceRetryMs = 5000U;
 constexpr std::uint32_t kResponseReadPollMs = 10U;
 constexpr std::size_t kReadingBatchRecordLimit = 8U;
 constexpr std::size_t kEventBatchRecordLimit = 24U;
@@ -620,7 +623,8 @@ void ServerSync::tick() {
   }
   const std::uint64_t now = clock_.monotonicMs();
   metrics_.durable_reading_backlog =
-      config_.serverAckSequence() < storage_.health().newest_sequence;
+      config_.serverAckSequence() <
+      storage_.health().newest_syncable_sequence;
   metrics_.primary_storage_pending = !reading_page_job_id_.empty() ||
                                      !event_page_job_id_.empty();
   const std::uint64_t reenrollment_generation =
@@ -749,8 +753,9 @@ void ServerSync::tick() {
               now < next_retry_ms_ ? next_retry_ms_ - now : 0),
           static_cast<unsigned long>(retry_attempt_),
           static_cast<unsigned long long>(
-              storage_.health().newest_sequence >= config_.serverAckSequence()
-                  ? storage_.health().newest_sequence -
+              storage_.health().newest_syncable_sequence >=
+                      config_.serverAckSequence()
+                  ? storage_.health().newest_syncable_sequence -
                         config_.serverAckSequence()
                   : 0));
     }
@@ -1102,6 +1107,7 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
   logTaskCheckpoint("BEFORE_JSON_BUILD");
   const std::string heartbeat_body = heartbeatBody();
   logTaskCheckpoint("AFTER_JSON_BUILD");
+  ++metrics_.heartbeat_requests_sent;
   const HttpResult response = request("POST", "/api/v1/device-heartbeats",
                                       std::move(heartbeat_body), true);
   last_operation_locally_deferred_ = response.local_resource_deferred;
@@ -1115,6 +1121,7 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
       return false;
     }
     ++metrics_.heartbeat_failures;
+    ++metrics_.heartbeat_transport_failures;
     metrics_.last_error =
         !response.problem_code.empty()
             ? response.problem_code
@@ -1122,6 +1129,7 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
     network_.setServerStatus(response.status > 0, false);
     if (response.status == 401 || response.status == 403) {
       ++metrics_.authentication_rejections;
+      ++metrics_.heartbeat_authentication_failures;
     }
     PM_LOG_WARN("HEARTBEAT", "HEARTBEAT_FAILED",
                 "error=PM-SERVER-001 status=%d category=%s problem=%s "
@@ -1133,10 +1141,12 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
                 static_cast<unsigned long>(retry_attempt_));
     return false;
   }
+  ++metrics_.heartbeat_http_200;
   logTaskCheckpoint("BEFORE_RESPONSE_PARSE");
   JsonDocument document;
   if (deserializeJson(document, response.body)) {
     ++metrics_.heartbeat_failures;
+    ++metrics_.heartbeat_contract_failures;
     metrics_.last_error = "heartbeat_response_invalid";
     PM_LOG_ERROR("HEARTBEAT", "RESPONSE_INVALID", "error=PM-SERVER-002");
     logTaskCheckpoint("AFTER_RESPONSE_PARSE");
@@ -1150,44 +1160,159 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
       !document["recommended_heartbeat_interval_seconds"].is<std::uint32_t>() ||
       !document["immediate_sync_requested"].is<bool>()) {
     ++metrics_.heartbeat_failures;
+    ++metrics_.heartbeat_contract_failures;
     metrics_.last_error = "heartbeat_response_contract_invalid";
     PM_LOG_ERROR("HEARTBEAT", "RESPONSE_INVALID",
                  "error=PM-SERVER-002 category=contract_shape_invalid");
     logTaskCheckpoint("AFTER_RESPONSE_PARSE");
     return false;
   }
+  ++metrics_.heartbeat_transport_successes;
+  ++metrics_.heartbeat_server_accepted;
+  metrics_.last_heartbeat_utc_ms = clock_.utcMs();
+  network_.setServerStatus(true, true);
   const std::uint64_t acknowledgement =
       document["highest_contiguous_accepted_sequence"].as<std::uint64_t>();
   const std::uint64_t current_ack = config_.serverAckSequence();
-  const std::uint64_t newest_sequence = storage_.health().newest_sequence;
+  std::uint64_t maximum_seen = acknowledgement;
+  bool cursor_contract_valid = true;
+  if (document["sequence_cursor"].is<JsonObjectConst>()) {
+    const JsonObjectConst cursor = document["sequence_cursor"].as<JsonObjectConst>();
+    if (!cursor["highest_contiguous_accepted_sequence"].is<std::uint64_t>() ||
+        !cursor["maximum_seen_sequence"].is<std::uint64_t>() ||
+        !cursor["next_sequence_floor"].is<std::uint64_t>()) {
+      ++metrics_.heartbeat_contract_failures;
+      ++metrics_.sequence_cursor_conflicts;
+      metrics_.last_error = "heartbeat_cursor_contract_invalid";
+      PM_LOG_ERROR("HEARTBEAT", "RESPONSE_INVALID",
+                   "error=PM-SERVER-002 category=cursor_shape_invalid "
+                   "heartbeat_accepted=true external_failure=false");
+      cursor_contract_valid = false;
+      maximum_seen = config_.serverMaximumSeenSequence();
+    } else {
+      const std::uint64_t nested_ack =
+          cursor["highest_contiguous_accepted_sequence"].as<std::uint64_t>();
+      maximum_seen = cursor["maximum_seen_sequence"].as<std::uint64_t>();
+      const std::uint64_t next_floor =
+          cursor["next_sequence_floor"].as<std::uint64_t>();
+      if (!sync_policy::sequenceCursorContractValid(
+              acknowledgement, nested_ack, maximum_seen, next_floor)) {
+        ++metrics_.heartbeat_contract_failures;
+        ++metrics_.sequence_cursor_conflicts;
+        metrics_.last_error = "heartbeat_cursor_contract_invalid";
+        PM_LOG_ERROR(
+            "HEARTBEAT", "RESPONSE_INVALID",
+            "error=PM-SERVER-002 category=cursor_values_invalid ack=%llu "
+            "nested_ack=%llu maximum_seen=%llu next_floor=%llu "
+            "heartbeat_accepted=true external_failure=false",
+            static_cast<unsigned long long>(acknowledgement),
+            static_cast<unsigned long long>(nested_ack),
+            static_cast<unsigned long long>(maximum_seen),
+            static_cast<unsigned long long>(next_floor));
+        cursor_contract_valid = false;
+        maximum_seen = config_.serverMaximumSeenSequence();
+      }
+    }
+  }
+  const SequenceState sequence_state = storage_.sequenceState(
+      current_ack, config_.serverMaximumSeenSequence(),
+      config_.preparedRemovalSequence());
+  const std::uint64_t newest_sequence =
+      sequence_state.local_newest_sequence;
+  PM_LOG_INFO(
+      "SYNC", "ACK_RECONCILIATION_BEGIN",
+      "request_id=%lu current_ack=%llu response_ack=%llu "
+      "response_maximum_seen=%llu local_newest=%llu local_floor=%llu "
+      "next_sequence=%llu mounted=%s writable=%s",
+      static_cast<unsigned long>(metrics_.active_request_id),
+      static_cast<unsigned long long>(current_ack),
+      static_cast<unsigned long long>(acknowledgement),
+      static_cast<unsigned long long>(maximum_seen),
+      static_cast<unsigned long long>(sequence_state.local_newest_sequence),
+      static_cast<unsigned long long>(
+          sequence_state.local_journal_high_water),
+      static_cast<unsigned long long>(sequence_state.next_sequence),
+      sequence_state.storage_mounted ? "true" : "false",
+      sequence_state.storage_writable ? "true" : "false");
   const sync_policy::AcknowledgementDisposition acknowledgement_disposition =
       sync_policy::classifyAcknowledgement(current_ack, newest_sequence,
                                            acknowledgement);
-  const bool sequence_floor_ready =
-      acknowledgement_disposition !=
-          sync_policy::AcknowledgementDisposition::AdvanceSequenceFloor ||
-      storage_.advanceSequenceFloor(acknowledgement);
-  const bool acknowledgement_valid =
-      acknowledgement_disposition !=
-          sync_policy::AcknowledgementDisposition::Invalid &&
-      sequence_floor_ready;
-  const bool acknowledgement_persisted =
-      acknowledgement_valid && (acknowledgement == current_ack ||
-                                config_.setServerAckSequence(acknowledgement));
-  if (!acknowledgement_persisted) {
-    ++metrics_.heartbeat_failures;
-    metrics_.last_error = "heartbeat_ack_invalid";
-    PM_LOG_ERROR("HEARTBEAT", "RESPONSE_INVALID",
-                 "error=PM-SERVER-002 category=ack_invalid current_ack=%llu "
-                 "response_ack=%llu newest=%llu",
-                 static_cast<unsigned long long>(current_ack),
-                 static_cast<unsigned long long>(acknowledgement),
-                 static_cast<unsigned long long>(newest_sequence));
-    logTaskCheckpoint("AFTER_RESPONSE_PARSE");
-    return false;
+  PM_LOG_INFO(
+      "SYNC", "ACK_DISPOSITION_SELECTED",
+      "disposition=%u current_ack=%llu response_ack=%llu local_newest=%llu",
+      static_cast<unsigned>(acknowledgement_disposition),
+      static_cast<unsigned long long>(current_ack),
+      static_cast<unsigned long long>(acknowledgement),
+      static_cast<unsigned long long>(newest_sequence));
+  const bool cursor_regressed = !cursor_contract_valid ||
+      acknowledgement_disposition ==
+          sync_policy::AcknowledgementDisposition::Invalid ||
+      maximum_seen < config_.serverMaximumSeenSequence();
+  if (cursor_regressed) {
+    if (cursor_contract_valid) {
+      ++metrics_.sequence_cursor_conflicts;
+      ++metrics_.sequence_cursor_regressions;
+      metrics_.last_error = "server_sequence_cursor_regressed";
+    }
+    PM_LOG_ERROR(
+        "SYNC", "SEQUENCE_CURSOR_CONFLICT",
+        "reason=%s current_ack=%llu response_ack=%llu "
+        "current_maximum_seen=%llu response_maximum_seen=%llu "
+        "heartbeat_accepted=true external_failure=false",
+        cursor_contract_valid ? "server_cursor_regression"
+                              : "cursor_contract_invalid",
+        static_cast<unsigned long long>(current_ack),
+        static_cast<unsigned long long>(acknowledgement),
+        static_cast<unsigned long long>(config_.serverMaximumSeenSequence()),
+        static_cast<unsigned long long>(maximum_seen));
+  } else {
+    const bool acknowledgement_persisted =
+        acknowledgement == current_ack ||
+        config_.setServerAckSequence(acknowledgement);
+    const bool maximum_seen_persisted =
+        maximum_seen == config_.serverMaximumSeenSequence() ||
+        config_.setServerMaximumSeenSequence(maximum_seen);
+    if (!acknowledgement_persisted || !maximum_seen_persisted) {
+      metrics_.last_error = "server_sequence_cursor_persist_failed";
+      PM_LOG_ERROR(
+          "SYNC", "SEQUENCE_CURSOR_PERSIST_FAILED",
+          "ack_persisted=%s maximum_seen_persisted=%s "
+          "heartbeat_accepted=true",
+          acknowledgement_persisted ? "true" : "false",
+          maximum_seen_persisted ? "true" : "false");
+    }
+  }
+  const std::uint64_t required_sequence_floor =
+      sync_policy::requiredSequenceFloor(
+          sequence_state.local_newest_sequence,
+          sequence_state.local_journal_high_water, current_ack,
+          config_.serverMaximumSeenSequence(), maximum_seen);
+  if (!cursor_regressed && sequence_state.storage_mounted &&
+      required_sequence_floor > sequence_state.local_journal_high_water) {
+    ++metrics_.sequence_reconciliation_requests;
+    if (!storage_coordinator_.queueSequenceReconciliation(
+            required_sequence_floor)) {
+      ++metrics_.sequence_reconciliation_failures;
+      metrics_.last_error = "sequence_reconciliation_queue_unavailable";
+      PM_LOG_ERROR("SYNC", "SEQUENCE_RECONCILIATION_QUEUE_FAILED",
+                   "required_floor=%llu heartbeat_accepted=true",
+                   static_cast<unsigned long long>(required_sequence_floor));
+    } else {
+      ++metrics_.sequence_reconciliation_deferred;
+    }
+  } else if (!cursor_regressed && !sequence_state.storage_mounted &&
+             required_sequence_floor >
+                 sequence_state.local_journal_high_water) {
+    PM_LOG_INFO(
+        "SYNC", "SEQUENCE_RECONCILIATION_DEFERRED",
+        "reason=storage_unmounted required_floor=%llu "
+        "local_floor=%llu heartbeat_accepted=true",
+        static_cast<unsigned long long>(required_sequence_floor),
+        static_cast<unsigned long long>(
+            sequence_state.local_journal_high_water));
   }
   immediate_sync_ = document["immediate_sync_requested"].as<bool>();
-  if (sync_policy::shouldReleaseReadingBackoff(
+  if (!cursor_regressed && sync_policy::shouldReleaseReadingBackoff(
           immediate_sync_, acknowledgement, newest_sequence,
           immediate_sync_release_recorded_,
           last_immediate_sync_release_ack_)) {
@@ -1224,9 +1349,11 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
     available_firmware_version_ = available;
   }
   ++metrics_.heartbeat_successes;
-  metrics_.last_heartbeat_utc_ms = clock_.utcMs();
-  metrics_.last_error.clear();
-  network_.setServerStatus(true, true);
+  if (!cursor_regressed &&
+      metrics_.last_error != "server_sequence_cursor_persist_failed" &&
+      metrics_.last_error != "sequence_reconciliation_queue_unavailable") {
+    metrics_.last_error.clear();
+  }
   network_.ipChangedSinceHeartbeat();
   PM_LOG_INFO("HEARTBEAT", "HEARTBEAT_COMPLETE",
               "successes=%llu ack_sequence=%llu synchronize_now=%s "
@@ -1316,8 +1443,9 @@ bool ServerSync::pushReadings() {
       static_cast<unsigned long long>(page.first_sequence),
       static_cast<unsigned long long>(page.last_sequence),
       static_cast<unsigned long long>(
-          storage_.health().newest_sequence >= config_.serverAckSequence()
-              ? storage_.health().newest_sequence -
+          storage_.health().newest_syncable_sequence >=
+                  config_.serverAckSequence()
+              ? storage_.health().newest_syncable_sequence -
                     config_.serverAckSequence()
               : 0));
   if (page.has_more) {
@@ -1451,7 +1579,8 @@ bool ServerSync::pushReadings() {
   const std::uint64_t acknowledgement =
       result["highest_contiguous_accepted_sequence"].as<std::uint64_t>();
   const std::uint64_t current_ack = config_.serverAckSequence();
-  const std::uint64_t newest_sequence = storage_.health().newest_sequence;
+  const std::uint64_t newest_sequence =
+      storage_.health().newest_syncable_sequence;
   if (acknowledgement == current_ack) {
     ++metrics_.batch_failures;
     metrics_.last_error = "batch_ack_stalled";
@@ -2492,16 +2621,38 @@ std::string ServerSync::heartbeatBody() const {
     live["energy_wh"] = latest.device_lifetime_energy_wh;
   }
   JsonObject storage_json = document["sd"].to<JsonObject>();
-  const bool storage_ok =
-      storage.present && storage.mounted && storage.writable;
+  const bool storage_ok = storage.present && storage.mounted &&
+                          storage.writable && storage.sequence_floor_ready;
   storage_json["ok"] = storage_ok;
-  storage_json["status"] = storage_ok ? storage.pressure_state.c_str()
-                                      : "storage_unavailable";
+  storage_json["status"] =
+      storage.sequence_reconciliation_in_progress
+          ? "sequence_reconciling"
+          : (storage_ok
+                 ? (storage.index_healthy ? storage.pressure_state.c_str()
+                                          : "history_integrity_degraded")
+                 : "storage_degraded");
   storage_json["error_count"] = storage.write_failures;
   JsonObject storage_details = storage_json["details"].to<JsonObject>();
   storage_details["present"] = storage.present;
   storage_details["mounted"] = storage.mounted;
   storage_details["writable"] = storage.writable;
+  storage_details["history_integrity_verified"] = storage.index_healthy;
+  storage_details["sequence_floor_ready"] = storage.sequence_floor_ready;
+  storage_details["sequence_reconciliation_in_progress"] =
+      storage.sequence_reconciliation_in_progress;
+  storage_details["sequence_conflict"] = storage.sequence_conflict;
+  storage_details["sequence_cursor_conflict"] =
+      metrics_.last_error == "server_sequence_cursor_regressed" ||
+      metrics_.last_error == "heartbeat_cursor_contract_invalid";
+  storage_details["sequence_floor"] = storage.sequence_floor;
+  storage_details["next_sequence"] = storage.next_sequence;
+  storage_details["local_record_count"] = storage.local_record_count;
+  storage_details["card_empty"] = storage.local_record_count == 0U;
+  storage_details["card_replaced_or_initialized"] =
+      storage.card_replaced_or_initialized;
+  storage_details["card_identity_status"] = storage.card_identity_status;
+  storage_details["card_generation"] = storage.card_generation;
+  storage_details["last_self_test_passed"] = storage.last_self_test_passed;
   storage_details["prepared_for_removal"] = storage.prepared_for_removal;
   storage_details["card_type"] = storage.card_type;
   storage_details["filesystem"] = storage.filesystem;
@@ -2534,7 +2685,9 @@ std::string ServerSync::heartbeatBody() const {
       measurement_config.storage_policy.cleanup_target_bytes;
   storage_details["event_retention_days"] =
       measurement_config.storage_policy.event_retention_days;
-  storage_details["server_ack_sequence"] = storage.server_ack_sequence;
+  storage_details["server_ack_sequence"] = config_.serverAckSequence();
+  storage_details["server_maximum_seen_sequence"] =
+      config_.serverMaximumSeenSequence();
   storage_details["event_ack_sequence"] = config_.serverEventAckSequence();
   storage_details["acknowledgement_verified"] =
       storage.acknowledgement_verified;
@@ -2543,8 +2696,8 @@ std::string ServerSync::heartbeatBody() const {
   storage_details["oldest_event_sequence"] = storage.oldest_event_sequence;
   storage_details["newest_event_sequence"] = storage.newest_event_sequence;
   storage_details["unacknowledged_record_count"] =
-      storage.newest_sequence >= config_.serverAckSequence()
-          ? storage.newest_sequence - config_.serverAckSequence()
+      storage.newest_syncable_sequence >= config_.serverAckSequence()
+          ? storage.newest_syncable_sequence - config_.serverAckSequence()
           : 0U;
   storage_details["reclaimable_bytes"] = storage.reclaimable_bytes;
   storage_details["protected_unacknowledged_bytes"] =
@@ -2593,11 +2746,14 @@ std::string ServerSync::heartbeatBody() const {
   storage_details["last_error"] = storage.last_error;
   document["oldest_stored_sequence"] = storage.oldest_sequence;
   document["oldest_syncable_sequence"] = storage.oldest_syncable_sequence;
+  document["newest_syncable_sequence"] = storage.newest_syncable_sequence;
   document["newest_stored_sequence"] = storage.newest_sequence;
   document["server_ack_sequence"] = config_.serverAckSequence();
+  document["server_maximum_seen_sequence"] =
+      config_.serverMaximumSeenSequence();
   document["backlog_estimate"] =
-      storage.newest_sequence >= config_.serverAckSequence()
-          ? storage.newest_sequence - config_.serverAckSequence()
+      storage.newest_syncable_sequence >= config_.serverAckSequence()
+          ? storage.newest_syncable_sequence - config_.serverAckSequence()
           : 0;
   JsonObject resources = document["resources"].to<JsonObject>();
   resources["free_heap_bytes"] = ESP.getFreeHeap();

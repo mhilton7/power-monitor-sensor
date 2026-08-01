@@ -1039,7 +1039,7 @@ class ProtocolContractTests(unittest.TestCase):
         events_start = firmware_source.index("bool ServerSync::pushEvents")
         events_rejected = firmware_source.index('"EVENT_BATCH_REJECTED"', events_start)
         events_cursor_commit = firmware_source.index(
-            "event_cursor_ = page_last_sequence", events_start
+            "event_cursor_ = acknowledged_event_sequence", events_start
         )
         self.assertLess(events_rejected, events_cursor_commit)
 
@@ -1075,7 +1075,7 @@ class ProtocolContractTests(unittest.TestCase):
             "kSdIdleClockBytes = 10U",
             "digitalWrite(pins::SD_CS, HIGH)",
             "spi.transfer(0xFFU)",
-            "const std::array<std::uint32_t, 3> attempt_hz",
+            "const std::array<std::uint32_t, 4> attempt_hz",
             "for (const std::uint32_t candidate_hz : attempt_hz)",
             "delay(static_cast<std::uint32_t>(attempt) * 25U)",
             "format_on_failure=false",
@@ -1088,12 +1088,19 @@ class ProtocolContractTests(unittest.TestCase):
             "publishHealthSnapshot(copy);",
             "last_health_snapshot_",
             "storage_health_snapshot_busy",
+            "lock(pdMS_TO_TICKS(100))",
+            "snapshot = last_health_snapshot_",
+            "A heartbeat must not interpret that temporary",
+            "acknowledged_sequence <= current_floor",
+            "reason=current_floor_satisfies_required",
             "std::size_t scanned_records = 0;",
             "std::size_t scanned_bytes = 0;",
             "std::size_t copied_chunks = 0;",
             "scanned_records % kCooperativeScanRecords == 0U",
             "scanned_bytes % kCooperativeScanBytes == 0U",
             "copied_chunks % kCooperativeScanRecords == 0U",
+            "index_count % kCooperativeScanRecords == 0U",
+            "scanned_event_records % kCooperativeScanRecords == 0U",
         ):
             self.assertIn(marker, source)
         coordinator = (
@@ -1117,10 +1124,29 @@ class ProtocolContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("kAggregationPriority = 3U", task_config)
-        self.assertIn("kStoragePriority = 2U", task_config)
-        self.assertIn("kHealthStackBytes = 8192U", task_config)
+        self.assertIn("kStoragePriority = 0U", task_config)
+        self.assertIn("time-slices recovery with IDLE0", task_config)
+        self.assertIn("kStorageStackBytes = 12288U", task_config)
+        self.assertIn("kHealthStackBytes = 12288U", task_config)
         self.assertIn("task_config::kAggregationPriority", application)
         self.assertIn("task_config::kStoragePriority", application)
+        self.assertIn('&storage_task_, 0);', application)
+        self.assertIn('&network_task_, 1);', application)
+        self.assertIn('&sync_task_, 1);', application)
+        self.assertIn("ScopedFatDirectoryWatchdogGuard", source)
+        self.assertIn("esp_task_wdt_delete(idle_task_)", source)
+        self.assertIn("esp_task_wdt_add(idle_task_)", source)
+        self.assertIn('"BOOT_MOUNT_RETRY"', application)
+        self.assertIn(
+            "last_retention_ms = clock_.monotonicMs()", application
+        )
+        self.assertIn(
+            "last_storage_cleanup_ack_sequence_ = config_.serverAckSequence()",
+            application,
+        )
+        self.assertIn(
+            "startup_measurement_config.storage_cleanup_request_id", application
+        )
         header = (ROOT / "src/storage/SdStorage.h").read_text(encoding="utf-8")
         self.assertIn("bool remountPreferred();", header)
         self.assertIn("preferred_spi_hz_{0}", header)
@@ -1145,12 +1171,26 @@ class ProtocolContractTests(unittest.TestCase):
             "health_.oldest_syncable_sequence",
             "vTaskDelay(pdMS_TO_TICKS(1));",
             "page.unavailable_sequence_ranges",
+            "HISTORY_SEGMENT_SKIPPED",
+            "segment.last_sequence <= query.after_sequence",
+            "segment.first_sequence > scan_ceiling",
+            "segment.closed &&",
+            "segment.complete &&",
+            "RECOVERY_SEGMENT_METADATA_ACCEPTED",
+            "reason=index_range_empty",
+            "indexed_start_offset",
         ):
             self.assertIn(marker, source)
+        self.assertIn(
+            "Active segments and any segment with missing/incomplete metadata",
+            source,
+        )
         server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(
             encoding="utf-8"
         )
         self.assertIn("query.require_syncable = true", server_sync)
+        self.assertIn("sequence_state.storage_mounted &&", server_sync)
+        self.assertIn('"SEQUENCE_RECONCILIATION_DEFERRED"', server_sync)
         self.assertIn('document["oldest_syncable_sequence"]', server_sync)
         self.assertIn(
             'SD.begin(pins::SD_CS, spi_, candidate_hz, "/sd", 8, false)', source

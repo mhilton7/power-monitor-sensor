@@ -122,6 +122,16 @@ void testEnergyAndRecord() {
   check(pm::sync_policy::classifyAcknowledgement(5, 8, 4) ==
             AcknowledgementDisposition::Invalid,
         "acknowledgement cannot regress");
+  check(pm::sync_policy::requiredSequenceFloor(0, 0, 785, 790, 790) ==
+            790,
+        "blank replacement card resumes above the server maximum-seen cursor");
+  check(pm::sync_policy::requiredSequenceFloor(812, 810, 785, 790, 790) ==
+            812,
+        "retained local records cannot be replaced by an older remote cursor");
+  check(pm::sync_policy::sequenceCursorContractValid(785, 785, 790, 791),
+        "server cursor accepts a maximum-seen value beyond contiguous ack");
+  check(!pm::sync_policy::sequenceCursorContractValid(785, 785, 790, 790),
+        "server cursor rejects a reused next sequence");
   pm::EnergyNormalizer rollover;
   result = rollover.update(0xFFFFFFF0ULL, 20, true, true, 0.0, false);
   check(result.method == std::string("pzem_rollover") &&
@@ -445,6 +455,7 @@ void testServerSyncPolicy() {
               pm::sync_policy::tlsMemoryReserveAvailable(92'696U, 39'924U) &&
               pm::sync_policy::tlsMemoryReserveAvailable(88'424U, 33'780U) &&
               pm::sync_policy::tlsMemoryReserveAvailable(81'508U, 52'212U) &&
+              pm::sync_policy::tlsMemoryReserveAvailable(72'348U, 58'356U) &&
               !pm::sync_policy::tlsMemoryReserveAvailable(
                  pm::sync_policy::kMinimumInternalHeapBytes - 1U,
                  pm::sync_policy::kMinimumLargestInternalBlockBytes) &&

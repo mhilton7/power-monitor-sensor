@@ -413,6 +413,9 @@ bool ConfigService::begin() {
         preferences_.getBytesLength("admin_hash") == crypto::Key32{}.size() &&
         preferences_.getBytesLength("admin_salt") == 16;
     server_ack_sequence_ = preferences_.getULong64("server_ack", 0);
+    server_maximum_seen_sequence_ =
+        preferences_.getULong64("server_max", server_ack_sequence_);
+    prepared_removal_sequence_ = preferences_.getULong64("remove_seq", 0);
     server_event_ack_sequence_ = preferences_.getULong64("event_ack", 0);
     server_config_version_ = preferences_.getUInt("server_cfg", 0);
     energy_offset_wh_ = preferences_.getULong64("energy_off", 0);
@@ -1106,6 +1109,8 @@ bool ConfigService::saveEnrollment(const std::string &device_id,
   }
   const std::uint64_t reenrollment_generation = reenrollmentGeneration();
   if (!writeULong64Checked(preferences_, "server_ack", 0) ||
+      !writeULong64Checked(preferences_, "server_max", 0) ||
+      !writeULong64Checked(preferences_, "remove_seq", 0) ||
       !writeULong64Checked(preferences_, "event_ack", 0) ||
       !writeUIntChecked(preferences_, "server_cfg", 0)) {
     PM_LOG_ERROR("CONFIG", "ENROLLMENT_CURSOR_PREPARE_FAILED",
@@ -1136,6 +1141,8 @@ bool ConfigService::saveEnrollment(const std::string &device_id,
     if (!state)
       return false;
     server_ack_sequence_ = 0;
+    server_maximum_seen_sequence_ = 0;
+    prepared_removal_sequence_ = 0;
     server_event_ack_sequence_ = 0;
     server_config_version_ = 0;
   }
@@ -1549,8 +1556,15 @@ bool ConfigService::beginReenrollment(const std::string &token) {
   const bool token_verified = setEnrollmentToken(token);
   const bool ack_cursor_verified =
       token_verified && writeULong64Checked(preferences_, "server_ack", 0);
+  const bool maximum_cursor_verified =
+      ack_cursor_verified &&
+      writeULong64Checked(preferences_, "server_max", 0);
+  const bool removal_cursor_verified =
+      maximum_cursor_verified &&
+      writeULong64Checked(preferences_, "remove_seq", 0);
   const bool event_cursor_verified =
-      ack_cursor_verified && writeULong64Checked(preferences_, "event_ack", 0);
+      removal_cursor_verified &&
+      writeULong64Checked(preferences_, "event_ack", 0);
   const bool config_cursor_verified =
       event_cursor_verified && writeUIntChecked(preferences_, "server_cfg", 0);
   if (!reenrollmentPrerequisitesReady(token_verified, ack_cursor_verified,
@@ -1577,6 +1591,8 @@ bool ConfigService::beginReenrollment(const std::string &token) {
     if (!state)
       return false;
     server_ack_sequence_ = 0;
+    server_maximum_seen_sequence_ = 0;
+    prepared_removal_sequence_ = 0;
     server_event_ack_sequence_ = 0;
     server_config_version_ = 0;
   }
@@ -1628,6 +1644,8 @@ bool ConfigService::factoryReset() {
     persistent_generation_ = generation;
     admin_password_configured_ = false;
     server_ack_sequence_ = 0;
+    server_maximum_seen_sequence_ = 0;
+    prepared_removal_sequence_ = 0;
     server_event_ack_sequence_ = 0;
     server_config_version_ = 0;
     energy_offset_wh_ = 0;
@@ -1660,6 +1678,54 @@ bool ConfigService::setServerAckSequence(const std::uint64_t sequence) {
   if (!state)
     return false;
   server_ack_sequence_ = sequence;
+  return true;
+}
+
+std::uint64_t ConfigService::serverMaximumSeenSequence() const {
+  RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+  return state ? server_maximum_seen_sequence_ : 0;
+}
+
+bool ConfigService::setServerMaximumSeenSequence(const std::uint64_t sequence) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
+  if (!mutation)
+    return false;
+  const std::uint64_t current = serverMaximumSeenSequence();
+  if (sequence < current)
+    return false;
+  if (sequence == current)
+    return true;
+  if (!writeULong64Checked(preferences_, "server_max", sequence)) {
+    return false;
+  }
+  RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+  if (!state)
+    return false;
+  server_maximum_seen_sequence_ = sequence;
+  return true;
+}
+
+std::uint64_t ConfigService::preparedRemovalSequence() const {
+  RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+  return state ? prepared_removal_sequence_ : 0;
+}
+
+bool ConfigService::setPreparedRemovalSequence(const std::uint64_t sequence) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
+  if (!mutation)
+    return false;
+  const std::uint64_t current = preparedRemovalSequence();
+  if (sequence < current)
+    return false;
+  if (sequence == current)
+    return true;
+  if (!writeULong64Checked(preferences_, "remove_seq", sequence)) {
+    return false;
+  }
+  RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+  if (!state)
+    return false;
+  prepared_removal_sequence_ = sequence;
   return true;
 }
 
@@ -2020,8 +2086,14 @@ bool ConfigService::loadOrMigrateEnrollment() {
       const bool token_verified = setEnrollmentToken(pending_token);
       const bool ack_cursor_verified =
           token_verified && writeULong64Checked(preferences_, "server_ack", 0);
-      const bool event_cursor_verified =
+      const bool maximum_cursor_verified =
           ack_cursor_verified &&
+          writeULong64Checked(preferences_, "server_max", 0);
+      const bool removal_cursor_verified =
+          maximum_cursor_verified &&
+          writeULong64Checked(preferences_, "remove_seq", 0);
+      const bool event_cursor_verified =
+          removal_cursor_verified &&
           writeULong64Checked(preferences_, "event_ack", 0);
       const bool config_cursor_verified =
           event_cursor_verified &&
@@ -2048,6 +2120,8 @@ bool ConfigService::loadOrMigrateEnrollment() {
         if (!state)
           return false;
         server_ack_sequence_ = 0;
+        server_maximum_seen_sequence_ = 0;
+        prepared_removal_sequence_ = 0;
         server_event_ack_sequence_ = 0;
         server_config_version_ = 0;
       }

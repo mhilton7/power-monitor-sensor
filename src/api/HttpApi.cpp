@@ -987,8 +987,8 @@ void HttpApi::registerReadRoutes() {
         const bool has_latest = diagnostics_.latest(latest) && latest.valid;
         const std::uint64_t acknowledgement = config_.serverAckSequence();
         const std::uint64_t backlog =
-            storage.newest_sequence >= acknowledgement
-                ? storage.newest_sequence - acknowledgement
+            storage.newest_syncable_sequence >= acknowledgement
+                ? storage.newest_syncable_sequence - acknowledgement
                 : 0U;
         const std::uint32_t free_internal =
             heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -1139,8 +1139,8 @@ void HttpApi::registerReadRoutes() {
         sync_json["acknowledged_sequence"] = acknowledgement;
         sync_json["newest_sequence"] = storage.newest_sequence;
         sync_json["backlog"] =
-            storage.newest_sequence >= acknowledgement
-                ? storage.newest_sequence - acknowledgement
+            storage.newest_syncable_sequence >= acknowledgement
+                ? storage.newest_syncable_sequence - acknowledgement
                 : 0U;
         sync_json["last_safe_error"] = sync.last_error;
         JsonObject local_http = document["local_http"].to<JsonObject>();
@@ -1371,9 +1371,12 @@ void HttpApi::registerReadRoutes() {
         document["oldest_syncable_sequence"] =
             storage.oldest_syncable_sequence;
         document["newest_stored_sequence"] = storage.newest_sequence;
+        document["newest_syncable_sequence"] =
+            storage.newest_syncable_sequence;
         document["durable_backlog_count"] =
-            storage.newest_sequence >= config_.serverAckSequence()
-                ? storage.newest_sequence - config_.serverAckSequence()
+            storage.newest_syncable_sequence >= config_.serverAckSequence()
+                ? storage.newest_syncable_sequence -
+                      config_.serverAckSequence()
                 : 0;
         document["durable_reading_backlog"] =
             sync.durable_reading_backlog;
@@ -1532,12 +1535,16 @@ void HttpApi::registerReadRoutes() {
                document["repair_count"] = value.repair_count;
                document["oldest_sequence"] = value.oldest_sequence;
                document["newest_sequence"] = value.newest_sequence;
+               document["newest_syncable_sequence"] =
+                   value.newest_syncable_sequence;
                document["server_ack_sequence"] = config_.serverAckSequence();
                document["event_ack_sequence"] =
                    config_.serverEventAckSequence();
                document["unsynchronized_estimate"] =
-                   value.newest_sequence >= config_.serverAckSequence()
-                       ? value.newest_sequence - config_.serverAckSequence()
+                   value.newest_syncable_sequence >=
+                           config_.serverAckSequence()
+                       ? value.newest_syncable_sequence -
+                             config_.serverAckSequence()
                        : 0;
                document["spi_hz"] = value.spi_hz;
                document["pressure_state"] = value.pressure_state;
@@ -1600,9 +1607,12 @@ void HttpApi::registerReadRoutes() {
         document["mode"] = connectionModeName(config_.config().connection_mode);
         document["server_ack_sequence"] = config_.serverAckSequence();
         document["newest_sequence"] = storage.newest_sequence;
+        document["newest_syncable_sequence"] =
+            storage.newest_syncable_sequence;
         document["backlog_estimate"] =
-            storage.newest_sequence >= config_.serverAckSequence()
-                ? storage.newest_sequence - config_.serverAckSequence()
+            storage.newest_syncable_sequence >= config_.serverAckSequence()
+                ? storage.newest_syncable_sequence -
+                      config_.serverAckSequence()
                 : 0;
         document["last_heartbeat_utc_ms"] = sync.last_heartbeat_utc_ms;
         document["last_sync_utc_ms"] = sync.last_sync_utc_ms;

@@ -328,7 +328,7 @@ std::string Diagnostics::healthJson(const ConfigService &config,
   document["parent_circuit_id"] = active_config.parent_circuit_id;
   document["measurement_role"] = active_config.measurement_role;
   const bool storage_healthy =
-      storage.writable &&
+      storage.writable && storage.sequence_floor_ready &&
       storage.free_bytes >= active_config.storage_warning_free_bytes;
   document["status"] =
       config.safeMode()
@@ -363,6 +363,19 @@ std::string Diagnostics::healthJson(const ConfigService &config,
   storage_json["present"] = storage.present;
   storage_json["mounted"] = storage.mounted;
   storage_json["writable"] = storage.writable;
+  storage_json["sequence_floor_ready"] = storage.sequence_floor_ready;
+  storage_json["sequence_reconciliation_in_progress"] =
+      storage.sequence_reconciliation_in_progress;
+  storage_json["sequence_conflict"] = storage.sequence_conflict;
+  storage_json["sequence_floor"] = storage.sequence_floor;
+  storage_json["next_sequence"] = storage.next_sequence;
+  storage_json["local_record_count"] = storage.local_record_count;
+  storage_json["card_empty"] = storage.local_record_count == 0U;
+  storage_json["card_replaced_or_initialized"] =
+      storage.card_replaced_or_initialized;
+  storage_json["card_identity_status"] = storage.card_identity_status;
+  storage_json["card_generation"] = storage.card_generation;
+  storage_json["last_self_test_passed"] = storage.last_self_test_passed;
   storage_json["free_bytes"] = storage.free_bytes;
   storage_json["warning_free_bytes"] = active_config.storage_warning_free_bytes;
   storage_json["low_space"] =
@@ -372,6 +385,15 @@ std::string Diagnostics::healthJson(const ConfigService &config,
   storage_json["oldest_sequence"] = storage.oldest_sequence;
   storage_json["newest_sequence"] = storage.newest_sequence;
   storage_json["server_ack_sequence"] = config.serverAckSequence();
+  storage_json["server_maximum_seen_sequence"] =
+      config.serverMaximumSeenSequence();
+  storage_json["prepared_removal_sequence"] =
+      config.preparedRemovalSequence();
+  storage_json["sequence_floor_advances"] = storage.sequence_floor_advances;
+  storage_json["sequence_floor_write_failures"] =
+      storage.sequence_floor_write_failures;
+  storage_json["sequence_floor_verify_failures"] =
+      storage.sequence_floor_verify_failures;
   JsonObject server = document["server"].to<JsonObject>();
   server["configured"] = !active_config.server_url.empty();
   server["reachable"] = network.server_reachable;
@@ -466,8 +488,30 @@ std::string Diagnostics::metricsJson(const StorageHealth &storage,
   sd["mount_cycles"] = storage.mount_cycles;
   sd["repair_count"] = storage.repair_count;
   JsonObject sync = document["sync"].to<JsonObject>();
+  sync["heartbeat_requests_sent"] = sync_metrics.heartbeat_requests_sent;
+  sync["heartbeat_http_200"] = sync_metrics.heartbeat_http_200;
+  sync["heartbeat_server_accepted"] =
+      sync_metrics.heartbeat_server_accepted;
   sync["heartbeat_successes"] = sync_metrics.heartbeat_successes;
   sync["heartbeat_failures"] = sync_metrics.heartbeat_failures;
+  sync["heartbeat_transport_successes"] =
+      sync_metrics.heartbeat_transport_successes;
+  sync["heartbeat_contract_failures"] =
+      sync_metrics.heartbeat_contract_failures;
+  sync["heartbeat_transport_failures"] =
+      sync_metrics.heartbeat_transport_failures;
+  sync["heartbeat_authentication_failures"] =
+      sync_metrics.heartbeat_authentication_failures;
+  sync["sequence_reconciliation_requests"] =
+      sync_metrics.sequence_reconciliation_requests;
+  sync["sequence_reconciliation_deferred"] =
+      sync_metrics.sequence_reconciliation_deferred;
+  sync["sequence_reconciliation_failures"] =
+      sync_metrics.sequence_reconciliation_failures;
+  sync["sequence_cursor_conflicts"] =
+      sync_metrics.sequence_cursor_conflicts;
+  sync["sequence_cursor_regressions"] =
+      sync_metrics.sequence_cursor_regressions;
   sync["batch_successes"] = sync_metrics.batch_successes;
   sync["batch_failures"] = sync_metrics.batch_failures;
   sync["authentication_rejections"] = sync_metrics.authentication_rejections;

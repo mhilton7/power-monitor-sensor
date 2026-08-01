@@ -15,8 +15,20 @@
 namespace pm {
 
 struct SyncMetrics {
+  std::uint64_t heartbeat_requests_sent{0};
+  std::uint64_t heartbeat_http_200{0};
+  std::uint64_t heartbeat_server_accepted{0};
   std::uint64_t heartbeat_successes{0};
   std::uint64_t heartbeat_failures{0};
+  std::uint64_t heartbeat_transport_successes{0};
+  std::uint64_t heartbeat_contract_failures{0};
+  std::uint64_t heartbeat_transport_failures{0};
+  std::uint64_t heartbeat_authentication_failures{0};
+  std::uint64_t sequence_reconciliation_requests{0};
+  std::uint64_t sequence_reconciliation_deferred{0};
+  std::uint64_t sequence_reconciliation_failures{0};
+  std::uint64_t sequence_cursor_conflicts{0};
+  std::uint64_t sequence_cursor_regressions{0};
   std::uint64_t batch_successes{0};
   std::uint64_t batch_failures{0};
   std::uint64_t events_successes{0};

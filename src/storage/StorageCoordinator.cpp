@@ -58,6 +58,30 @@ bool StorageCoordinator::begin() {
   return ready;
 }
 
+bool StorageCoordinator::queueSequenceReconciliation(
+    const std::uint64_t required_sequence_floor) {
+  std::uint64_t current =
+      required_sequence_floor_.load(std::memory_order_acquire);
+  while (required_sequence_floor > current &&
+         !required_sequence_floor_.compare_exchange_weak(
+             current, required_sequence_floor, std::memory_order_acq_rel)) {
+  }
+  bool expected = false;
+  if (!sequence_reconciliation_queued_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return true;
+  }
+  const Message message{Type::ReconcileSequence, nullptr};
+  if (xQueueSendToFront(control_queue_, &message, 0) != pdTRUE) {
+    sequence_reconciliation_queued_.store(false, std::memory_order_release);
+    return false;
+  }
+  PM_LOG_INFO("STORAGE", "SEQUENCE_RECONCILIATION_QUEUED",
+              "required_floor=%llu ownership=StorageTask",
+              static_cast<unsigned long long>(required_sequence_floor));
+  return true;
+}
+
 bool StorageCoordinator::enqueueRecord(const IntervalRecord &record) {
   auto *copy = new (std::nothrow) IntervalRecord(record);
   if (copy == nullptr) {
@@ -196,6 +220,30 @@ bool StorageCoordinator::queuePrepareRemoval() {
     return false;
   }
   return true;
+}
+
+bool StorageCoordinator::queueSelfTest() {
+  if (control_queue_ == nullptr) {
+    return false;
+  }
+  const Message message{Type::SelfTest, nullptr};
+  return xQueueSendToFront(control_queue_, &message, 0) == pdTRUE;
+}
+
+bool StorageCoordinator::queueRemount() {
+  if (control_queue_ == nullptr) {
+    return false;
+  }
+  const Message message{Type::Remount, nullptr};
+  return xQueueSendToFront(control_queue_, &message, 0) == pdTRUE;
+}
+
+bool StorageCoordinator::queueRebuildIndexes() {
+  if (control_queue_ == nullptr) {
+    return false;
+  }
+  const Message message{Type::RebuildIndexes, nullptr};
+  return xQueueSendToFront(control_queue_, &message, 0) == pdTRUE;
 }
 
 std::string StorageCoordinator::queueHistory(const HistoryQuery &query,
@@ -431,6 +479,16 @@ void StorageCoordinator::taskLoop() {
         delete request;
       } else if (message.type == Type::Remount) {
         remountStorage();
+      } else if (message.type == Type::SelfTest) {
+        storage_.selfTest();
+      } else if (message.type == Type::RebuildIndexes) {
+        HighMemoryLease memory_lease(diagnostics_);
+        if (memory_lease) {
+          storage_.rebuildIndexes();
+        } else {
+          PM_LOG_WARN("STORAGE", "REBUILD_MEMORY_GATE_TIMEOUT",
+                      "error=PM-STORAGE-014 retryable=true");
+        }
       } else if (message.type == Type::Retention) {
         auto *request = static_cast<RetentionData *>(message.payload);
         storage_.applyRetention(
@@ -442,6 +500,23 @@ void StorageCoordinator::taskLoop() {
       } else if (message.type == Type::PrepareRemoval) {
         storage_.prepareRemoval();
         prepare_removal_queued_.store(false, std::memory_order_release);
+      } else if (message.type == Type::ReconcileSequence) {
+        const std::uint64_t requested =
+            required_sequence_floor_.load(std::memory_order_acquire);
+        const bool reconciled = storage_.advanceSequenceFloor(requested);
+        sequence_reconciliation_queued_.store(false,
+                                              std::memory_order_release);
+        const std::uint64_t latest =
+            required_sequence_floor_.load(std::memory_order_acquire);
+        PM_LOG_INFO(
+            "STORAGE", "SEQUENCE_RECONCILIATION_COMPLETE",
+            "result=%s required_floor=%llu latest_requested_floor=%llu",
+            reconciled ? "success" : "degraded",
+            static_cast<unsigned long long>(requested),
+            static_cast<unsigned long long>(latest));
+        if (latest > requested) {
+          queueSequenceReconciliation(latest);
+        }
       }
       continue;
     }
@@ -550,6 +625,16 @@ void StorageCoordinator::taskLoop() {
     case Type::Remount:
       remountStorage();
       break;
+    case Type::SelfTest:
+      storage_.selfTest();
+      break;
+    case Type::RebuildIndexes: {
+      HighMemoryLease memory_lease(diagnostics_);
+      if (memory_lease) {
+        storage_.rebuildIndexes();
+      }
+      break;
+    }
     case Type::Retention:
       // Retention messages use the dedicated control queue.
       delete static_cast<RetentionData *>(message.payload);
@@ -557,6 +642,10 @@ void StorageCoordinator::taskLoop() {
       break;
     case Type::PrepareRemoval:
       prepare_removal_queued_.store(false, std::memory_order_release);
+      break;
+    case Type::ReconcileSequence:
+      sequence_reconciliation_queued_.store(false,
+                                            std::memory_order_release);
       break;
     }
   }

@@ -11,6 +11,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <SD.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 
 #include "board_pins.h"
 #include "build_config.h"
@@ -88,6 +90,44 @@ constexpr const char *kCleanupJournalPath =
 constexpr const char *kCleanupTrashDirectory =
     "/POWERMON/recovery/retention-trash";
 
+// Arduino's FAT directory iterator calls f_stat()/f_open() while the SD SPI
+// driver owns the calling core. A slow or recovering card can remain inside a
+// single openNextFile() call longer than ESP-IDF's five-second idle-task
+// watchdog interval. The storage task itself is deliberately not watched and
+// all primary metering runs on the other core, so suspend only the current
+// core's IDLE-task subscription for the bounded directory walk and restore it
+// immediately afterward. This does not disable the interrupt watchdog or any
+// application-task watchdog.
+class ScopedFatDirectoryWatchdogGuard {
+public:
+  ScopedFatDirectoryWatchdogGuard() {
+    const BaseType_t core = xPortGetCoreID();
+    if (core < 0 || core >= portNUM_PROCESSORS) {
+      return;
+    }
+    idle_task_ = xTaskGetIdleTaskHandleForCPU(static_cast<UBaseType_t>(core));
+    if (idle_task_ != nullptr && esp_task_wdt_delete(idle_task_) == ESP_OK) {
+      removed_ = true;
+    }
+  }
+
+  ~ScopedFatDirectoryWatchdogGuard() {
+    if (removed_ && esp_task_wdt_add(idle_task_) != ESP_OK) {
+      PM_LOG_ERROR("SD", "FAT_WATCHDOG_RESTORE_FAILED",
+                   "error=PM-SD-025 idle_task_subscription=missing");
+    }
+  }
+
+  ScopedFatDirectoryWatchdogGuard(const ScopedFatDirectoryWatchdogGuard &) =
+      delete;
+  ScopedFatDirectoryWatchdogGuard &
+  operator=(const ScopedFatDirectoryWatchdogGuard &) = delete;
+
+private:
+  TaskHandle_t idle_task_{nullptr};
+  bool removed_{false};
+};
+
 std::string pairedIndexPath(const std::string &record_path) {
   std::string output = record_path;
   const std::size_t records_pos = output.find("/records/");
@@ -148,8 +188,14 @@ SdStorage::SdStorage() : spi_(FSPI) {
   health_snapshot_mutex_ = xSemaphoreCreateMutex();
 }
 
-bool SdStorage::begin(const std::uint32_t spi_hz) {
+bool SdStorage::begin(const std::uint32_t spi_hz,
+                      const std::string &device_id,
+                      const std::string &hardware_fingerprint,
+                      const std::uint64_t required_sequence_floor) {
   preferred_spi_hz_ = std::min(spi_hz, build::MAX_SD_SPI_HZ);
+  device_id_ = device_id;
+  hardware_fingerprint_ = hardware_fingerprint;
+  required_sequence_floor_ = required_sequence_floor;
   return remountPreferred();
 }
 
@@ -176,8 +222,18 @@ bool SdStorage::remountPreferred() {
   digitalWrite(pins::SD_CS, HIGH);
   health_.mounted = health_.writable = health_.present = false;
   health_.prepared_for_removal = false;
-  const std::array<std::uint32_t, 3> attempt_hz{
-      requested_hz, std::min(requested_hz, kSdFallbackClockHz),
+  health_.sequence_floor_ready = false;
+  health_.sequence_reconciliation_in_progress = false;
+  health_.sequence_conflict = false;
+  health_.card_replaced_or_initialized = false;
+  // Retry the configured speed once after issuing the SD recovery clocks.
+  // A CPU-only reset can leave a card mid-transaction: the first standard
+  // Arduino initialization may fail even though the same card immediately
+  // succeeds after the 80-clock recovery sequence. Dropping directly to
+  // 1 MHz made a production 13-segment recovery occupy the storage memory
+  // gate for more than a minute and unnecessarily defer heartbeats.
+  const std::array<std::uint32_t, 4> attempt_hz{
+      requested_hz, requested_hz, std::min(requested_hz, kSdFallbackClockHz),
       std::min(requested_hz, kSdRecoveryClockHz)};
   ++health_.mount_cycles;
   bool mounted = false;
@@ -185,12 +241,25 @@ bool SdStorage::remountPreferred() {
   for (const std::uint32_t candidate_hz : attempt_hz) {
     ++attempt;
     health_.spi_hz = candidate_hz;
-    prepareSdSpiBus(spi_);
+    // Keep the first attempt on the Arduino SD library's proven initialization
+    // path.  Sending a transaction before sdcard_init() caused some cards to
+    // remain in an indeterminate command state after a CPU-only reset.  The
+    // explicit 80-clock recovery sequence is intentionally reserved for the
+    // slower fallback attempts.
+    const bool recovery_attempt = attempt > 1U;
+    if (recovery_attempt) {
+      prepareSdSpiBus(spi_);
+    } else {
+      spi_.begin(pins::SD_SCK, pins::SD_MISO, pins::SD_MOSI, pins::SD_CS);
+    }
     PM_LOG_INFO("SD", "MOUNT_ATTEMPT",
-                "attempt=%u maximum_attempts=3 spi_hz=%lu "
-                "recovery_idle_clocks=80 format_on_failure=false",
+                "attempt=%u maximum_attempts=4 spi_hz=%lu "
+                "strategy=%s recovery_idle_clocks=%u "
+                "format_on_failure=false",
                 static_cast<unsigned>(attempt),
-                static_cast<unsigned long>(candidate_hz));
+                static_cast<unsigned long>(candidate_hz),
+                recovery_attempt ? "recovery" : "standard",
+                recovery_attempt ? 80U : 0U);
     if (SD.begin(pins::SD_CS, spi_, candidate_hz, "/sd", 8, false)) {
       mounted = true;
       break;
@@ -198,9 +267,9 @@ bool SdStorage::remountPreferred() {
     SD.end();
     spi_.end();
     digitalWrite(pins::SD_CS, HIGH);
-    // Do not collapse repeated frequencies. A configuration already at the
-    // 400 kHz recovery speed still needs three independent command/reset
-    // attempts after a CPU-only reset interrupts an SD transaction.
+    // Do not collapse repeated frequencies. Even a configuration already at
+    // the 400 kHz recovery speed still needs
+    // independent command/reset attempts after an interrupted transaction.
     delay(static_cast<std::uint32_t>(attempt) * 25U);
   }
   if (!mounted) {
@@ -223,19 +292,36 @@ bool SdStorage::remountPreferred() {
   const bool cleanup_recovery_ok = self_test_ok && recoverCleanupJournal();
   const bool recovery_ok = cleanup_recovery_ok && recover();
   health_.writable = layout_ok && self_test_ok && recovery_ok;
+  if (health_.writable) {
+    health_.sequence_reconciliation_in_progress =
+        required_sequence_floor_ > health_.sequence_floor;
+    health_.sequence_floor_ready =
+        !health_.sequence_reconciliation_in_progress ||
+        advanceSequenceFloor(required_sequence_floor_);
+    health_.sequence_reconciliation_in_progress =
+        !health_.sequence_floor_ready;
+  }
   updateCapacity();
   PM_LOG_INFO(
       "SD", "MOUNT_COMPLETE",
       "result=%s card_type=%s filesystem=%s spi_hz=%lu capacity=%llu used=%llu "
-      "free=%llu layout=%s self_test=%s recovery=%s next_sequence=%llu",
-      health_.writable ? "success" : "degraded", cardTypeName(SD.cardType()),
+      "free=%llu layout=%s self_test=%s recovery=%s history_integrity=%s "
+      "next_sequence=%llu sequence_floor=%llu floor_ready=%s card_identity=%s",
+      !health_.writable
+          ? "failed"
+          : (health_.index_healthy ? "success" : "degraded_writable"),
+      cardTypeName(SD.cardType()),
       health_.filesystem.c_str(), static_cast<unsigned long>(health_.spi_hz),
       static_cast<unsigned long long>(health_.capacity_bytes),
       static_cast<unsigned long long>(health_.used_bytes),
       static_cast<unsigned long long>(health_.free_bytes),
       layout_ok ? "ok" : "failed", self_test_ok ? "ok" : "failed",
       recovery_ok ? "ok" : "failed",
-      static_cast<unsigned long long>(next_sequence_));
+      health_.index_healthy ? "verified" : "degraded_preserved",
+      static_cast<unsigned long long>(next_sequence_),
+      static_cast<unsigned long long>(health_.sequence_floor),
+      health_.sequence_floor_ready ? "true" : "false",
+      health_.card_identity_status.c_str());
   publishHealthSnapshot(health_);
   unlock();
   return health_.writable;
@@ -245,16 +331,22 @@ bool SdStorage::append(IntervalRecord &record) {
   if (!lock()) {
     return false;
   }
-  if (!health_.mounted || !health_.writable || health_.prepared_for_removal) {
+  if (!health_.mounted || !health_.writable || health_.prepared_for_removal ||
+      !health_.sequence_floor_ready ||
+      next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
     ++health_.write_failures;
-    health_.last_error = "sd_not_writable";
+    health_.last_error = !health_.sequence_floor_ready
+                             ? "sequence_reconciliation_required"
+                             : "sd_not_writable";
     if (diag::SerialLogger::instance().allow("sd_not_writable", 10'000U)) {
       PM_LOG_ERROR("SD", "WRITE_REJECTED",
                    "error=PM-SD-002 mounted=%s writable=%s "
-                   "prepared_for_removal=%s failures=%llu",
+                   "prepared_for_removal=%s sequence_floor_ready=%s "
+                   "failures=%llu",
                    health_.mounted ? "true" : "false",
                    health_.writable ? "true" : "false",
                    health_.prepared_for_removal ? "true" : "false",
+                   health_.sequence_floor_ready ? "true" : "false",
                    static_cast<unsigned long long>(health_.write_failures));
     }
     unlock();
@@ -351,9 +443,15 @@ bool SdStorage::append(IntervalRecord &record) {
         health_.oldest_syncable_sequence == 0
             ? record.sequence
             : std::min(health_.oldest_syncable_sequence, record.sequence);
+    health_.newest_syncable_sequence =
+        std::max(health_.newest_syncable_sequence, record.sequence);
   }
   health_.newest_sequence = record.sequence;
+  ++health_.local_record_count;
   ++next_sequence_;
+  health_.sequence_floor = record.sequence;
+  health_.next_sequence = next_sequence_;
+  health_.sequence_floor_ready = true;
   ++health_.writes;
   health_.last_write_latency_ms = millis() - started;
   health_.last_write_utc_ms = record.end_utc_ms;
@@ -582,7 +680,10 @@ bool SdStorage::selfTest() {
   }
   ok = ok && actual == expected;
   SD.remove(path.c_str());
-  health_.writable = ok;
+  // A manual test is diagnostic evidence only. It must not overwrite the
+  // lifecycle state established by mount, recovery, and sequence
+  // reconciliation.
+  health_.last_self_test_passed = ok;
   health_.last_error = ok ? "" : "sd_self_test_failed";
   if (ok) {
     PM_LOG_INFO("SD", "SELF_TEST_COMPLETE", "result=success readback=verified");
@@ -744,6 +845,9 @@ SegmentMetadata SdStorage::inspectSegment(const std::string &path) const {
     index_first = index_first == 0U ? value : std::min(index_first, value);
     index_last = std::max(index_last, value);
     ++index_count;
+    if (index_count % kCooperativeScanRecords == 0U) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
   }
   if (index) {
     index.close();
@@ -793,6 +897,9 @@ SegmentMetadata SdStorage::inspectEventSegment(const std::string &path) const {
         metadata.all_times_trusted && timestamp != 0U;
     metadata.integrity_crc ^= checksum;
     ++metadata.record_count;
+    if (metadata.record_count % kCooperativeScanRecords == 0U) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
   }
   if (input) {
     input.close();
@@ -987,8 +1094,11 @@ bool SdStorage::recoverCleanupJournal() {
     }
     return SD.rename(temporary.c_str(), target.c_str());
   };
+  // The reading-sequence journal is recovered later by recover(), which
+  // validates target, temporary, and backup and preserves the greatest value.
+  // Never apply the generic target-wins cleanup here: after a power loss the
+  // temporary copy can be the only durable record of a newly advanced floor.
   bool temporary_recovery_ok =
-      recover_atomic_temp("/POWERMON/state/sequence.journal") &&
       recover_atomic_temp("/POWERMON/state/event-sequence.journal") &&
       recover_atomic_temp(kCleanupJournalPath);
   std::vector<std::string> metadata_temps;
@@ -1225,6 +1335,10 @@ bool SdStorage::applyRetention(
     newest_sequence = std::max(newest_sequence, metadata.last_sequence);
     segments.push_back(std::move(metadata));
     segment_metadata_loaded.push_back(loaded);
+    // SD/FAT directory and segment scans can hold the SPI implementation in
+    // long polling sections. Explicitly release the core between files so the
+    // watchdog-protected meter and aggregation tasks remain schedulable.
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
   for (std::size_t index = 0; index < segments.size(); ++index) {
     auto &metadata = segments[index];
@@ -1240,6 +1354,7 @@ bool SdStorage::applyRetention(
                   metadata.record_path.c_str());
       metadata.complete = false;
     }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
   health_.open_segment_count = 0U;
   health_.closed_segment_count = 0U;
@@ -1394,6 +1509,7 @@ bool SdStorage::applyRetention(
         std::max(newest_event_sequence, metadata.last_sequence);
     event_segments.push_back(std::move(metadata));
     event_metadata_loaded.push_back(loaded);
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
   for (std::size_t index = 0; index < event_segments.size(); ++index) {
     auto &metadata = event_segments[index];
@@ -1405,6 +1521,7 @@ bool SdStorage::applyRetention(
     if (!metadata_unchanged && !persistSegmentMetadata(metadata)) {
       metadata.complete = false;
     }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
   health_.event_segment_count =
       static_cast<std::uint32_t>(event_segments.size());
@@ -1610,6 +1727,71 @@ StorageHealth SdStorage::health() const {
   return copy;
 }
 
+SequenceState SdStorage::sequenceState(
+    const std::uint64_t persisted_server_ack,
+    const std::uint64_t persisted_server_max_seen,
+    const std::uint64_t prepared_removal_high_water) const {
+  SequenceState state;
+  StorageHealth snapshot;
+  bool have_snapshot = false;
+  if (lock(pdMS_TO_TICKS(100))) {
+    snapshot = health_;
+    unlock();
+    publishHealthSnapshot(snapshot);
+    have_snapshot = true;
+  } else if (health_snapshot_mutex_ != nullptr &&
+             xSemaphoreTake(health_snapshot_mutex_, pdMS_TO_TICKS(25)) ==
+                 pdTRUE) {
+    // Retention and recovery intentionally own the SD mutex for the complete
+    // filesystem transaction.  A heartbeat must not interpret that temporary
+    // lock contention as a removed card with sequence zero: doing so queues a
+    // spurious floor advance while the real high-water mark is still valid.
+    // The independently protected snapshot is published only after complete
+    // storage mutations, so it is safe and internally consistent here.
+    snapshot = last_health_snapshot_;
+    xSemaphoreGive(health_snapshot_mutex_);
+    have_snapshot = true;
+  }
+  if (!have_snapshot) {
+    state.persisted_server_ack = persisted_server_ack;
+    state.persisted_server_max_seen = persisted_server_max_seen;
+    state.prepared_removal_high_water = prepared_removal_high_water;
+    state.effective_sequence_floor =
+        std::max({persisted_server_ack, persisted_server_max_seen,
+                  prepared_removal_high_water});
+    state.next_sequence =
+        state.effective_sequence_floor ==
+                std::numeric_limits<std::uint64_t>::max()
+            ? state.effective_sequence_floor
+            : state.effective_sequence_floor + 1U;
+    state.sequence_reconciliation_in_progress = true;
+    return state;
+  }
+  state.storage_present = snapshot.present;
+  state.storage_mounted = snapshot.mounted;
+  state.storage_writable = snapshot.writable;
+  state.card_empty = snapshot.local_record_count == 0U;
+  state.sequence_floor_ready = snapshot.sequence_floor_ready;
+  state.sequence_reconciliation_in_progress =
+      snapshot.sequence_reconciliation_in_progress;
+  state.sequence_conflict = snapshot.sequence_conflict;
+  state.local_record_count = snapshot.local_record_count;
+  state.local_oldest_sequence = snapshot.oldest_sequence;
+  state.local_newest_sequence = snapshot.newest_sequence;
+  state.local_journal_high_water = snapshot.sequence_floor;
+  state.prepared_removal_high_water = prepared_removal_high_water;
+  state.persisted_server_ack = persisted_server_ack;
+  state.persisted_server_max_seen = persisted_server_max_seen;
+  state.effective_sequence_floor = std::max(
+      {state.local_newest_sequence, state.local_journal_high_water,
+       persisted_server_ack, persisted_server_max_seen,
+       prepared_removal_high_water});
+  state.next_sequence = snapshot.next_sequence;
+  state.card_generation = snapshot.card_generation;
+  state.card_identity_status = snapshot.card_identity_status;
+  return state;
+}
+
 void SdStorage::publishHealthSnapshot(const StorageHealth &snapshot) const {
   if (health_snapshot_mutex_ != nullptr &&
       xSemaphoreTake(health_snapshot_mutex_, pdMS_TO_TICKS(25)) == pdTRUE) {
@@ -1623,20 +1805,81 @@ std::uint64_t SdStorage::nextSequence() const { return next_sequence_; }
 bool SdStorage::advanceSequenceFloor(
     const std::uint64_t acknowledged_sequence) {
   if (!lock()) {
+    PM_LOG_ERROR("STORAGE", "SEQUENCE_FLOOR_ADVANCE_FAILED",
+                 "reason=storage_lock_timeout required_floor=%llu",
+                 static_cast<unsigned long long>(acknowledged_sequence));
     return false;
+  }
+  PM_LOG_INFO(
+      "STORAGE", "SEQUENCE_FLOOR_ADVANCE_BEGIN",
+      "required_floor=%llu current_floor=%llu local_newest=%llu "
+      "mounted=%s writable=%s",
+      static_cast<unsigned long long>(acknowledged_sequence),
+      static_cast<unsigned long long>(next_sequence_ - 1U),
+      static_cast<unsigned long long>(health_.newest_sequence),
+      health_.mounted ? "true" : "false",
+      health_.writable ? "true" : "false");
+  const std::uint64_t current_floor = next_sequence_ - 1U;
+  // A requested floor is a lower bound, not an equality assertion. A queued
+  // request may become stale while StorageTask is completing retention or a
+  // remount. If the durable journal has already advanced beyond that request,
+  // continuity is satisfied and must never be downgraded to a conflict.
+  if (health_.mounted && health_.writable &&
+      acknowledged_sequence <= current_floor) {
+    health_.sequence_conflict = false;
+    health_.sequence_floor_ready = true;
+    health_.sequence_reconciliation_in_progress = false;
+    health_.sequence_floor = current_floor;
+    health_.next_sequence = next_sequence_;
+    publishHealthSnapshot(health_);
+    PM_LOG_INFO(
+        "STORAGE", "SEQUENCE_FLOOR_ADVANCE_COMPLETE",
+        "result=already_reconciled reason=current_floor_satisfies_required "
+        "required_floor=%llu final_floor=%llu next_sequence=%llu",
+        static_cast<unsigned long long>(acknowledged_sequence),
+        static_cast<unsigned long long>(current_floor),
+        static_cast<unsigned long long>(next_sequence_));
+    unlock();
+    return true;
   }
   const bool valid =
       health_.mounted && health_.writable &&
       acknowledged_sequence >= health_.newest_sequence &&
-      acknowledged_sequence >= next_sequence_ - 1U;
-  if (!valid || acknowledged_sequence == next_sequence_ - 1U) {
+      acknowledged_sequence >= current_floor &&
+      acknowledged_sequence != std::numeric_limits<std::uint64_t>::max();
+  if (!valid || acknowledged_sequence == current_floor) {
+    const bool unavailable = !health_.mounted || !health_.writable;
+    health_.sequence_conflict = !valid && !unavailable;
+    health_.sequence_floor_ready = valid;
+    health_.sequence_reconciliation_in_progress = unavailable;
+    health_.sequence_floor = current_floor;
+    health_.next_sequence = next_sequence_;
+    publishHealthSnapshot(health_);
+    PM_LOG_INFO(
+        "STORAGE",
+        valid ? "SEQUENCE_FLOOR_ADVANCE_COMPLETE"
+              : "SEQUENCE_FLOOR_ADVANCE_FAILED",
+        "result=%s reason=%s required_floor=%llu final_floor=%llu "
+        "next_sequence=%llu",
+        valid ? "already_reconciled" : "failed",
+        unavailable ? "storage_unavailable" : "cursor_conflict",
+        static_cast<unsigned long long>(acknowledged_sequence),
+        static_cast<unsigned long long>(health_.sequence_floor),
+        static_cast<unsigned long long>(health_.next_sequence));
     unlock();
     return valid;
   }
+  health_.sequence_reconciliation_in_progress = true;
   const bool persisted = persistSequence(acknowledged_sequence);
   if (persisted) {
     const bool blank_or_replaced_card = health_.newest_sequence == 0U;
     next_sequence_ = acknowledged_sequence + 1U;
+    health_.sequence_floor = acknowledged_sequence;
+    health_.next_sequence = next_sequence_;
+    health_.sequence_floor_ready = true;
+    health_.sequence_reconciliation_in_progress = false;
+    health_.sequence_conflict = false;
+    ++health_.sequence_floor_advances;
     PM_LOG_WARN(
         "SYNC", "SEQUENCE_FLOOR_ADVANCED",
         "server_ack=%llu newest_stored=%llu next_sequence=%llu "
@@ -1655,10 +1898,29 @@ bool SdStorage::advanceSequenceFloor(
                   "sequence_continuity=restored next_sequence=%llu",
                   static_cast<unsigned long long>(next_sequence_));
     }
+    PM_LOG_INFO(
+        "STORAGE", "SEQUENCE_FLOOR_ADVANCE_COMPLETE",
+        "result=reconciled required_floor=%llu final_floor=%llu "
+        "next_sequence=%llu",
+        static_cast<unsigned long long>(acknowledged_sequence),
+        static_cast<unsigned long long>(health_.sequence_floor),
+        static_cast<unsigned long long>(health_.next_sequence));
   } else {
     ++health_.write_failures;
-    health_.last_error = "sequence_floor_persist_failed";
+    if (health_.last_error.empty()) {
+      health_.last_error = "sequence_floor_persist_failed";
+    }
+    health_.sequence_floor_ready = false;
+    health_.sequence_reconciliation_in_progress = true;
+    PM_LOG_ERROR(
+        "STORAGE", "SEQUENCE_FLOOR_ADVANCE_FAILED",
+        "reason=%s required_floor=%llu current_floor=%llu local_newest=%llu",
+        health_.last_error.c_str(),
+        static_cast<unsigned long long>(acknowledged_sequence),
+        static_cast<unsigned long long>(health_.sequence_floor),
+        static_cast<unsigned long long>(health_.newest_sequence));
   }
+  publishHealthSnapshot(health_);
   unlock();
   return persisted;
 }
@@ -1693,36 +1955,90 @@ bool SdStorage::recover() {
   PM_LOG_INFO("SD", "RECOVERY_SCAN_BEGIN", "record_files=%u",
               static_cast<unsigned>(files.size()));
   bool all_valid = true;
+  health_.oldest_sequence = 0U;
   health_.oldest_syncable_sequence = 0;
+  health_.newest_syncable_sequence = 0;
+  health_.local_record_count = 0U;
   for (const auto &path : files) {
-    all_valid = recoverFile(path, maximum_sequence) && all_valid;
+    SegmentMetadata metadata;
+    // Closed segments were fully inspected when their immutable, checksummed
+    // sidecar was written. Revalidate that sidecar and both file sizes instead
+    // of rereading every historical byte after a CPU-only reset. Active,
+    // untrusted, incomplete, or changed segments still take the conservative
+    // repair scan below.
+    const bool recovered_from_metadata =
+        loadSegmentMetadata(path, false, metadata) && metadata.closed &&
+        metadata.complete && metadata.index_valid &&
+        metadata.all_times_trusted;
+    if (recovered_from_metadata) {
+      maximum_sequence = std::max(maximum_sequence, metadata.last_sequence);
+      health_.oldest_sequence =
+          health_.oldest_sequence == 0U
+              ? metadata.first_sequence
+              : std::min(health_.oldest_sequence, metadata.first_sequence);
+      health_.oldest_syncable_sequence =
+          health_.oldest_syncable_sequence == 0U
+              ? metadata.first_sequence
+              : std::min(health_.oldest_syncable_sequence,
+                         metadata.first_sequence);
+      health_.newest_syncable_sequence = std::max(
+          health_.newest_syncable_sequence, metadata.last_sequence);
+      health_.local_record_count += metadata.record_count;
+      PM_LOG_TRACE(
+          "SD", "RECOVERY_SEGMENT_METADATA_ACCEPTED",
+          "first_sequence=%llu last_sequence=%llu records=%lu",
+          static_cast<unsigned long long>(metadata.first_sequence),
+          static_cast<unsigned long long>(metadata.last_sequence),
+          static_cast<unsigned long>(metadata.record_count));
+    } else {
+      all_valid = recoverFile(path, maximum_sequence) && all_valid;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
-  File journal = SD.open("/POWERMON/state/sequence.journal", FILE_READ);
   std::uint64_t journal_sequence = 0;
-  if (journal) {
-    const String value = journal.readStringUntil('\n');
-    journal_sequence = std::strtoull(value.c_str(), nullptr, 10);
-    journal.close();
+  std::uint64_t temporary_sequence = 0;
+  std::uint64_t backup_sequence = 0;
+  loadSequenceJournal("/POWERMON/state/sequence.journal", journal_sequence);
+  loadSequenceJournal("/POWERMON/state/sequence.journal.tmp",
+                      temporary_sequence);
+  loadSequenceJournal("/POWERMON/state/sequence.journal.bak",
+                      backup_sequence);
+  journal_sequence =
+      std::max({journal_sequence, temporary_sequence, backup_sequence});
+  if ((temporary_sequence != 0U || backup_sequence != 0U) &&
+      !persistSequence(journal_sequence)) {
+    health_.last_error = "sequence_journal_recovery_failed";
+    return false;
   }
   const std::uint64_t committed = std::max(maximum_sequence, journal_sequence);
-  next_sequence_ = committed + 1;
-  health_.newest_sequence = maximum_sequence;
-  health_.oldest_sequence = 0;
-  if (maximum_sequence > 0) {
-    HistoryQuery query;
-    query.limit = 1;
-    query.maximum_payload_bytes = 4096;
-    HistoryPage first = readEnvelopeFiles(files, query, "sequence");
-    health_.oldest_sequence = first.first_sequence;
+  if (committed == std::numeric_limits<std::uint64_t>::max()) {
+    health_.sequence_conflict = true;
+    health_.last_error = "sequence_space_exhausted";
+    return false;
   }
-  health_.index_healthy = all_valid;
-
+  next_sequence_ = committed + 1;
+  health_.sequence_floor = committed;
+  health_.next_sequence = next_sequence_;
+  health_.newest_sequence = maximum_sequence;
   std::uint64_t maximum_event_sequence = 0U;
   std::uint64_t minimum_event_sequence = 0U;
   std::vector<std::string> event_files;
   collectFiles("/POWERMON/events", ".events", event_files);
   for (const auto &path : event_files) {
+    SegmentMetadata metadata;
+    if (loadSegmentMetadata(path, true, metadata) && metadata.closed &&
+        metadata.complete && metadata.all_times_trusted) {
+      minimum_event_sequence =
+          minimum_event_sequence == 0U
+              ? metadata.first_sequence
+              : std::min(minimum_event_sequence, metadata.first_sequence);
+      maximum_event_sequence =
+          std::max(maximum_event_sequence, metadata.last_sequence);
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
     File event_file = SD.open(path.c_str(), FILE_READ);
+    std::size_t scanned_event_records = 0U;
     while (event_file && event_file.available() > 0) {
       const String raw = event_file.readStringUntil('\n');
       std::string event_payload;
@@ -1741,10 +2057,15 @@ bool SdStorage::recover() {
                                    ? sequence
                                    : std::min(minimum_event_sequence, sequence);
       maximum_event_sequence = std::max(maximum_event_sequence, sequence);
+      ++scanned_event_records;
+      if (scanned_event_records % kCooperativeScanRecords == 0U) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
     }
     if (event_file) {
       event_file.close();
     }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
   File event_journal =
       SD.open("/POWERMON/state/event-sequence.journal", FILE_READ);
@@ -1758,6 +2079,10 @@ bool SdStorage::recover() {
       std::max(maximum_event_sequence, event_journal_sequence) + 1U;
   health_.oldest_event_sequence = minimum_event_sequence;
   health_.newest_event_sequence = maximum_event_sequence;
+  // Reading and event history share the public integrity state. Publish it
+  // only after both scans so an event-record fault cannot be mislabeled as a
+  // fully verified card in MOUNT_COMPLETE or the heartbeat health payload.
+  health_.index_healthy = all_valid;
   PM_LOG_INFO("SD", "RECOVERY_SCAN_COMPLETE",
               "result=%s files=%u oldest_sequence=%llu newest_sequence=%llu "
               "oldest_syncable_sequence=%llu journal_sequence=%llu "
@@ -1771,7 +2096,13 @@ bool SdStorage::recover() {
               static_cast<unsigned long long>(journal_sequence),
               static_cast<unsigned long long>(next_sequence_),
               static_cast<unsigned long>(health_.repair_count));
-  return all_valid;
+  // A corrupt historical segment is preserved and excluded from synchronization,
+  // but it must not make a card that passed the filesystem self-test read-only.
+  // The sequence floor is still safe because it is the maximum of every valid
+  // record plus the target/temp/backup journals and the persisted server cursor.
+  // Hard failures above (journal installation or sequence exhaustion) continue
+  // to fail closed.
+  return true;
 }
 
 bool SdStorage::recoverFile(const std::string &path,
@@ -1863,14 +2194,21 @@ bool SdStorage::recoverFile(const std::string &path,
       complete_corruption = true;
       break;
     }
-    maximum_sequence =
-        std::max(maximum_sequence, document["sequence"].as<std::uint64_t>());
+    const std::uint64_t sequence =
+        document["sequence"].as<std::uint64_t>();
+    health_.oldest_sequence =
+        health_.oldest_sequence == 0U
+            ? sequence
+            : std::min(health_.oldest_sequence, sequence);
+    maximum_sequence = std::max(maximum_sequence, sequence);
+    ++health_.local_record_count;
     if (syncableDocument(document)) {
-      const std::uint64_t sequence = document["sequence"].as<std::uint64_t>();
       health_.oldest_syncable_sequence =
           health_.oldest_syncable_sequence == 0
               ? sequence
               : std::min(health_.oldest_syncable_sequence, sequence);
+      health_.newest_syncable_sequence =
+          std::max(health_.newest_syncable_sequence, sequence);
     }
     valid_end += line.size();
     ++scanned_records;
@@ -1888,17 +2226,70 @@ bool SdStorage::recoverFile(const std::string &path,
 }
 
 bool SdStorage::writeManifest() {
-  if (SD.exists("/POWERMON/manifest.json")) {
-    return true;
+  const char *target = "/POWERMON/manifest.json";
+  if (SD.exists(target)) {
+    File existing = SD.open(target, FILE_READ);
+    JsonDocument stored;
+    const DeserializationError error = deserializeJson(stored, existing);
+    if (existing) {
+      existing.close();
+    }
+    if (error) {
+      health_.card_identity_status = "manifest_invalid";
+      health_.last_error = "storage_manifest_invalid";
+      return false;
+    }
+    const std::uint32_t schema = stored["schema_version"] | 1U;
+    if (schema >= 2U) {
+      const std::string stored_device = stored["device_id"] | "";
+      const std::string stored_fingerprint =
+          stored["hardware_id_fingerprint"] |
+          (stored["hardware_fingerprint"] | "");
+      if ((!stored_device.empty() && stored_device != device_id_) ||
+          (!stored_fingerprint.empty() &&
+           stored_fingerprint != hardware_fingerprint_)) {
+        health_.card_identity_status = "wrong_sensor";
+        health_.card_device_id = stored_device;
+        health_.last_error = "storage_card_identity_mismatch";
+        PM_LOG_ERROR(
+            "STORAGE", "CARD_IDENTITY_MISMATCH",
+            "expected_device=%s stored_device=%s action=read_only",
+            diag::maskIdentifier(device_id_).c_str(),
+            diag::maskIdentifier(stored_device).c_str());
+        return false;
+      }
+      health_.card_identity_status = "verified";
+      health_.card_device_id = stored_device;
+      health_.card_generation = stored["card_generation"] | 0ULL;
+      health_.card_replaced_or_initialized = false;
+      return true;
+    }
+    // Schema 1 cards predate identity binding. Upgrade in place without
+    // touching readings or sequence history.
   }
   JsonDocument document;
-  document["schema_version"] = 1;
+  document["schema_version"] = 2;
   document["record_format"] = "PMR1";
   document["protocol"] = version::PROTOCOL;
   document["authoritative_store"] = "microSD";
+  document["device_id"] = device_id_;
+  document["hardware_id_fingerprint"] = hardware_fingerprint_;
+  const std::uint64_t generation =
+      (static_cast<std::uint64_t>(esp_random()) << 32U) | esp_random();
+  document["card_generation"] = generation;
+  const std::time_t created_at = std::time(nullptr);
+  if (created_at >= 1'600'000'000) {
+    document["created_at"] =
+        isoUtc(static_cast<std::uint64_t>(created_at) * 1000U);
+  } else {
+    document["created_at"] = nullptr;
+  }
+  document["created_monotonic_ms"] = millis();
   std::string payload;
   serializeJson(document, payload);
-  File file = SD.open("/POWERMON/manifest.json", FILE_WRITE);
+  const char *temporary = "/POWERMON/manifest.json.tmp";
+  SD.remove(temporary);
+  File file = SD.open(temporary, FILE_WRITE);
   const bool ok =
       file && file.write(reinterpret_cast<const std::uint8_t *>(payload.data()),
                          payload.size()) == payload.size();
@@ -1906,14 +2297,62 @@ bool SdStorage::writeManifest() {
     file.flush();
     file.close();
   }
-  return ok;
+  if (!ok) {
+    SD.remove(temporary);
+    return false;
+  }
+  File verify = SD.open(temporary, FILE_READ);
+  JsonDocument verified;
+  const bool verified_ok = verify && !deserializeJson(verified, verify) &&
+                           verified["schema_version"].as<unsigned>() == 2U &&
+                           std::string(verified["device_id"] | "") == device_id_;
+  if (verify) {
+    verify.close();
+  }
+  if (!verified_ok) {
+    SD.remove(temporary);
+    return false;
+  }
+  SD.remove(target);
+  const bool installed = SD.rename(temporary, target);
+  health_.card_identity_status = installed ? "verified" : "manifest_write_failed";
+  health_.card_device_id = installed ? device_id_ : "";
+  health_.card_generation = installed ? generation : 0U;
+  health_.card_replaced_or_initialized = installed;
+  return installed;
+}
+
+bool SdStorage::loadSequenceJournal(const char *path,
+                                    std::uint64_t &value) const {
+  value = 0U;
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    return false;
+  }
+  const String raw = file.readStringUntil('\n');
+  file.close();
+  if (raw.isEmpty()) {
+    return false;
+  }
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(raw.c_str(), &end, 10);
+  if (end == raw.c_str() || (*end != '\0' && *end != '\r')) {
+    return false;
+  }
+  value = static_cast<std::uint64_t>(parsed);
+  return true;
 }
 
 bool SdStorage::persistSequence(const std::uint64_t committed_sequence) {
   const std::string value = std::to_string(committed_sequence) + "\n";
   const char *temporary = "/POWERMON/state/sequence.journal.tmp";
   const char *target = "/POWERMON/state/sequence.journal";
-  SD.remove(temporary);
+  const char *backup = "/POWERMON/state/sequence.journal.bak";
+  if (SD.exists(temporary) && !SD.remove(temporary)) {
+    health_.last_error = "sequence_journal_temporary_remove_failed";
+    ++health_.sequence_floor_write_failures;
+    return false;
+  }
   File file = SD.open(temporary, FILE_WRITE);
   const bool written =
       file && file.write(reinterpret_cast<const std::uint8_t *>(value.data()),
@@ -1924,10 +2363,53 @@ bool SdStorage::persistSequence(const std::uint64_t committed_sequence) {
   }
   if (!written) {
     SD.remove(temporary);
+    health_.last_error = "sequence_journal_temporary_write_failed";
+    ++health_.sequence_floor_write_failures;
     return false;
   }
+  std::uint64_t verified_sequence = 0U;
+  if (!loadSequenceJournal(temporary, verified_sequence) ||
+      verified_sequence != committed_sequence) {
+    SD.remove(temporary);
+    health_.last_error = "sequence_journal_temporary_verify_failed";
+    ++health_.sequence_floor_verify_failures;
+    return false;
+  }
+  if (SD.exists(backup) && !SD.remove(backup)) {
+    SD.remove(temporary);
+    health_.last_error = "sequence_journal_backup_remove_failed";
+    ++health_.sequence_floor_write_failures;
+    return false;
+  }
+  const bool had_target = SD.exists(target);
+  if (had_target && !SD.rename(target, backup)) {
+    SD.remove(temporary);
+    health_.last_error = "sequence_journal_backup_rename_failed";
+    ++health_.sequence_floor_write_failures;
+    return false;
+  }
+  if (!SD.rename(temporary, target)) {
+    if (had_target) {
+      SD.rename(backup, target);
+    }
+    health_.last_error = "sequence_journal_install_rename_failed";
+    ++health_.sequence_floor_write_failures;
+    return false;
+  }
+  verified_sequence = 0U;
+  const bool installed = loadSequenceJournal(target, verified_sequence) &&
+                         verified_sequence == committed_sequence;
+  if (installed) {
+    SD.remove(backup);
+    return true;
+  }
   SD.remove(target);
-  return SD.rename(temporary, target);
+  if (had_target) {
+    SD.rename(backup, target);
+  }
+  health_.last_error = "sequence_journal_final_verify_failed";
+  ++health_.sequence_floor_verify_failures;
+  return false;
 }
 
 bool SdStorage::persistEventSequence(
@@ -2033,6 +2515,7 @@ std::string SdStorage::serializeRecord(const IntervalRecord &value) const {
 
 void SdStorage::collectFiles(const std::string &directory, const char *suffix,
                              std::vector<std::string> &output) const {
+  ScopedFatDirectoryWatchdogGuard watchdog_guard;
   File root = SD.open(directory.c_str(), FILE_READ);
   if (!root || !root.isDirectory()) {
     return;
@@ -2121,6 +2604,8 @@ HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
                       kSyncCoverageWindow
           ? query.after_sequence + kSyncCoverageWindow
           : std::numeric_limits<std::uint64_t>::max();
+  const bool event_records =
+      std::strcmp(sequence_field, "event_sequence") == 0;
 
   const auto process_line = [&](const std::string &line) {
     std::string payload;
@@ -2187,10 +2672,93 @@ HistoryPage SdStorage::readEnvelopeFiles(const std::vector<std::string> &paths,
   };
 
   for (const auto &path : paths) {
+    // Closed segment metadata is immutable after recovery/rotation. Use its
+    // verified sequence bounds to avoid rereading every acknowledged segment
+    // for each small synchronization page. This is especially important on a
+    // card mounted at the conservative recovery speed: a complete scan can
+    // otherwise hold the storage memory lease across several heartbeat
+    // intervals and make a healthy sensor appear offline.
+    //
+    // Active segments and any segment with missing/incomplete metadata still
+    // take the full conservative scan path. The optimization can therefore
+    // never hide newly appended or unverifiable records.
+    SegmentMetadata segment;
+    if (loadSegmentMetadata(path, event_records, segment) && segment.closed &&
+        segment.complete &&
+        (segment.last_sequence <= query.after_sequence ||
+         segment.first_sequence > scan_ceiling)) {
+      PM_LOG_TRACE(
+          "STORAGE", "HISTORY_SEGMENT_SKIPPED",
+          "kind=%s first_sequence=%llu last_sequence=%llu after=%llu "
+          "scan_ceiling=%llu reason=verified_closed_range",
+          event_records ? "events" : "readings",
+          static_cast<unsigned long long>(segment.first_sequence),
+          static_cast<unsigned long long>(segment.last_sequence),
+          static_cast<unsigned long long>(query.after_sequence),
+          static_cast<unsigned long long>(scan_ceiling));
+      continue;
+    }
+    std::uint64_t indexed_start_offset = 0U;
+    bool indexed_start_found = false;
+    bool index_well_formed = false;
+    if (!event_records) {
+      const std::string index_path = pairedIndexPath(path);
+      File index = index_path.empty()
+                       ? File{}
+                       : SD.open(index_path.c_str(), FILE_READ);
+      index_well_formed = static_cast<bool>(index);
+      std::size_t indexed_records = 0U;
+      while (index_well_formed && index && index.available() > 0) {
+        const String raw = index.readStringUntil('\n');
+        unsigned long long sequence = 0U;
+        unsigned long long timestamp = 0U;
+        unsigned long long offset = 0U;
+        unsigned checksum = 0U;
+        if (std::sscanf(raw.c_str(), "%llu,%llu,%llu,%x", &sequence,
+                        &timestamp, &offset, &checksum) != 4) {
+          index_well_formed = false;
+          break;
+        }
+        ++indexed_records;
+        if (sequence > query.after_sequence && sequence <= scan_ceiling) {
+          indexed_start_offset = static_cast<std::uint64_t>(offset);
+          indexed_start_found = true;
+          break;
+        }
+        if (sequence > scan_ceiling) {
+          break;
+        }
+        if (indexed_records % kCooperativeScanRecords == 0U) {
+          vTaskDelay(pdMS_TO_TICKS(1));
+        }
+      }
+      if (index) {
+        index.close();
+      }
+      // A well-formed index with no sequence in the requested window proves
+      // that this segment cannot contribute. If the index is absent or
+      // malformed, preserve the conservative full-record scan.
+      if (index_well_formed && indexed_records > 0U &&
+          !indexed_start_found) {
+        PM_LOG_TRACE("STORAGE", "HISTORY_SEGMENT_SKIPPED",
+                     "kind=readings after=%llu scan_ceiling=%llu "
+                     "reason=index_range_empty",
+                     static_cast<unsigned long long>(query.after_sequence),
+                     static_cast<unsigned long long>(scan_ceiling));
+        continue;
+      }
+    }
     File file = SD.open(path.c_str(), FILE_READ);
     if (!file) {
       ++health_.read_failures;
       continue;
+    }
+    if (indexed_start_found &&
+        !file.seek(static_cast<std::uint32_t>(indexed_start_offset))) {
+      ++health_.read_failures;
+      page.error_code = "storage_index_seek_failed";
+      file.close();
+      return page;
     }
     std::array<std::uint8_t, 1024> read_buffer{};
     std::string line;

@@ -232,6 +232,10 @@ public:
 
   std::uint64_t serverAckSequence() const;
   bool setServerAckSequence(std::uint64_t sequence);
+  std::uint64_t serverMaximumSeenSequence() const;
+  bool setServerMaximumSeenSequence(std::uint64_t sequence);
+  std::uint64_t preparedRemovalSequence() const;
+  bool setPreparedRemovalSequence(std::uint64_t sequence);
   std::uint64_t serverEventAckSequence() const;
   bool setServerEventAckSequence(std::uint64_t sequence);
   std::uint32_t serverConfigVersion() const;
@@ -316,6 +320,8 @@ private:
   std::uint64_t reenrollment_generation_{0};
   std::uint64_t persistent_generation_{0};
   std::uint64_t server_ack_sequence_{0};
+  std::uint64_t server_maximum_seen_sequence_{0};
+  std::uint64_t prepared_removal_sequence_{0};
   std::uint64_t server_event_ack_sequence_{0};
   std::uint32_t server_config_version_{0};
   std::uint64_t energy_offset_wh_{0};

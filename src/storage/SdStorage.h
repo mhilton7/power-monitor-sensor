@@ -18,13 +18,20 @@ struct StorageHealth {
   bool mounted{false};
   bool writable{false};
   bool prepared_for_removal{false};
+  bool sequence_floor_ready{false};
+  bool sequence_reconciliation_in_progress{false};
+  bool sequence_conflict{false};
+  bool last_self_test_passed{false};
+  bool card_replaced_or_initialized{false};
   bool index_healthy{false};
   std::uint64_t capacity_bytes{0};
   std::uint64_t used_bytes{0};
   std::uint64_t free_bytes{0};
   std::uint64_t oldest_sequence{0};
   std::uint64_t oldest_syncable_sequence{0};
+  std::uint64_t newest_syncable_sequence{0};
   std::uint64_t newest_sequence{0};
+  std::uint64_t local_record_count{0};
   std::uint64_t oldest_event_sequence{0};
   std::uint64_t newest_event_sequence{0};
   std::uint64_t writes{0};
@@ -39,6 +46,12 @@ struct StorageHealth {
   std::uint32_t spi_hz{0};
   std::uint64_t last_write_utc_ms{0};
   std::uint64_t server_ack_sequence{0};
+  std::uint64_t sequence_floor{0};
+  std::uint64_t next_sequence{1};
+  std::uint64_t sequence_floor_advances{0};
+  std::uint64_t sequence_floor_write_failures{0};
+  std::uint64_t sequence_floor_verify_failures{0};
+  std::uint64_t card_generation{0};
   std::uint64_t event_ack_sequence{0};
   std::uint64_t reclaimable_bytes{0};
   std::uint64_t protected_unacknowledged_bytes{0};
@@ -67,12 +80,35 @@ struct StorageHealth {
   bool storage_full{false};
   std::string filesystem{"FAT32"};
   std::string card_type{"unknown"};
+  std::string card_identity_status{"unknown"};
+  std::string card_device_id;
   std::string current_file;
   std::string pressure_state{"failed"};
   std::string pressure_reason{"not_initialized"};
   std::string last_cleanup_result{"never"};
   std::string last_cleanup_reason;
   std::string last_error;
+};
+
+struct SequenceState {
+  bool storage_present{false};
+  bool storage_mounted{false};
+  bool storage_writable{false};
+  bool card_empty{true};
+  bool sequence_floor_ready{false};
+  bool sequence_reconciliation_in_progress{false};
+  bool sequence_conflict{false};
+  std::uint64_t local_record_count{0};
+  std::uint64_t local_oldest_sequence{0};
+  std::uint64_t local_newest_sequence{0};
+  std::uint64_t local_journal_high_water{0};
+  std::uint64_t prepared_removal_high_water{0};
+  std::uint64_t persisted_server_ack{0};
+  std::uint64_t persisted_server_max_seen{0};
+  std::uint64_t effective_sequence_floor{0};
+  std::uint64_t next_sequence{1};
+  std::uint64_t card_generation{0};
+  std::string card_identity_status{"unknown"};
 };
 
 struct HistoryQuery {
@@ -99,7 +135,9 @@ struct HistoryPage {
 class SdStorage {
 public:
   SdStorage();
-  bool begin(std::uint32_t spi_hz);
+  bool begin(std::uint32_t spi_hz, const std::string &device_id,
+             const std::string &hardware_fingerprint,
+             std::uint64_t required_sequence_floor);
   bool remount(std::uint32_t spi_hz);
   bool remountPreferred();
   bool append(IntervalRecord &record);
@@ -121,6 +159,9 @@ public:
                                    std::uint64_t first_utc_ms,
                                    std::uint64_t last_utc_ms);
   StorageHealth health() const;
+  SequenceState sequenceState(std::uint64_t persisted_server_ack,
+                              std::uint64_t persisted_server_max_seen,
+                              std::uint64_t prepared_removal_high_water) const;
   std::uint64_t nextSequence() const;
   bool advanceSequenceFloor(std::uint64_t acknowledged_sequence);
 
@@ -130,6 +171,7 @@ private:
   bool recoverCleanupJournal();
   bool recoverFile(const std::string &path, std::uint64_t &maximum_sequence);
   bool writeManifest();
+  bool loadSequenceJournal(const char *path, std::uint64_t &value) const;
   bool persistSequence(std::uint64_t committed_sequence);
   bool persistEventSequence(std::uint64_t committed_sequence);
   bool ensureDirectory(const std::string &path);
@@ -176,6 +218,9 @@ private:
   mutable StorageHealth last_health_snapshot_;
   std::uint64_t next_sequence_{1};
   std::uint64_t next_event_sequence_{1};
+  std::uint64_t required_sequence_floor_{0};
+  std::string device_id_;
+  std::string hardware_fingerprint_;
   std::uint32_t preferred_spi_hz_{0};
   StoragePolicy active_policy_{};
   StorageGrowthEstimator growth_estimator_{};

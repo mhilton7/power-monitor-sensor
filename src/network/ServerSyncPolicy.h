@@ -15,11 +15,13 @@ constexpr std::size_t kReadingBatchResponseBytes = 12U * 1024U;
 constexpr std::size_t kEventBatchResponseBytes = 8U * 1024U;
 constexpr std::size_t kReadingBatchPayloadBytes = 8U * 1024U;
 constexpr std::size_t kEventBatchPayloadBytes = 16U * 1024U;
-// The live storage/PZEM boundary has been measured at 81,508 free internal
-// bytes immediately before a heartbeat. TLS consumes about 41 KiB on this
-// target, so a 78 KiB admission floor retains roughly 37 KiB after the
-// handshake while avoiding a false disconnect at that valid steady state.
-constexpr std::uint32_t kMinimumInternalHeapBytes = 78U * 1024U;
+// The circular-storage and sequence-reconciliation runtime has been measured
+// at 72,348 free internal bytes immediately before a heartbeat. TLS consumes
+// about 41 KiB on this target, so a 64 KiB admission floor leaves roughly
+// 23 KiB after the handshake while the independent response-allocation guard
+// below preserves 24 KiB after allocating the bounded response body. Keeping
+// the older 78 KiB floor made every valid steady-state heartbeat impossible.
+constexpr std::uint32_t kMinimumInternalHeapBytes = 64U * 1024U;
 // A live PZEM sample leaves a 33,780-byte largest internal block on the
 // production ESP32-S3 N16R8. The TLS path has been physically validated with a
 // 32 KiB contiguous allocation while the independent total-heap guard
@@ -123,6 +125,40 @@ constexpr AcknowledgementDisposition classifyAcknowledgement(
     return AcknowledgementDisposition::Current;
   }
   return AcknowledgementDisposition::Advance;
+}
+constexpr std::uint64_t requiredSequenceFloor(
+    const std::uint64_t local_record_high_water,
+    const std::uint64_t journal_high_water,
+    const std::uint64_t persisted_acknowledgement,
+    const std::uint64_t persisted_maximum_seen,
+    const std::uint64_t server_maximum_seen,
+    const std::uint64_t prepared_removal_high_water = 0U) {
+  const std::uint64_t local = local_record_high_water > journal_high_water
+                                  ? local_record_high_water
+                                  : journal_high_water;
+  const std::uint64_t persisted =
+      persisted_acknowledgement > persisted_maximum_seen
+          ? persisted_acknowledgement
+          : persisted_maximum_seen;
+  const std::uint64_t remote = persisted > server_maximum_seen
+                                   ? persisted
+                                   : server_maximum_seen;
+  return local > remote
+             ? (local > prepared_removal_high_water ? local
+                                                     : prepared_removal_high_water)
+             : (remote > prepared_removal_high_water
+                    ? remote
+                    : prepared_removal_high_water);
+}
+constexpr bool sequenceCursorContractValid(
+    const std::uint64_t top_level_acknowledgement,
+    const std::uint64_t nested_acknowledgement,
+    const std::uint64_t maximum_seen_sequence,
+    const std::uint64_t next_sequence_floor) {
+  return top_level_acknowledgement == nested_acknowledgement &&
+         maximum_seen_sequence >= nested_acknowledgement &&
+         maximum_seen_sequence != UINT64_MAX &&
+         next_sequence_floor == maximum_seen_sequence + 1U;
 }
 constexpr bool shouldReleaseReadingBackoff(
     const bool immediate_sync_requested, const std::uint64_t acknowledgement,
