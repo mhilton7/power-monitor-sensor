@@ -313,6 +313,8 @@ export class App {
   private async runDiagnosticAction(button: HTMLButtonElement): Promise<void> {
     if (this.privilegedOperationActive) return;
     const action = button.dataset.action ?? "";
+    const confirmationMessage = button.dataset.confirmMessage;
+    if (confirmationMessage && !window.confirm(confirmationMessage)) return;
     const confirmation = destructiveConfirmation(action);
     if (confirmation) {
       const typed = window.prompt(`Type ${confirmation} to continue.`);
@@ -323,7 +325,11 @@ export class App {
     button.disabled = true;
     try {
       await api.runAction(action, confirmation);
-      this.actionResult(`${button.textContent?.trim() || action} was queued.`);
+      this.actionResult(
+        action === "prepare-card-removal"
+          ? "Card preparation was queued. Wait for microSD on Status to leave the Writable state, then power off the sensor before removing the card."
+          : `${button.textContent?.trim() || action} was queued.`,
+      );
     } catch (error) {
       this.actionResult(this.message(error, `${action} failed.`), true);
     } finally {

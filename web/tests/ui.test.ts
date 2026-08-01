@@ -228,6 +228,45 @@ describe("minimal WebUI", () => {
     expect(document.body.textContent).toContain("48%");
     expect(document.body.textContent).toContain("75 succeeded · 11 failed");
     expect(document.body.textContent).toContain("Test server TLS");
+    expect(document.body.textContent).toContain("Prepare card for removal");
+  });
+
+  it("requires confirmation before preparing the microSD card for removal", async () => {
+    vi.spyOn(api, "openSession").mockResolvedValue({
+      expiresInSeconds: 900,
+      setupRequired: false,
+      elevated: false,
+    });
+    vi.spyOn(api, "getUiStatus").mockResolvedValue(status);
+    vi.spyOn(api, "getUiDiagnostics").mockResolvedValue(diagnostics);
+    const runAction = vi.spyOn(api, "runAction").mockResolvedValue({
+      status: "queued",
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const root = document.querySelector<HTMLElement>("#app")!;
+
+    new App(root).start();
+    await Promise.resolve();
+    await Promise.resolve();
+    root.querySelector<HTMLButtonElement>('[data-view="diagnostics"]')!.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const prepare = root.querySelector<HTMLButtonElement>(
+      '[data-action="prepare-card-removal"]',
+    )!;
+    prepare.click();
+    await Promise.resolve();
+    expect(runAction).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    prepare.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runAction).toHaveBeenCalledWith("prepare-card-removal", undefined);
+    expect(root.querySelector("#action-result")?.textContent).toContain(
+      "power off the sensor before removing the card",
+    );
   });
 
   it("does not overlap Status polls and does not fetch config, metrics, OTA, or events", async () => {

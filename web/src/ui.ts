@@ -291,8 +291,9 @@ export const renderDiagnostics =
     <button type="button" data-action="test-dns">Test DNS</button><button type="button" data-action="test-ntp">Test NTP</button>
     <button type="button" data-action="test-server-tls">Test server TLS</button><button type="button" data-action="test-heartbeat">Test heartbeat</button>
     <button type="button" data-action="test-pzem">Test PZEM</button><button type="button" data-action="test-sd">Test microSD</button>
+    <button type="button" data-action="prepare-card-removal" data-confirm-message="Stop microSD writes and safely unmount the card? Wait for storage to leave the Writable state, then power off the sensor before physically removing the card.">Prepare card for removal</button>
     <a class="button" href="/api/v1/diagnostics/bundle" download>Download redacted bundle</a><a class="button" href="/api/v1/diagnostics/disconnect-flight-recorder" download>Download disconnect record</a><button type="button" data-action="reboot" data-confirm="REBOOT">Reboot</button>
-  </div><p id="action-result" role="status"></p>
+  </div><p class="muted">Preparing the card stops durable writes and unmounts it safely. Power off the sensor before physically removing the card.</p><p id="action-result" role="status"></p>
   <details class="recovery"><summary>Owner-only recovery</summary><p>These actions preserve typed confirmation and administrator elevation.</p>
     <div class="actions"><button type="button" data-action="network-reset" data-confirm="RESET NETWORK">Network reset</button>
     <button type="button" class="danger" data-action="factory-reset" data-confirm="FACTORY RESET">Factory reset</button></div>
