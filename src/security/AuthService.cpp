@@ -75,7 +75,7 @@ AuthResult RequestAuthenticator::verify(
   return AuthResult::Ok;
 }
 
-crypto::Key32 SessionManager::digest(const std::string &value) {
+crypto::Key32 SessionManager::digest(const StringView value) {
   return crypto::sha256(reinterpret_cast<const std::uint8_t *>(value.data()),
                         value.size());
 }
@@ -220,7 +220,8 @@ SessionManager::Session SessionManager::elevate(
 }
 
 LocalSessionResult
-SessionManager::validate(const std::string &token, const std::uint64_t now_ms,
+SessionManager::validate(const StringView token,
+                         const std::uint64_t now_ms,
                          const bool require_elevated) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (token.empty()) {
@@ -244,7 +245,7 @@ SessionManager::validate(const std::string &token, const std::uint64_t now_ms,
 }
 
 LocalSessionResult SessionManager::validateMutation(
-    const std::string &token, const std::string &csrf,
+    const StringView token, const StringView csrf,
     const std::uint64_t now_ms, const bool require_elevated) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (token.empty()) {

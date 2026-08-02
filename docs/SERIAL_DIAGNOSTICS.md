@@ -141,12 +141,32 @@ contains current/minimum heap, largest block, internal free/largest block, and
 free PSRAM.
 
 `MEMORY/HEAP_LOW` with `PM-TLS-006` means the request was deferred before TLS
-because either free internal heap was below 78 KiB or the largest internal
-block was below 32 KiB. This is a safe local-resource deferral: cleanup runs,
+because either free internal heap was below 64 KiB or the largest internal
+block was below 32 KiB. The 32 KiB contiguous guard was not weakened. When at
+least 64 KiB remains free but the largest block is smaller than 32 KiB, the
+precise classification is `fragmented`; below the total floor it is
+`low_total_memory`. This is a safe local-resource deferral: cleanup runs,
 server reachability/authentication are preserved, external failure counters
-do not advance, and the operation retries after 1.5 seconds. Ordinary
-local JSON and embedded-asset responses explicitly close after delivery so
-idle AsyncTCP connections cannot erode that TLS reserve during a long soak.
+do not advance, and the operation uses bounded local retry. Ordinary local
+JSON and embedded-asset responses explicitly close after delivery so idle
+AsyncTCP lifetimes are bounded by design. Native ownership and mock-browser
+cancellation tests cover cleanup behavior; this software-only run did not
+capture a physical AsyncTCP allocator trace.
+
+The diagnostic bundle also reports Status-pool capacity/active/exhaustion,
+maximum Status bytes, request/response scratch capacities and reuse counts,
+unexpected growth, fragmentation episodes/recoveries, the operation active at
+entry, TLS admission totals/largest block, last heartbeat attempt/success/age,
+expected interval, offline threshold, freshness state, and last local deferral
+reason. These are counters and sanitized enum/text fields; no CA, device
+secret, HMAC value, session token, or request body is included.
+
+Interpret server freshness independently from Wi-Fi: `live` is within the
+expected heartbeat interval, `delayed` is late but inside the stale boundary,
+`stale` has a prior success beyond freshness, `offline` has no timely
+server-received heartbeat, and `unauthenticated` is a current authentication
+failure. A local age of 356 seconds must never be described as “Server
+connected.”
 
 The unauthenticated `GET /api/local/health` liveness route exposes only safe
 counters and booleans needed by the physical soak. It does not contact the
@@ -319,7 +339,7 @@ disabled.
 | `PM-TLS-002` | TLS | CA PEM parse failed | Export a complete PEM certificate chain/CA |
 | `PM-TLS-003` | TLS | Time is not trusted | Resolve NTP before TLS/signed requests |
 | `PM-TLS-004` | TLS | TLS client/handshake setup failed | Check CA, certificate SAN, server port, and TLS compatibility |
-| `PM-TLS-006` | MEMORY/TLS | Internal heap reserve or the physically validated 32 KiB contiguous allocation is unsafe for a TLS attempt | Capture sync stack/heap checkpoints and inspect bounded payload ownership |
+| `PM-TLS-006` | MEMORY/TLS | Internal heap reserve or the retained 32 KiB contiguous admission requirement is unsafe for a TLS attempt | Capture sync stack/heap checkpoints and inspect bounded payload ownership; physically validate the exact deployed binary separately |
 | `PM-HTTP-001` | HTTP | Outbound request transport failed | Use its request ID and DNS/TLS category |
 | `PM-HTTP-002` | HTTP | Local request body exceeded the limit | Send at most the documented bounded JSON size |
 | `PM-HTTP-003` | HTTP | Outbound request body exceeded the 24 KiB safety cap | Reduce the bounded batch; do not raise it without heap measurement |
@@ -439,7 +459,8 @@ TLS failure:
 [000008715][ERROR][HTTP     ][HTTP_FAILED] error=PM-HTTP-001 request_id=4 method=POST endpoint=/api/v1/device-heartbeats transport=connection refused tls_category=CONNECTION_REFUSED elapsed_ms=613
 ```
 
-Representative physical outage recovery, with identifiers and secrets omitted:
+Historical prior-build outage recovery example, with identifiers and secrets
+omitted (illustrative log syntax only; not validation of the current binary):
 
 ```text
 [002770198][WARN ][SERVER   ][SYNC_RETRY_SCHEDULED] attempt=1 base_ms=1000 delay_ms=1023 maximum_ms=900000
@@ -449,11 +470,12 @@ Representative physical outage recovery, with identifiers and secrets omitted:
 [002962185][INFO ][SYNC     ][READ_BATCH_BEGIN] records=24 first_sequence=46 last_sequence=95
 ```
 
-The bounded retries did not reboot the device or interrupt local probes or
-microSD writes. The retained acknowledgement of zero reflects a pre-existing
-server history gap (sequences 1 through 45 are not on the card); firmware does
-not fabricate missing readings or advance the durable cursor without server
-acknowledgement.
+In that historical capture, bounded retries did not reboot the device or
+interrupt local probes or microSD writes. Its retained acknowledgement of zero
+reflected a pre-existing server history gap (sequences 1 through 45 were not on
+the card); firmware did not fabricate missing readings or advance the durable
+cursor without server acknowledgement. Repeat physical verification with the
+exact new binary before using equivalent observations as release evidence.
 
 Password work:
 

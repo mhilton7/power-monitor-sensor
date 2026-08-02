@@ -12,16 +12,18 @@ import hashlib
 import json
 import os
 import secrets
+import socket
 import ssl
 import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 try:
     from .protocol import PROTOCOL, hkdf_sha256, verify
@@ -37,6 +39,9 @@ HEARTBEAT_ENDPOINT = "heartbeat"
 READINGS_ENDPOINT = "readings"
 EVENTS_ENDPOINT = "events"
 CONFIG_REPORT_ENDPOINT = "config_report"
+
+TRANSPORT_RESPONSE_BODY_DELAY = "response_body_delay"
+TRANSPORT_CONNECTION_RESET = "connection_reset"
 
 
 def utc_now() -> str:
@@ -106,6 +111,54 @@ class FaultPlan:
             return response
 
 
+@dataclass(frozen=True)
+class TransportFault:
+    """One deterministic transport lifecycle fault for mock-HTTPS tests."""
+
+    kind: str
+    delay_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.kind not in {
+            TRANSPORT_RESPONSE_BODY_DELAY,
+            TRANSPORT_CONNECTION_RESET,
+        }:
+            raise ValueError(f"unsupported transport fault: {self.kind}")
+        if self.delay_seconds < 0:
+            raise ValueError("transport fault delay must not be negative")
+        if self.kind == TRANSPORT_CONNECTION_RESET and self.delay_seconds != 0:
+            raise ValueError("connection reset does not accept a delay")
+
+
+@dataclass
+class TransportFaultPlan:
+    """Thread-safe, one-shot transport faults consumed after authentication."""
+
+    _faults: dict[str, deque[TransportFault]] = field(default_factory=dict, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def enqueue(self, endpoint: str, fault: TransportFault) -> None:
+        if endpoint not in {
+            HEARTBEAT_ENDPOINT,
+            READINGS_ENDPOINT,
+            EVENTS_ENDPOINT,
+            CONFIG_REPORT_ENDPOINT,
+        }:
+            raise ValueError(f"unsupported transport-fault endpoint: {endpoint}")
+        with self._lock:
+            self._faults.setdefault(endpoint, deque()).append(fault)
+
+    def take(self, endpoint: str) -> TransportFault | None:
+        with self._lock:
+            queue = self._faults.get(endpoint)
+            if not queue:
+                return None
+            fault = queue.popleft()
+            if not queue:
+                del self._faults[endpoint]
+            return fault
+
+
 @dataclass
 class DeviceState:
     secret: bytes = field(repr=False)
@@ -159,6 +212,7 @@ class ServerState:
     token_used: bool = False
     devices: dict[str, DeviceState] = field(default_factory=dict)
     faults: FaultPlan = field(default_factory=FaultPlan)
+    transport_faults: TransportFaultPlan = field(default_factory=TransportFaultPlan)
     clock: Callable[[], float] = field(default=time.time, repr=False)
     _enrollment_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     desired_config: dict[str, Any] = field(
@@ -224,6 +278,20 @@ class ServerState:
         self.faults.enqueue(
             endpoint,
             FaultResponse(status, code, detail, retry_after_seconds),
+        )
+
+    def queue_transport_fault(
+        self, endpoint: str, kind: str, *, delay_seconds: float = 0.0
+    ) -> None:
+        """Queue a test-only connection reset or delayed response body.
+
+        The fault is applied only after the signed request authenticates. This
+        keeps authentication failures distinct from network lifecycle failures
+        and prevents a transport test from weakening request verification.
+        """
+
+        self.transport_faults.enqueue(
+            endpoint, TransportFault(kind=kind, delay_seconds=delay_seconds)
         )
 
     def issue_enrollment_token(
@@ -383,6 +451,11 @@ class SimulatorHandler(BaseHTTPRequestHandler):
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
+        delay_seconds = getattr(self, "_response_body_delay_seconds", 0.0)
+        if delay_seconds:
+            self.wfile.flush()
+            time.sleep(delay_seconds)
+            self._response_body_delay_seconds = 0.0
         if body:
             self.wfile.write(body)
 
@@ -400,8 +473,35 @@ class SimulatorHandler(BaseHTTPRequestHandler):
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
+        delay_seconds = getattr(self, "_response_body_delay_seconds", 0.0)
+        if delay_seconds:
+            self.wfile.flush()
+            time.sleep(delay_seconds)
+            self._response_body_delay_seconds = 0.0
         if body:
             self.wfile.write(body)
+
+    def _prepare_transport(self, endpoint: str) -> bool:
+        """Apply a one-shot post-authentication transport fault.
+
+        Returning ``False`` means the connection was deliberately reset before
+        request processing. A response delay is retained only for the next
+        response generated by this request handler.
+        """
+
+        fault = self.state.transport_faults.take(endpoint)
+        if fault is None:
+            return True
+        if fault.kind == TRANSPORT_RESPONSE_BODY_DELAY:
+            self._response_body_delay_seconds = fault.delay_seconds
+            return True
+        self.close_connection = True
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.connection.close()
+        return False
 
     def _send_fault(self, endpoint: str) -> bool:
         response = self.state.faults.take(endpoint)
@@ -457,7 +557,7 @@ class SimulatorHandler(BaseHTTPRequestHandler):
             return None
         return device_id, device
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path == "/api/v1/time":
             self._send(200, {"schema_version": 1, "utc": utc_now()})
             return
@@ -511,7 +611,7 @@ class SimulatorHandler(BaseHTTPRequestHandler):
                 "application/problem+json",
             )
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         body = self._read_body()
         if body is None:
             return
@@ -551,6 +651,8 @@ class SimulatorHandler(BaseHTTPRequestHandler):
             return
         device_id, device = authenticated
         if self.path == "/api/v1/device-heartbeats":
+            if not self._prepare_transport(HEARTBEAT_ENDPOINT):
+                return
             if self._send_fault(HEARTBEAT_ENDPOINT):
                 return
             if payload.get("device_id") != device_id:
@@ -600,6 +702,8 @@ class SimulatorHandler(BaseHTTPRequestHandler):
                 },
             )
         elif self.path == "/api/v1/device-readings/batch":
+            if not self._prepare_transport(READINGS_ENDPOINT):
+                return
             if self._send_fault(READINGS_ENDPOINT):
                 return
             records = payload.get("readings")
@@ -694,6 +798,8 @@ class SimulatorHandler(BaseHTTPRequestHandler):
                 },
             )
         elif self.path == "/api/v1/device-events/batch":
+            if not self._prepare_transport(EVENTS_ENDPOINT):
+                return
             if self._send_fault(EVENTS_ENDPOINT):
                 return
             events = payload.get("events", [])
@@ -723,6 +829,8 @@ class SimulatorHandler(BaseHTTPRequestHandler):
                 },
             )
         elif self.path == "/api/v1/device-config/report":
+            if not self._prepare_transport(CONFIG_REPORT_ENDPOINT):
+                return
             if self._send_fault(CONFIG_REPORT_ENDPOINT):
                 return
             if (
@@ -750,10 +858,38 @@ class SimulatorHandler(BaseHTTPRequestHandler):
             )
 
 
+class SimulatorHttpServer(ThreadingHTTPServer):
+    """Loopback server with an optional deterministic TLS-accept delay."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.tls_connection_delay_seconds = 0.0
+
+    def get_request(self) -> tuple[socket.socket, Any]:
+        # When the listening socket is SSL-wrapped, ``accept`` performs the
+        # server handshake. Sleeping before it therefore models a delayed TLS
+        # connection without weakening certificate or hostname verification.
+        if self.tls_connection_delay_seconds:
+            time.sleep(self.tls_connection_delay_seconds)
+        return super().get_request()
+
+
 def serve(
-    host: str, port: int, state: ServerState, cert: Path | None, key: Path | None
-) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer((host, port), SimulatorHandler)
+    host: str,
+    port: int,
+    state: ServerState,
+    cert: Path | None,
+    key: Path | None,
+    *,
+    tls_connection_delay_seconds: float = 0.0,
+) -> SimulatorHttpServer:
+    if tls_connection_delay_seconds < 0:
+        raise ValueError("TLS connection delay must not be negative")
+    server = SimulatorHttpServer((host, port), SimulatorHandler)
+    server.tls_connection_delay_seconds = tls_connection_delay_seconds
     server.state = state  # type: ignore[attr-defined]
     if cert or key:
         if not cert or not key:

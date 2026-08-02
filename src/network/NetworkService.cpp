@@ -427,6 +427,17 @@ void NetworkService::requestScan() {
   scan_requested_.store(true, std::memory_order_release);
 }
 
+bool NetworkService::setupApActive() const {
+  if (!lockStatus(pdMS_TO_TICKS(100))) {
+    PM_LOG_ERROR("NETWORK", "STATUS_MUTEX_TIMEOUT",
+                 "error=PM-NETWORK-002 phase=setup_ap_snapshot timeout_ms=100");
+    return false;
+  }
+  const bool active = status_.setup_ap_active;
+  unlockStatus();
+  return active;
+}
+
 NetworkStatus NetworkService::status() const {
   if (!lockStatus(pdMS_TO_TICKS(100))) {
     PM_LOG_ERROR("NETWORK", "STATUS_MUTEX_TIMEOUT",
@@ -434,6 +445,32 @@ NetworkStatus NetworkService::status() const {
     return {};
   }
   const NetworkStatus snapshot = status_;
+  unlockStatus();
+  return snapshot;
+}
+
+CompactNetworkStatus NetworkService::compactStatus() const {
+  CompactNetworkStatus snapshot;
+  if (!lockStatus(pdMS_TO_TICKS(100))) {
+    PM_LOG_ERROR("NETWORK", "STATUS_MUTEX_TIMEOUT",
+                 "error=PM-NETWORK-002 phase=compact_snapshot timeout_ms=100");
+    return snapshot;
+  }
+  snapshot.station_connected = status_.station_connected;
+  snapshot.server_reachable = status_.server_reachable;
+  snapshot.server_authenticated = status_.server_authenticated;
+  snapshot.rssi_dbm = status_.rssi_dbm;
+  const int written =
+      std::snprintf(snapshot.ip_address.data(), snapshot.ip_address.size(),
+                    "%s", status_.ip_address.c_str());
+  const int hostname_written =
+      std::snprintf(snapshot.hostname.data(), snapshot.hostname.size(), "%s",
+                    status_.hostname.c_str());
+  snapshot.truncated =
+      written < 0 ||
+      static_cast<std::size_t>(written) >= snapshot.ip_address.size() ||
+      hostname_written < 0 ||
+      static_cast<std::size_t>(hostname_written) >= snapshot.hostname.size();
   unlockStatus();
   return snapshot;
 }

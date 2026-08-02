@@ -19,10 +19,10 @@ of being repeated as numeric literals:
 | Diagnostic logger | 4 KiB |
 | Meter | 6 KiB |
 | Aggregation | 8 KiB |
-| Storage | 8 KiB |
+| Storage | 12 KiB |
 | Network | 8 KiB |
 | Server synchronization | 24 KiB |
-| Health | 6 KiB |
+| Health | 12 KiB |
 | Maintenance | 12 KiB |
 | Serial command | 24 KiB |
 | Password worker (on demand) | 16 KiB |
@@ -61,11 +61,13 @@ It submits bounded history jobs to `StorageTask` through
 `StorageCoordinator`, then polls the result from later scheduler ticks. This
 keeps recursive FAT directory scans and SPI reads off the Wi-Fi core, so a
 large offline backlog cannot starve `NetworkTask` or the core idle task.
-On core 1, `StorageTask` runs at priority 2 while the watchdog-supervised
+On core 1, `StorageTask` runs at priority 0 while the watchdog-supervised
 `AggregationTask` runs at priority 3. Recovery also yields while scanning
-record bytes and records. This ordering is intentional: a slow 400 kHz card
-recovery must never prevent AggregationTask from waking, feeding its watchdog,
-and preserving the measurement pipeline.
+record bytes and records. Idle priority lets the scheduler service the
+watchdog-monitored idle task while every online task can preempt a slow 400 kHz
+card recovery. This ordering is intentional: recovery must never prevent
+AggregationTask from waking, feeding its watchdog, and preserving the
+measurement pipeline.
 
 ## Measurement
 
@@ -91,9 +93,11 @@ margin_percent = min(high_water_bytes, allocated_bytes)
 ```
 
 For a 24 KiB task, acceptance requires at least 6 KiB of measured high-water
-space at the worst tested checkpoint. Record the actual minimum from the
-physical 100-heartbeat CSV in the release verification report; never replace
-measurement with the configured allocation.
+space at the worst tested checkpoint. NetworkTask and ServerSyncTask have a
+30-percent target; other application tasks retain the 25-percent minimum.
+Native/simulated runs can prove configured capacity and modelled margin only.
+Record an actual minimum from a later physical run in the release verification
+report; never replace physical measurement with configured allocation.
 
 ## Sizing procedure
 
@@ -114,7 +118,11 @@ an unbounded stack allocation.
 ## Physical verification
 
 Physical results are valid only for the exact source fingerprint and binary
-listed in the release verification record. Earlier 16 KiB ServerSyncTask soak
-claims are intentionally removed because they do not describe the current
-24 KiB layout or minimal WebUI. See `FIRMWARE_OPTIMIZATION_1.0.5.md` for the
-current baseline and acceptance status.
+listed in the release verification record. Earlier ServerSyncTask soak claims
+do not describe the current 24 KiB layout, fixed Status-response pool, or
+PSRAM transport scratch and therefore are not current acceptance evidence.
+
+This repair run is software-only: it records configured/static and simulated
+evidence, builds all ESP32 environments, and does not connect, flash, or
+monitor hardware. Physical task high-water, Wi-Fi, and TLS confirmation remain
+a later deployment-verification step using the exact final ELF.

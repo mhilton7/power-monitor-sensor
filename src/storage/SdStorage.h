@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -90,6 +91,81 @@ struct StorageHealth {
   std::string last_error;
 };
 
+struct CompactStorageHealth {
+  bool present{false};
+  bool mounted{false};
+  bool writable{false};
+  std::uint64_t newest_sequence{0U};
+  std::uint64_t newest_syncable_sequence{0U};
+};
+
+// Fixed-capacity heartbeat snapshot. The full StorageHealth model owns
+// diagnostic strings that are convenient for infrequent UI requests but
+// expensive to copy immediately before every TLS transaction. This snapshot
+// contains exactly the fields published by the signed heartbeat and never
+// allocates while it is copied under the storage mutex.
+struct HeartbeatStorageHealth {
+  bool present{false};
+  bool mounted{false};
+  bool writable{false};
+  bool prepared_for_removal{false};
+  bool sequence_floor_ready{false};
+  bool sequence_reconciliation_in_progress{false};
+  bool sequence_conflict{false};
+  bool last_self_test_passed{false};
+  bool card_replaced_or_initialized{false};
+  bool index_healthy{false};
+  bool acknowledgement_verified{false};
+  bool cleanup_in_progress{false};
+  bool cleanup_recovery_required{false};
+  bool storage_full{false};
+  std::uint64_t capacity_bytes{0};
+  std::uint64_t used_bytes{0};
+  std::uint64_t free_bytes{0};
+  std::uint64_t oldest_sequence{0};
+  std::uint64_t oldest_syncable_sequence{0};
+  std::uint64_t newest_syncable_sequence{0};
+  std::uint64_t newest_sequence{0};
+  std::uint64_t local_record_count{0};
+  std::uint64_t oldest_event_sequence{0};
+  std::uint64_t newest_event_sequence{0};
+  std::uint64_t write_failures{0};
+  std::uint64_t sequence_floor{0};
+  std::uint64_t next_sequence{1};
+  std::uint64_t card_generation{0};
+  std::uint64_t reclaimable_bytes{0};
+  std::uint64_t protected_unacknowledged_bytes{0};
+  std::uint64_t protected_untrusted_bytes{0};
+  std::uint64_t last_cleanup_utc_ms{0};
+  std::uint64_t last_cleanup_reclaimed_bytes{0};
+  std::uint64_t dropped_interval_count{0};
+  std::uint64_t first_dropped_interval_utc_ms{0};
+  std::uint64_t last_dropped_interval_utc_ms{0};
+  std::uint64_t growth_bytes_per_day{0};
+  std::int64_t estimated_days_remaining{-1};
+  std::uint32_t segment_count{0};
+  std::uint32_t eligible_segment_count{0};
+  std::uint32_t protected_segment_count{0};
+  std::uint32_t open_segment_count{0};
+  std::uint32_t closed_segment_count{0};
+  std::uint32_t untrusted_segment_count{0};
+  std::uint32_t event_segment_count{0};
+  std::uint32_t export_count{0};
+  std::uint32_t repair_artifact_count{0};
+  std::uint32_t temporary_artifact_count{0};
+  std::uint8_t free_percent{0};
+  std::array<char, 16> filesystem{};
+  std::array<char, 24> card_type{};
+  std::array<char, 40> card_identity_status{};
+  std::array<char, 48> pressure_state{};
+  std::array<char, 96> pressure_reason{};
+  std::array<char, 48> last_cleanup_result{};
+  // Remote cleanup reasons are contract-bounded to 500 bytes.
+  std::array<char, 512> last_cleanup_reason{};
+  std::array<char, 192> last_error{};
+  bool truncated{false};
+};
+
 struct SequenceState {
   bool storage_present{false};
   bool storage_mounted{false};
@@ -159,6 +235,8 @@ public:
                                    std::uint64_t first_utc_ms,
                                    std::uint64_t last_utc_ms);
   StorageHealth health() const;
+  CompactStorageHealth compactHealth() const;
+  HeartbeatStorageHealth heartbeatHealth() const;
   SequenceState sequenceState(std::uint64_t persisted_server_ack,
                               std::uint64_t persisted_server_max_seen,
                               std::uint64_t prepared_removal_high_water) const;

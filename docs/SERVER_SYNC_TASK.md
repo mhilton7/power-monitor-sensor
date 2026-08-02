@@ -62,12 +62,11 @@ The repair addresses ownership and peak live memory:
   16 KiB, and all other responses at 24 KiB. Request bodies are bounded per
   endpoint before TLS begins.
 - Response bytes are read through a bounded stream loop, not `getString()`.
-- TLS admission requires at least 78 KiB of free internal heap and a largest
-  contiguous internal block of at least 32 KiB. The latter accepts the
-  33,780-byte steady-state block measured with a live PZEM while retaining the
-  physically validated 32 KiB contiguous TLS allocation floor. The total-heap
-  threshold accepts the 81,508-byte storage-boundary state while retaining
-  roughly 37 KiB after the measured TLS working set.
+- TLS admission requires at least 64 KiB of free internal heap and a largest
+  contiguous internal block of at least 32 KiB. The total floor reflects the
+  bounded 41 KiB historical TLS working set and an independent post-response
+  reserve; the contiguous guard remains unchanged. Historical live-PZEM traces
+  informed these guards but do not validate the current binary.
 - Local JSON and embedded-asset responses send `Connection: close`. This
   bounds AsyncTCP connection lifetime under concurrent WebUI/health polling
   instead of weakening the TLS admission reserve when clients retain idle
@@ -211,6 +210,31 @@ heartbeat. Ordinary transport failures never reboot the sensor. Retry is
 exponential, capped by the configured maximum, jittered, and honors a valid
 server `Retry-After`.
 
+## Fragmentation and reusable transport storage
+
+TLS admission reads one `HeapSnapshot` and requires both 64 KiB total free
+internal heap and a 32 KiB largest contiguous internal block. A state with
+72,280 bytes total free and only a 24,564-byte largest block is classified as
+local fragmentation. It is not a DNS, Wi-Fi, authentication, signature, or
+server-transport failure and therefore does not advance external exponential
+backoff. Optional UI work remains deferred and the heartbeat receives a short
+bounded local retry after memory coalesces.
+
+`ServerSyncTask` owns one 20 KiB request buffer and one 24 KiB response buffer.
+Both are allocated once from PSRAM, never grow, and are reused for heartbeat,
+reading, event, and bounded response bodies. A request body that exceeds its
+documented capacity fails locally; it is never rebuilt in a larger internal
+buffer. The CA-bearing transport configuration is cached and copied again only
+when the persistent configuration generation changes. Request-specific
+canonical/authentication values remain bounded and are destroyed by the one
+transaction cleanup path.
+
+The 32 KiB contiguous TLS guard is deliberately unchanged. Historical device
+evidence established the safety boundary, but that evidence does not validate
+the new binary. Current-run evidence consists of deterministic allocation,
+fragmentation, mock-transport, native, browser, and build tests. Physical
+confirmation remains a separate deployment step with the exact final ELF.
+
 ## Local isolation
 
 `GET /api/local/health` is an unauthenticated, read-only LAN liveness probe.
@@ -220,7 +244,8 @@ Wi-Fi/time/storage/meter booleans, sync state, heartbeat counters, task stack
 margin, and internal-heap state so a host soak test can verify the WebUI while
 TLS is active or failing.
 
-Run the physical soak from the repository root:
+The following command is reserved for later physical deployment validation;
+it is not an acceptance gate for the software-only repair:
 
 ```powershell
 .\tools\diagnostics\Test-SensorHeartbeatSoak.ps1 `
@@ -237,6 +262,7 @@ attempts so one dropped packet is recorded without being misclassified as a
 device outage; the root and health HTTP probes remain independent and
 fail-closed.
 
-Do not treat results from another source revision as release evidence. The
-exact 1.0.5 binary must complete the physical matrix and its hashes, source
-fingerprint, timestamps, and task table must be retained with the result.
+Do not treat results from another source revision as release evidence. A
+future physical run must use the exact released binary, matching ELF hash,
+source fingerprint, timestamps, and task table. No prior 1.0.5 or other-binary
+soak is evidence for this build.

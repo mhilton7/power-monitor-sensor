@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "core/StringView.h"
+
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
 
@@ -112,10 +114,9 @@ public:
   Session elevate(const std::string &presented_token, std::uint64_t now_ms,
                   std::uint32_t ttl_seconds,
                   std::uint32_t elevation_ttl_seconds);
-  LocalSessionResult validate(const std::string &token, std::uint64_t now_ms,
+  LocalSessionResult validate(StringView token, std::uint64_t now_ms,
                               bool require_elevated = false) const;
-  LocalSessionResult validateMutation(const std::string &token,
-                                      const std::string &csrf,
+  LocalSessionResult validateMutation(StringView token, StringView csrf,
                                       std::uint64_t now_ms,
                                       bool require_elevated = false) const;
   bool invalidate(const std::string &token, std::uint64_t now_ms);
@@ -134,7 +135,7 @@ private:
     std::uint32_t generation{0};
   };
 
-  static crypto::Key32 digest(const std::string &value);
+  static crypto::Key32 digest(StringView value);
   static bool digestEqual(const crypto::Key32 &left,
                           const crypto::Key32 &right);
   Entry *find(const crypto::Key32 &token_digest);

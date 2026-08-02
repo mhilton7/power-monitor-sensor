@@ -1727,6 +1727,117 @@ StorageHealth SdStorage::health() const {
   return copy;
 }
 
+CompactStorageHealth SdStorage::compactHealth() const {
+  const auto compact = [](const StorageHealth &health) {
+    return CompactStorageHealth{health.present, health.mounted, health.writable,
+                                health.newest_sequence,
+                                health.newest_syncable_sequence};
+  };
+  if (!lock(pdMS_TO_TICKS(100))) {
+    if (health_snapshot_mutex_ != nullptr &&
+        xSemaphoreTake(health_snapshot_mutex_, pdMS_TO_TICKS(25)) == pdTRUE) {
+      const CompactStorageHealth snapshot = compact(last_health_snapshot_);
+      xSemaphoreGive(health_snapshot_mutex_);
+      return snapshot;
+    }
+    return {};
+  }
+  const CompactStorageHealth snapshot = compact(health_);
+  unlock();
+  return snapshot;
+}
+
+HeartbeatStorageHealth SdStorage::heartbeatHealth() const {
+  const auto compact = [](const StorageHealth &source) {
+    HeartbeatStorageHealth output;
+    output.present = source.present;
+    output.mounted = source.mounted;
+    output.writable = source.writable;
+    output.prepared_for_removal = source.prepared_for_removal;
+    output.sequence_floor_ready = source.sequence_floor_ready;
+    output.sequence_reconciliation_in_progress =
+        source.sequence_reconciliation_in_progress;
+    output.sequence_conflict = source.sequence_conflict;
+    output.last_self_test_passed = source.last_self_test_passed;
+    output.card_replaced_or_initialized = source.card_replaced_or_initialized;
+    output.index_healthy = source.index_healthy;
+    output.acknowledgement_verified = source.acknowledgement_verified;
+    output.cleanup_in_progress = source.cleanup_in_progress;
+    output.cleanup_recovery_required = source.cleanup_recovery_required;
+    output.storage_full = source.storage_full;
+    output.capacity_bytes = source.capacity_bytes;
+    output.used_bytes = source.used_bytes;
+    output.free_bytes = source.free_bytes;
+    output.oldest_sequence = source.oldest_sequence;
+    output.oldest_syncable_sequence = source.oldest_syncable_sequence;
+    output.newest_syncable_sequence = source.newest_syncable_sequence;
+    output.newest_sequence = source.newest_sequence;
+    output.local_record_count = source.local_record_count;
+    output.oldest_event_sequence = source.oldest_event_sequence;
+    output.newest_event_sequence = source.newest_event_sequence;
+    output.write_failures = source.write_failures;
+    output.sequence_floor = source.sequence_floor;
+    output.next_sequence = source.next_sequence;
+    output.card_generation = source.card_generation;
+    output.reclaimable_bytes = source.reclaimable_bytes;
+    output.protected_unacknowledged_bytes =
+        source.protected_unacknowledged_bytes;
+    output.protected_untrusted_bytes = source.protected_untrusted_bytes;
+    output.last_cleanup_utc_ms = source.last_cleanup_utc_ms;
+    output.last_cleanup_reclaimed_bytes =
+        source.last_cleanup_reclaimed_bytes;
+    output.dropped_interval_count = source.dropped_interval_count;
+    output.first_dropped_interval_utc_ms =
+        source.first_dropped_interval_utc_ms;
+    output.last_dropped_interval_utc_ms = source.last_dropped_interval_utc_ms;
+    output.growth_bytes_per_day = source.growth_bytes_per_day;
+    output.estimated_days_remaining = source.estimated_days_remaining;
+    output.segment_count = source.segment_count;
+    output.eligible_segment_count = source.eligible_segment_count;
+    output.protected_segment_count = source.protected_segment_count;
+    output.open_segment_count = source.open_segment_count;
+    output.closed_segment_count = source.closed_segment_count;
+    output.untrusted_segment_count = source.untrusted_segment_count;
+    output.event_segment_count = source.event_segment_count;
+    output.export_count = source.export_count;
+    output.repair_artifact_count = source.repair_artifact_count;
+    output.temporary_artifact_count = source.temporary_artifact_count;
+    output.free_percent = source.free_percent;
+    const auto copy_text = [&output](auto &destination,
+                                     const std::string &value) {
+      const int written = std::snprintf(destination.data(), destination.size(),
+                                        "%s", value.c_str());
+      output.truncated =
+          output.truncated || written < 0 ||
+          static_cast<std::size_t>(written) >= destination.size();
+    };
+    copy_text(output.filesystem, source.filesystem);
+    copy_text(output.card_type, source.card_type);
+    copy_text(output.card_identity_status, source.card_identity_status);
+    copy_text(output.pressure_state, source.pressure_state);
+    copy_text(output.pressure_reason, source.pressure_reason);
+    copy_text(output.last_cleanup_result, source.last_cleanup_result);
+    copy_text(output.last_cleanup_reason, source.last_cleanup_reason);
+    copy_text(output.last_error, source.last_error);
+    return output;
+  };
+  if (!lock(pdMS_TO_TICKS(100))) {
+    if (health_snapshot_mutex_ != nullptr &&
+        xSemaphoreTake(health_snapshot_mutex_, pdMS_TO_TICKS(25)) == pdTRUE) {
+      const HeartbeatStorageHealth snapshot = compact(last_health_snapshot_);
+      xSemaphoreGive(health_snapshot_mutex_);
+      return snapshot;
+    }
+    HeartbeatStorageHealth unavailable;
+    std::snprintf(unavailable.last_error.data(), unavailable.last_error.size(),
+                  "%s", "storage_health_snapshot_busy");
+    return unavailable;
+  }
+  const HeartbeatStorageHealth snapshot = compact(health_);
+  unlock();
+  return snapshot;
+}
+
 SequenceState SdStorage::sequenceState(
     const std::uint64_t persisted_server_ack,
     const std::uint64_t persisted_server_max_seen,

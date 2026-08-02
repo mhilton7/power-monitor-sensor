@@ -65,4 +65,38 @@ heartbeat `401`/`403`/`409`/`429`/`503`, nonce replay, successful
 enrollment/heartbeat/backfill, and HTTP `200` reading responses containing
 record-level rejections.
 
+## Verified mock-HTTPS lifecycle tests
+
+`test/integration/test_mock_https.py` generates a short-lived test CA and a
+`localhost` server certificate at test time. The private key and certificates
+are removed when the suite finishes and are never production trust material.
+The client keeps both `CERT_REQUIRED` and hostname checking enabled; an
+ordinary client that does not trust the generated CA is expected to fail
+closed.
+
+The HTTPS suite verifies signed heartbeat, reading-batch, and event-batch
+success, authentication rejection, `429`/`503` with `Retry-After`, delayed TLS
+accept, delayed response bodies, a post-authentication connection reset, and
+same-port outage recovery. Test-only transport faults are one-shot and are
+consumed only after HMAC authentication:
+
+```python
+from simulator.server import (
+    HEARTBEAT_ENDPOINT,
+    TRANSPORT_CONNECTION_RESET,
+    TRANSPORT_RESPONSE_BODY_DELAY,
+)
+
+state.queue_transport_fault(
+    HEARTBEAT_ENDPOINT,
+    TRANSPORT_RESPONSE_BODY_DELAY,
+    delay_seconds=0.1,
+)
+state.queue_transport_fault(HEARTBEAT_ENDPOINT, TRANSPORT_CONNECTION_RESET)
+```
+
+These are deterministic host transport/lifecycle checks. They do not represent
+a physical mbedTLS handshake or a measurement from an ESP32. The native policy
+suite separately enforces the 32 KiB contiguous-allocation admission rule.
+
 On Windows, `tools/fetch_server_ca.ps1` can export the certificate chain presented by an HTTPS server and print its leaf SHA-256 fingerprint. A TLS server commonly omits its root CA, so the tool produces `ca-candidate.pem` only when a CA certificate is actually presented. Always compare the reported fingerprint through an independent trusted channel before provisioning it; downloading trust material from an unauthenticated connection is not secure bootstrapping.

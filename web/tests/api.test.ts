@@ -34,6 +34,32 @@ describe("minimal local API client", () => {
     expect(String(fetchMock.mock.calls[0][0])).toBe("/api/v1/ui/diagnostics");
   });
 
+  it("exposes a bounded Retry-After delay from a deferred Status response", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            code: "local_resource_deferred",
+            detail: "TLS has priority.",
+          }),
+          {
+            status: 503,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "120",
+            },
+          },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.getUiStatus()).rejects.toMatchObject({
+      status: 503,
+      code: "local_resource_deferred",
+      retryAfterMs: 60_000,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("polls a queued password job without resubmitting the mutation", async () => {
     vi.useFakeTimers();
     const replies = [

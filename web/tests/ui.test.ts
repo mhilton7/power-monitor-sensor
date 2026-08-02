@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import * as api from "../src/api";
-import { App } from "../src/main";
+import { App, STATUS_INTERVAL_MS } from "../src/main";
 import {
   clearSecrets,
   readConfiguredSetupForm,
@@ -8,6 +8,7 @@ import {
   renderSetup,
   renderShell,
   renderStatus,
+  resolveServerFreshness,
   updateDiagnostics,
   updateStatus,
 } from "../src/ui";
@@ -196,6 +197,55 @@ describe("minimal WebUI", () => {
     expect(document.body.firstElementChild).toBe(main);
   });
 
+  it.each([
+    [0, "live", "Connected"],
+    [4, "live", "Connected"],
+    [15, "live", "Connected"],
+    [29, "delayed", "Heartbeat delayed"],
+    [30, "stale", "Connection stale"],
+    [31, "stale", "Connection stale"],
+    [356, "stale", "Connection stale"],
+  ] as const)(
+    "maps a %s-second-old heartbeat to %s",
+    (age, expectedState, expectedLabel) => {
+      const aged = structuredClone(status);
+      aged.server = {
+        state: age >= 30 ? "stale" : age > 15 ? "delayed" : "live",
+        last_success_utc_ms: status.sync.last_success_utc_ms,
+        age_seconds: age,
+        expected_heartbeat_seconds: 15,
+        stale_after_seconds: 30,
+        offline_after_seconds: 30,
+        last_attempt_result: age >= 30 ? "local_resource_deferred" : "ok",
+        last_safe_error: age >= 30 ? "internal_heap_fragmented" : "",
+      };
+      const freshness = resolveServerFreshness(aged);
+      expect(freshness.state).toBe(expectedState);
+      expect(freshness.serverLabel).toBe(expectedLabel);
+      if (age === 356) {
+        expect(freshness.heartbeatLabel).toBe("5 minutes 56 seconds ago");
+        expect(freshness.headerLabel).not.toBe("Server connected");
+        expect(freshness.reason).toContain("contiguous TLS memory block");
+      }
+    },
+  );
+
+  it("distinguishes never connected, unauthenticated, and Wi-Fi offline", () => {
+    const never = structuredClone(status);
+    never.sync.last_success_utc_ms = null;
+    expect(resolveServerFreshness(never).state).toBe("never_connected");
+
+    const unauthenticated = structuredClone(status);
+    unauthenticated.health.server = "unauthenticated";
+    expect(resolveServerFreshness(unauthenticated).state).toBe(
+      "unauthenticated",
+    );
+
+    const offline = structuredClone(status);
+    offline.health.wifi = "offline";
+    expect(resolveServerFreshness(offline).state).toBe("offline");
+  });
+
   it("keeps advanced setup collapsed and secrets write-only", () => {
     document.body.innerHTML = renderSetup(config);
     const details = document.querySelector("details")!;
@@ -294,10 +344,204 @@ describe("minimal WebUI", () => {
     expect(getDiagnostics).not.toHaveBeenCalled();
     resolveStatus(status);
     await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(4_999);
+    await vi.advanceTimersByTimeAsync(STATUS_INTERVAL_MS - 1);
     expect(getStatus).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(getStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("coalesces manual refresh with an in-flight automatic Status request", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "openSession").mockResolvedValue({
+      expiresInSeconds: 900,
+      setupRequired: false,
+      elevated: false,
+    });
+    let resolveStatus!: (value: UiStatus) => void;
+    const getStatus = vi.spyOn(api, "getUiStatus").mockReturnValue(
+      new Promise<UiStatus>((resolve) => {
+        resolveStatus = resolve;
+      }),
+    );
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const app = new App(root);
+    app.start();
+    await Promise.resolve();
+    root.querySelector<HTMLButtonElement>("#refresh-status")!.click();
+    root.querySelector<HTMLButtonElement>("#refresh-status")!.click();
+    expect(getStatus).toHaveBeenCalledOnce();
+    expect(app.requestCounters()).toMatchObject({
+      requestsStarted: 1,
+      maximumSimultaneousRequests: 1,
+    });
+    resolveStatus(status);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(app.requestCounters()).toMatchObject({
+      requestsCompleted: 1,
+      requestsAborted: 0,
+    });
+  });
+
+  it("pauses while hidden and refreshes once immediately when visible", async () => {
+    vi.useFakeTimers();
+    let hidden = false;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    vi.spyOn(api, "openSession").mockResolvedValue({
+      expiresInSeconds: 900,
+      setupRequired: false,
+      elevated: false,
+    });
+    const getStatus = vi.spyOn(api, "getUiStatus").mockResolvedValue(status);
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const app = new App(root);
+    app.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(getStatus).toHaveBeenCalledOnce();
+
+    hidden = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(getStatus).toHaveBeenCalledOnce();
+
+    hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(getStatus).toHaveBeenCalledTimes(2);
+    expect(app.requestCounters().maximumSimultaneousRequests).toBe(1);
+  });
+
+  it("pauses Status polling during session renewal and resumes once", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "openSession").mockResolvedValue({
+      expiresInSeconds: 1,
+      setupRequired: false,
+      elevated: false,
+    });
+    let releaseRenewal!: (value: api.SessionResult) => void;
+    const renewal = new Promise<api.SessionResult>((resolve) => {
+      releaseRenewal = resolve;
+    });
+    const renewSession = vi
+      .spyOn(api, "renewLocalSession")
+      .mockReturnValue(renewal);
+    let call = 0;
+    const getStatus = vi
+      .spyOn(api, "getUiStatus")
+      .mockImplementation((signal?: AbortSignal) => {
+        call += 1;
+        if (call !== 2) return Promise.resolve(status);
+        return new Promise<UiStatus>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      });
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const app = new App(root);
+    app.start();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(renewSession).toHaveBeenCalledOnce();
+    expect(getStatus).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(getStatus).toHaveBeenCalledTimes(2);
+
+    releaseRenewal({
+      expiresInSeconds: 900,
+      setupRequired: false,
+      elevated: false,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getStatus).toHaveBeenCalledTimes(3);
+    expect(app.requestCounters()).toMatchObject({
+      requestsAborted: 1,
+      maximumSimultaneousRequests: 1,
+      sessionRenewals: 1,
+    });
+  });
+
+  it("updates heartbeat age once per second without additional network requests", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "openSession").mockResolvedValue({
+      expiresInSeconds: 900,
+      setupRequired: false,
+      elevated: false,
+    });
+    const fresh = structuredClone(status);
+    fresh.server = {
+      state: "live",
+      last_success_utc_ms: status.sync.last_success_utc_ms,
+      age_seconds: 4,
+      expected_heartbeat_seconds: 15,
+      stale_after_seconds: 30,
+      offline_after_seconds: 30,
+      last_attempt_result: "ok",
+      last_safe_error: "",
+    };
+    const getStatus = vi.spyOn(api, "getUiStatus").mockResolvedValue(fresh);
+    const root = document.querySelector<HTMLElement>("#app")!;
+    new App(root).start();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(root.querySelector("#heartbeat-at")?.textContent).toBe(
+      "4 seconds ago",
+    );
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(getStatus).toHaveBeenCalledOnce();
+    expect(root.querySelector("#heartbeat-at")?.textContent).toBe(
+      "13 seconds ago",
+    );
+  });
+
+  it("honors a bounded Retry-After without a 503 request storm", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "openSession").mockResolvedValue({
+      expiresInSeconds: 900,
+      setupRequired: false,
+      elevated: false,
+    });
+    const getStatus = vi
+      .spyOn(api, "getUiStatus")
+      .mockRejectedValueOnce(
+        new api.ApiError(
+          503,
+          "local_resource_deferred",
+          "TLS has priority.",
+          25_000,
+        ),
+      )
+      .mockResolvedValue(status);
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const app = new App(root);
+    app.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(getStatus).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(24_999);
+    expect(getStatus).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getStatus).toHaveBeenCalledTimes(2);
+    expect(app.requestCounters().automaticRetries).toBe(1);
+  });
+
+  it("keeps a 35-minute visible session at the 10-second request budget", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "openSession").mockResolvedValue({
+      expiresInSeconds: 10_000,
+      setupRequired: false,
+      elevated: false,
+    });
+    const getStatus = vi.spyOn(api, "getUiStatus").mockResolvedValue(status);
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const app = new App(root);
+    app.start();
+    await vi.advanceTimersByTimeAsync(2_100_000);
+    expect(getStatus).toHaveBeenCalledTimes(211);
+    expect(app.requestCounters().maximumSimultaneousRequests).toBe(1);
   });
 
   it("loads Setup and Diagnostics only after their views are opened", async () => {
@@ -321,6 +565,9 @@ describe("minimal WebUI", () => {
     await Promise.resolve();
     expect(getConfig).toHaveBeenCalledOnce();
     root.querySelector<HTMLButtonElement>('[data-view="diagnostics"]')!.click();
+    await Promise.resolve();
+    expect(getDiagnostics).not.toHaveBeenCalled();
+    root.querySelector<HTMLButtonElement>("#refresh-diagnostics")!.click();
     await Promise.resolve();
     expect(getDiagnostics).toHaveBeenCalledOnce();
   });

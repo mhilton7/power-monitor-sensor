@@ -117,6 +117,13 @@ struct SensorStatusConfig {
   std::string friendly_name;
 };
 
+struct CompactSensorStatusConfig {
+  std::array<char, 65> friendly_name{};
+  std::uint32_t heartbeat_interval_seconds{15U};
+  std::uint64_t server_ack_sequence{0U};
+  bool truncated{false};
+};
+
 // Hot-path configuration snapshots intentionally exclude the CA, OTA key,
 // and unrelated strings. RuntimeConfig can contain several KiB of PEM data;
 // copying it from a 250 ms network loop or every meter sample needlessly
@@ -165,15 +172,30 @@ struct ServerSyncRuntimeConfig {
   std::uint32_t sync_retry_max_seconds{900};
 };
 
+// Allocation-free snapshot for the recurring server-sync path. Stable text
+// such as the friendly name and OTA channel remains available through the
+// full snapshot for infrequent operations, but is not copied every tick or
+// heartbeat.
+struct CompactServerSyncRuntimeConfig {
+  bool server_configured{false};
+  ConnectionMode connection_mode{ConnectionMode::Push};
+  std::uint32_t heartbeat_interval_seconds{15};
+  std::uint32_t sync_interval_seconds{300};
+  std::uint32_t sync_retry_max_seconds{900};
+  StoragePolicy storage_policy{};
+};
+
 class ConfigService {
 public:
   bool begin();
   RuntimeConfig config() const;
   ServerTransportConfig serverTransportConfig() const;
   SensorStatusConfig sensorStatusConfig() const;
+  CompactSensorStatusConfig compactSensorStatusConfig() const;
   NetworkRuntimeConfig networkRuntimeConfig() const;
   MeasurementRuntimeConfig measurementRuntimeConfig() const;
   ServerSyncRuntimeConfig serverSyncRuntimeConfig() const;
+  CompactServerSyncRuntimeConfig compactServerSyncRuntimeConfig() const;
   DeviceIdentity identity() const;
   ConfigValidation validate(const RuntimeConfig &candidate,
                             bool ct_change_acknowledged) const;

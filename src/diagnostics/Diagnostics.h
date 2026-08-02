@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -35,11 +36,19 @@ struct SyncMetrics {
   std::uint64_t events_failures{0};
   std::uint64_t authentication_rejections{0};
   std::uint64_t last_heartbeat_utc_ms{0};
+  std::uint64_t last_heartbeat_attempt_monotonic_ms{0};
+  std::uint64_t last_heartbeat_success_monotonic_ms{0};
   std::uint64_t last_sync_utc_ms{0};
   std::uint64_t transactions_started{0};
   std::uint64_t transactions_completed{0};
   std::uint64_t transactions_failed{0};
   std::uint64_t local_resource_deferrals{0};
+  std::uint64_t fragmentation_deferrals{0};
+  std::uint64_t fragmentation_recoveries{0};
+  std::uint64_t heartbeat_buffer_reuses{0};
+  std::uint64_t heartbeat_buffer_growths{0};
+  std::uint64_t response_buffer_reuses{0};
+  std::uint64_t response_buffer_growths{0};
   std::uint64_t tls_requests_admitted{0};
   std::uint64_t tls_requests_rejected_heap{0};
   std::uint64_t tls_requests_rejected_stack{0};
@@ -50,11 +59,28 @@ struct SyncMetrics {
   std::uint32_t free_internal_heap_bytes{0};
   std::uint32_t largest_internal_block_bytes{0};
   std::uint32_t minimum_free_internal_heap_bytes{0};
+  std::uint32_t largest_internal_before_tls{0};
+  std::uint32_t largest_internal_after_tls{0};
+  std::uint32_t largest_internal_after_cleanup{0};
+  std::uint32_t consecutive_local_deferrals{0};
   bool sync_in_progress{false};
   bool sync_pending{false};
   bool primary_storage_pending{false};
   bool durable_reading_backlog{false};
+  std::string last_heartbeat_result{"never_attempted"};
+  std::string last_local_deferral_reason;
   std::string last_error;
+};
+
+struct CompactSyncMetrics {
+  std::uint64_t last_heartbeat_utc_ms{0U};
+  std::uint64_t last_heartbeat_attempt_monotonic_ms{0U};
+  std::uint64_t last_heartbeat_success_monotonic_ms{0U};
+  std::uint32_t consecutive_local_deferrals{0U};
+  std::array<char, 33> last_heartbeat_result{};
+  std::array<char, 65> last_local_deferral_reason{};
+  std::array<char, 65> last_error{};
+  bool truncated{false};
 };
 
 struct HttpMetrics {
@@ -81,6 +107,17 @@ struct HttpMetrics {
   std::uint64_t server_hmac_body_hash_rejected{0};
   std::uint64_t server_hmac_signature_rejected{0};
   std::uint64_t ui_status_requests{0};
+  std::uint64_t ui_status_responses{0};
+  std::uint64_t ui_status_response_bytes{0};
+  std::uint64_t ui_status_pool_exhaustions{0};
+  std::uint64_t ui_status_dynamic_allocation_failures{0};
+  std::uint64_t ui_status_response_object_allocations{0};
+  std::uint64_t ui_status_response_object_releases{0};
+  std::uint32_t ui_status_response_object_bytes{0};
+  std::uint32_t largest_internal_before_ui{0};
+  std::uint32_t largest_internal_after_ui{0};
+  std::uint32_t largest_internal_before_ui_response_object{0};
+  std::uint32_t largest_internal_after_ui_response_object{0};
   std::uint64_t ui_setup_requests{0};
   std::uint64_t ui_diagnostics_requests{0};
   std::uint64_t ui_heavy_requests_deferred{0};
@@ -154,6 +191,7 @@ public:
   QueueMetrics queueMetrics() const;
   void setSyncMetrics(const SyncMetrics &metrics);
   SyncMetrics syncMetrics() const;
+  CompactSyncMetrics compactSyncMetrics() const;
   void setMemoryPressureMetrics(const MemoryPressureMetrics &metrics);
   MemoryPressureMetrics memoryPressureMetrics() const;
   bool acquireHighMemoryOperation(
@@ -167,6 +205,15 @@ public:
   void recordServerHmac(ServerHmacMetric result);
   void recordAuthRateLimit(bool browser_session);
   void recordUiRequest(UiRequestKind kind);
+  void recordUiStatusResponse(std::size_t bytes,
+                              std::uint32_t largest_internal_before,
+                              std::uint32_t largest_internal_after,
+                              std::uint32_t largest_before_response_object,
+                              std::uint32_t largest_after_response_object,
+                              std::size_t response_object_bytes);
+  void recordUiStatusResponseObjectRelease();
+  void recordUiStatusPoolExhaustion();
+  void recordUiStatusDynamicAllocationFailure();
   void recordHeavyUiDeferral();
   void recordLocalResponseAllocationFailure();
   HttpMetrics httpMetrics() const;

@@ -1,6 +1,7 @@
 # Replaced-card sequence reconciliation
 
-Firmware 1.0.9 separates server connectivity from local microSD recovery. A
+Firmware 1.0.10 preserves the separation between server connectivity and local
+microSD recovery. A
 valid HTTP 200 heartbeat proves that the enrolled device reached the server
 and authenticated successfully. A missing, read-only, or replacement card can
 degrade durable History, but it does not turn that accepted heartbeat into a

@@ -7,6 +7,9 @@
 
 #include <ESPAsyncWebServer.h>
 
+#include "api/BoundedCookie.h"
+#include "api/CompactUiStatus.h"
+#include "api/StatusResponsePool.h"
 #include "app/Maintenance.h"
 #include "config/ConfigService.h"
 #include "diagnostics/Diagnostics.h"
@@ -21,6 +24,11 @@
 
 namespace pm {
 
+inline constexpr std::size_t kUiStatusResponseSlots = 2U;
+inline constexpr std::size_t kUiStatusResponseCapacity = 2048U;
+using UiStatusResponsePool =
+    StatusResponsePool<kUiStatusResponseSlots, kUiStatusResponseCapacity>;
+
 class HttpApi {
 public:
   HttpApi(ConfigService &config, NetworkService &network, ClockService &clock,
@@ -30,6 +38,9 @@ public:
   void begin();
 
 private:
+  static constexpr std::size_t kSessionTokenCharacters = 64U;
+  using BoundedSessionCookie =
+      BoundedCookieValue<kSessionTokenCharacters>;
   static constexpr std::size_t kPasswordResultCapacity = 16U;
   static constexpr UBaseType_t kPasswordJobQueueCapacity = 8U;
 
@@ -96,11 +107,14 @@ private:
   void registerBodyRoute(const char *path, WebRequestMethod method,
                          ArRequestHandlerFunction handler);
   std::string takeBody(AsyncWebServerRequest *request) const;
-  bool authorize(AsyncWebServerRequest *request, const std::string &body,
+  bool authorize(AsyncWebServerRequest *request, StringView body,
                  bool mutation, bool allow_local_session = true,
                  bool require_elevated_local = false);
-  RequestAuthMode classifyAuthMode(AsyncWebServerRequest *request) const;
+  RequestAuthMode
+  classifyAuthMode(AsyncWebServerRequest *request,
+                   const BoundedSessionCookie &session_cookie) const;
   LocalSessionResult localSessionResult(AsyncWebServerRequest *request,
+                                        StringView session_token,
                                         bool mutation,
                                         bool require_elevated = false) const;
   bool localSession(AsyncWebServerRequest *request, bool mutation,
@@ -109,6 +123,7 @@ private:
   void createLocalSession(AsyncWebServerRequest *request, bool elevated);
   std::string cookieValue(AsyncWebServerRequest *request,
                           const char *name) const;
+  BoundedSessionCookie sessionCookie(AsyncWebServerRequest *request) const;
   void sendJson(AsyncWebServerRequest *request, int status,
                 const std::string &body,
                 const char *content_type = "application/json");
@@ -143,6 +158,8 @@ private:
   SemaphoreHandle_t password_result_mutex_{nullptr};
   TaskHandle_t password_job_task_{nullptr};
   std::array<PasswordJobResult, kPasswordResultCapacity> password_results_{};
+  UiStatusResponsePool status_response_pool_{};
+  EspHeapTelemetry heap_telemetry_{};
   AsyncWebServer server_{80};
   RequestAuthenticator authenticator_;
   SessionManager sessions_;

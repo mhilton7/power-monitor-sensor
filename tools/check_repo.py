@@ -5,8 +5,10 @@ import csv
 import json
 import re
 import sys
+from itertools import pairwise
 from pathlib import Path
 
+from check_hot_paths import check as check_hot_paths
 from release_integrity import ReleaseIntegrityError, validate_release_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,9 +96,7 @@ def main() -> None:
             for name, (_, _, offset, size) in partitions.items()
         )
     )
-    for (_, previous_end, previous_name), (offset, _, name) in zip(
-        ordered, ordered[1:]
-    ):
+    for (_, previous_end, previous_name), (offset, _, name) in pairwise(ordered):
         if offset < previous_end:
             fail(f"partition overlap between {previous_name} and {name}")
     if ordered[-1][1] > 0x1000000:
@@ -138,7 +138,8 @@ def main() -> None:
     if not required_assets.is_file() or required_assets.stat().st_size < 1000:
         fail("generated embedded UI assets are absent")
     forbidden = re.compile(
-        r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----|password\s*=\s*[\"'][^\"']{8,}", re.I
+        r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----|password\s*=\s*[\"'][^\"']{8,}",
+        re.IGNORECASE,
     )
     for path in ROOT.rglob("*"):
         if not path.is_file() or any(
@@ -243,6 +244,13 @@ def main() -> None:
                 "USB-only setup-password provisioning marker missing: "
                 f"{required_serial_provisioning_marker}"
             )
+    hot_path_violations = check_hot_paths(ROOT)
+    if hot_path_violations:
+        rendered = "; ".join(
+            f"[{violation.rule}] {violation.detail}"
+            for violation in hot_path_violations
+        )
+        fail(f"compact Status hot-path policy failed: {rendered}")
     release_root = ROOT / "release"
     if release_root.is_dir():
         for release_directory in sorted(

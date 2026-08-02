@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <string>
 
+#include "core/HeapTelemetry.h"
+#include "core/StringView.h"
+
 namespace pm {
 namespace sync_policy {
 
@@ -22,10 +25,10 @@ constexpr std::size_t kEventBatchPayloadBytes = 16U * 1024U;
 // below preserves 24 KiB after allocating the bounded response body. Keeping
 // the older 78 KiB floor made every valid steady-state heartbeat impossible.
 constexpr std::uint32_t kMinimumInternalHeapBytes = 64U * 1024U;
-// A live PZEM sample leaves a 33,780-byte largest internal block on the
-// production ESP32-S3 N16R8. The TLS path has been physically validated with a
-// 32 KiB contiguous allocation while the independent total-heap guard
-// preserves the remaining network/UI reserve.
+// A prior deployed build reported a 33,780-byte largest internal block beside
+// a live PZEM sample. Retain the conservative 32 KiB contiguous admission
+// requirement while this exact binary awaits separate physical validation;
+// the independent total-heap guard preserves the remaining network/UI reserve.
 constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 32U * 1024U;
 constexpr std::uint32_t kMinimumPostResponseInternalHeapBytes = 24U * 1024U;
 
@@ -48,6 +51,12 @@ enum class AcknowledgementDisposition : std::uint8_t {
   Current,
   Advance,
   AdvanceSequenceFloor,
+};
+
+enum class TlsMemoryAdmission : std::uint8_t {
+  Available,
+  LowTotalMemory,
+  Fragmented,
 };
 
 // The server-sync task is the only transport owner, but local actions can ask
@@ -96,11 +105,21 @@ bool stackMarginHealthy(std::uint32_t allocated_bytes,
                         std::uint32_t minimum_margin_percent);
 bool tlsMemoryReserveAvailable(std::uint32_t free_internal_bytes,
                                std::uint32_t largest_internal_block_bytes);
+TlsMemoryAdmission classifyTlsMemory(const HeapSnapshot &snapshot);
+bool tlsMemoryReserveAvailable(const HeapSnapshot &snapshot);
 bool responseLengthAllowed(int response_size, int status);
-std::size_t maximumResponseBytes(const std::string &endpoint);
-std::size_t maximumRequestBytes(const std::string &endpoint);
-bool responseLengthAllowed(const std::string &endpoint, int response_size,
+std::size_t maximumResponseBytes(StringView endpoint);
+std::size_t maximumRequestBytes(StringView endpoint);
+bool responseLengthAllowed(StringView endpoint, int response_size,
                            int status);
+constexpr bool responseBodyFitsBuffer(const int response_size,
+                                      const std::size_t capacity) {
+  // HTTPClient reports -1 when a valid response has no Content-Length. A 204
+  // is allowed to take that path, so never cast a non-positive sentinel to an
+  // unsigned size while enforcing the bounded response buffer.
+  return response_size <= 0 ||
+         static_cast<std::size_t>(response_size) <= capacity;
+}
 bool responseAllocationAvailable(std::uint32_t free_internal_bytes,
                                  std::uint32_t largest_internal_block_bytes,
                                  int response_size);

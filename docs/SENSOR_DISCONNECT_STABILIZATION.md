@@ -1,5 +1,10 @@
 # Sensor disconnect and local-session stabilization
 
+> Historical record: the physical observations below apply only to the named
+> 1.0.6-1.0.8 binaries. They are not physical validation of the current
+> fragmentation repair. Current Status polling is 10 seconds and is documented
+> in `LOCAL_WEB_UI.md`.
+
 The corrective release is firmware `1.0.8`. Version `1.0.5` had been reused
 for non-identical binaries during earlier troubleshooting, so it remains
 historical evidence and is not overwritten. Version `1.0.6` was a physical
@@ -29,10 +34,11 @@ central-server HMAC rejection.
 
 The high microSD read count was caused by the former WebUI request fan-out:
 multiple independently polled endpoints requested history/storage work. The
-three-view WebUI now polls only `/api/v1/ui/status` every five seconds. That
-endpoint reads an in-memory measurement and a cached storage-health snapshot;
-it does not scan historical files. Setup does not poll. Diagnostics loads only
-on entry or explicit refresh.
+three-view 1.0.8 WebUI polled only `/api/v1/ui/status` every five seconds. The
+current policy is one immediate request followed by one request every 10
+seconds while visible. The endpoint reads an in-memory measurement and a
+compact cached storage-health snapshot; it does not scan historical files.
+Setup does not poll. Diagnostics loads only on entry or explicit refresh.
 
 ## Authentication repair
 

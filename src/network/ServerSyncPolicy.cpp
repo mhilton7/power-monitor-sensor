@@ -104,6 +104,21 @@ bool tlsMemoryReserveAvailable(
          largest_internal_block_bytes >= kMinimumLargestInternalBlockBytes;
 }
 
+TlsMemoryAdmission classifyTlsMemory(const HeapSnapshot &snapshot) {
+  if (snapshot.free_internal_bytes < kMinimumInternalHeapBytes) {
+    return TlsMemoryAdmission::LowTotalMemory;
+  }
+  if (snapshot.largest_internal_block_bytes <
+      kMinimumLargestInternalBlockBytes) {
+    return TlsMemoryAdmission::Fragmented;
+  }
+  return TlsMemoryAdmission::Available;
+}
+
+bool tlsMemoryReserveAvailable(const HeapSnapshot &snapshot) {
+  return classifyTlsMemory(snapshot) == TlsMemoryAdmission::Available;
+}
+
 bool responseLengthAllowed(const int response_size, const int status) {
   if (status == 204) {
     return response_size <= 0;
@@ -112,7 +127,7 @@ bool responseLengthAllowed(const int response_size, const int status) {
          static_cast<std::size_t>(response_size) <= kMaximumResponseBytes;
 }
 
-std::size_t maximumResponseBytes(const std::string &endpoint) {
+std::size_t maximumResponseBytes(const StringView endpoint) {
   if (endpoint == "/api/v1/device-heartbeats") {
     return kHeartbeatResponseBytes;
   }
@@ -128,7 +143,7 @@ std::size_t maximumResponseBytes(const std::string &endpoint) {
   return kMaximumResponseBytes;
 }
 
-std::size_t maximumRequestBytes(const std::string &endpoint) {
+std::size_t maximumRequestBytes(const StringView endpoint) {
   if (endpoint == "/api/v1/device-readings/batch") {
     return kReadingBatchPayloadBytes + (4U * 1024U);
   }
@@ -138,7 +153,7 @@ std::size_t maximumRequestBytes(const std::string &endpoint) {
   return kHeartbeatResponseBytes;
 }
 
-bool responseLengthAllowed(const std::string &endpoint,
+bool responseLengthAllowed(const StringView endpoint,
                            const int response_size, const int status) {
   if (status == 204) {
     return response_size <= 0;

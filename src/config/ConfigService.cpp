@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -462,6 +463,23 @@ SensorStatusConfig ConfigService::sensorStatusConfig() const {
               : SensorStatusConfig{};
 }
 
+CompactSensorStatusConfig ConfigService::compactSensorStatusConfig() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  CompactSensorStatusConfig output;
+  if (!lock) {
+    return output;
+  }
+  const int written = std::snprintf(output.friendly_name.data(),
+                                    output.friendly_name.size(), "%s",
+                                    config_.friendly_name.c_str());
+  output.truncated = written < 0 ||
+                     static_cast<std::size_t>(written) >=
+                         output.friendly_name.size();
+  output.heartbeat_interval_seconds = config_.heartbeat_interval_seconds;
+  output.server_ack_sequence = server_ack_sequence_;
+  return output;
+}
+
 NetworkRuntimeConfig ConfigService::networkRuntimeConfig() const {
   RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
   if (!lock) {
@@ -516,6 +534,20 @@ ServerSyncRuntimeConfig ConfigService::serverSyncRuntimeConfig() const {
           config_.heartbeat_interval_seconds,
           config_.sync_interval_seconds,
           config_.sync_retry_max_seconds};
+}
+
+CompactServerSyncRuntimeConfig
+ConfigService::compactServerSyncRuntimeConfig() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  if (!lock) {
+    return {};
+  }
+  return {!config_.server_url.empty(),
+          config_.connection_mode,
+          config_.heartbeat_interval_seconds,
+          config_.sync_interval_seconds,
+          config_.sync_retry_max_seconds,
+          config_.storage_policy};
 }
 
 DeviceIdentity ConfigService::identity() const {

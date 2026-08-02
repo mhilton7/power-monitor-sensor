@@ -1,5 +1,10 @@
 # Firmware 1.0.5 optimization and verification record
 
+> Historical record: this document describes the immutable 1.0.5 binary. It
+> is not validation evidence for the current fragmentation repair. Current
+> memory ownership, polling, and validation scope are documented in
+> `MEMORY_AND_FRAGMENTATION.md` and `LOCAL_WEB_UI.md`.
+
 ## Root cause and implementation
 
 Firmware 1.0.4 had two independent synchronization defects. First, it treated
@@ -24,7 +29,8 @@ storage recovery, backlog, or low internal memory.
 ## Minimal local WebUI
 
 The production navigation contains exactly Status, Setup, and Diagnostics.
-Status polls only `GET /api/v1/ui/status`, at most once every five seconds,
+In the historical 1.0.5 image, Status polled only
+`GET /api/v1/ui/status`, at most once every five seconds,
 never overlaps requests, pauses while hidden, and updates existing text nodes.
 Setup fetches `GET /api/v1/config` only when opened. Diagnostics fetches
 `GET /api/v1/ui/diagnostics` only when opened or explicitly refreshed. No

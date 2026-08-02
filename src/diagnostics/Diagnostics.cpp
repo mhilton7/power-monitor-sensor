@@ -1,6 +1,7 @@
 #include "diagnostics/Diagnostics.h"
 
 #include <algorithm>
+#include <cstdio>
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -115,6 +116,31 @@ SyncMetrics Diagnostics::syncMetrics() const {
   const SyncMetrics copy = sync_;
   unlock();
   return copy;
+}
+
+CompactSyncMetrics Diagnostics::compactSyncMetrics() const {
+  CompactSyncMetrics output;
+  if (!lock()) {
+    return output;
+  }
+  output.last_heartbeat_utc_ms = sync_.last_heartbeat_utc_ms;
+  output.last_heartbeat_attempt_monotonic_ms =
+      sync_.last_heartbeat_attempt_monotonic_ms;
+  output.last_heartbeat_success_monotonic_ms =
+      sync_.last_heartbeat_success_monotonic_ms;
+  output.consecutive_local_deferrals = sync_.consecutive_local_deferrals;
+  const auto copy = [&output](auto &target, const std::string &source) {
+    const int written = std::snprintf(target.data(), target.size(), "%s",
+                                      source.c_str());
+    output.truncated = output.truncated || written < 0 ||
+                       static_cast<std::size_t>(written) >= target.size();
+  };
+  copy(output.last_heartbeat_result, sync_.last_heartbeat_result);
+  copy(output.last_local_deferral_reason,
+       sync_.last_local_deferral_reason);
+  copy(output.last_error, sync_.last_error);
+  unlock();
+  return output;
 }
 
 void Diagnostics::setMemoryPressureMetrics(
@@ -292,6 +318,49 @@ void Diagnostics::recordUiRequest(const UiRequestKind kind) {
   http_.peak_local_http_requests =
       std::max<std::uint32_t>(http_.peak_local_http_requests, 1U);
   unlock();
+}
+
+void Diagnostics::recordUiStatusResponse(
+    const std::size_t bytes, const std::uint32_t largest_internal_before,
+    const std::uint32_t largest_internal_after,
+    const std::uint32_t largest_before_response_object,
+    const std::uint32_t largest_after_response_object,
+    const std::size_t response_object_bytes) {
+  if (lock()) {
+    ++http_.ui_status_responses;
+    http_.ui_status_response_bytes += bytes;
+    ++http_.ui_status_response_object_allocations;
+    http_.ui_status_response_object_bytes =
+        static_cast<std::uint32_t>(response_object_bytes);
+    http_.largest_internal_before_ui = largest_internal_before;
+    http_.largest_internal_after_ui = largest_internal_after;
+    http_.largest_internal_before_ui_response_object =
+        largest_before_response_object;
+    http_.largest_internal_after_ui_response_object =
+        largest_after_response_object;
+    unlock();
+  }
+}
+
+void Diagnostics::recordUiStatusResponseObjectRelease() {
+  if (lock()) {
+    ++http_.ui_status_response_object_releases;
+    unlock();
+  }
+}
+
+void Diagnostics::recordUiStatusPoolExhaustion() {
+  if (lock()) {
+    ++http_.ui_status_pool_exhaustions;
+    unlock();
+  }
+}
+
+void Diagnostics::recordUiStatusDynamicAllocationFailure() {
+  if (lock()) {
+    ++http_.ui_status_dynamic_allocation_failures;
+    unlock();
+  }
 }
 
 void Diagnostics::recordHeavyUiDeferral() {
@@ -575,6 +644,26 @@ std::string Diagnostics::metricsJson(const StorageHealth &storage,
   http["server_hmac_signature_rejected"] =
       http_metrics.server_hmac_signature_rejected;
   http["ui_status_requests"] = http_metrics.ui_status_requests;
+  http["ui_status_responses"] = http_metrics.ui_status_responses;
+  http["ui_status_response_bytes"] = http_metrics.ui_status_response_bytes;
+  http["ui_status_pool_exhaustions"] =
+      http_metrics.ui_status_pool_exhaustions;
+  http["ui_status_dynamic_allocation_failures"] =
+      http_metrics.ui_status_dynamic_allocation_failures;
+  http["ui_status_response_object_allocations"] =
+      http_metrics.ui_status_response_object_allocations;
+  http["ui_status_response_object_releases"] =
+      http_metrics.ui_status_response_object_releases;
+  http["ui_status_response_object_bytes"] =
+      http_metrics.ui_status_response_object_bytes;
+  http["largest_internal_before_ui"] =
+      http_metrics.largest_internal_before_ui;
+  http["largest_internal_after_ui"] =
+      http_metrics.largest_internal_after_ui;
+  http["largest_internal_before_ui_response_object"] =
+      http_metrics.largest_internal_before_ui_response_object;
+  http["largest_internal_after_ui_response_object"] =
+      http_metrics.largest_internal_after_ui_response_object;
   http["ui_setup_requests"] = http_metrics.ui_setup_requests;
   http["ui_diagnostics_requests"] =
       http_metrics.ui_diagnostics_requests;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -8,11 +9,14 @@
 
 #include "app/Maintenance.h"
 #include "config/ConfigService.h"
+#include "core/HeapTelemetry.h"
+#include "core/StringView.h"
 #include "diagnostics/Diagnostics.h"
 #include "meter/IMeter.h"
 #include "network/ClockService.h"
 #include "network/NetworkService.h"
 #include "network/ServerSyncPolicy.h"
+#include "network/ServerSyncScratch.h"
 #include "storage/SdStorage.h"
 #include "storage/StorageCoordinator.h"
 
@@ -33,7 +37,8 @@ public:
 private:
   struct HttpResult {
     int status{-1};
-    std::string body;
+    const char *body{nullptr};
+    std::size_t body_size{0U};
     std::string error;
     std::string problem_code;
     std::string tls_category;
@@ -49,9 +54,22 @@ private:
   bool reportConfiguration(std::uint32_t version, const char *status,
                            const char *detail);
   bool checkFirmwareManifest();
-  HttpResult request(const char *method, const std::string &endpoint,
-                     std::string body, bool authenticated);
-  std::string heartbeatBody() const;
+  HttpResult request(const char *method, StringView endpoint,
+                     const char *body, std::size_t body_size,
+                     bool authenticated);
+  HttpResult request(const char *method, StringView endpoint,
+                     const char *body, bool authenticated) {
+    return request(method, endpoint, body,
+                   body == nullptr ? 0U : std::char_traits<char>::length(body),
+                   authenticated);
+  }
+  HttpResult request(const char *method, StringView endpoint,
+                     const std::string &body, bool authenticated) {
+    return request(method, endpoint, body.data(), body.size(), authenticated);
+  }
+  bool heartbeatBody(ServerSyncBuffer &output) const;
+  bool ensureTransportScratch();
+  bool refreshTransportConfig();
   std::uint32_t heartbeatDelayMs() const;
   std::uint32_t retryDelayMs(std::uint32_t retry_after_ms);
   std::uint32_t operationRetryDelayMs(std::uint32_t &attempt,
@@ -95,9 +113,20 @@ private:
   std::string pending_config_report_detail_{"post_apply_connectivity_failed"};
   sync_policy::SingleFlightGate single_flight_;
   sync_policy::EndpointAddressCache endpoint_address_cache_;
+  ServerSyncScratch transport_scratch_;
+  EspHeapTelemetry heap_telemetry_;
+  ServerTransportConfig transport_config_;
+  CompactServerSyncRuntimeConfig transport_runtime_config_{};
+  std::string transport_host_;
+  std::string transport_device_id_;
+  std::string transport_boot_id_;
+  std::uint16_t transport_port_{443U};
+  std::uint64_t transport_config_generation_{0U};
+  std::uint64_t next_transport_scratch_retry_ms_{0U};
   bool immediate_sync_{false};
   bool immediate_sync_release_recorded_{false};
   bool last_operation_locally_deferred_{false};
+  bool fragmentation_deferred_{false};
   std::string available_firmware_version_;
 };
 

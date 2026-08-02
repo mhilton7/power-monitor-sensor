@@ -11,11 +11,24 @@ import {
   renderStatus,
   updateDiagnostics,
   updateStatus,
+  updateStatusFreshness,
   type View,
 } from "./ui";
-import type { EffectiveConfig } from "./types";
+import type { EffectiveConfig, UiStatus } from "./types";
 
-const STATUS_INTERVAL_MS = 5_000;
+export const STATUS_INTERVAL_MS = 10_000;
+const FRESHNESS_TICK_MS = 1_000;
+
+export interface BrowserRequestCounters {
+  requestsStarted: number;
+  requestsCompleted: number;
+  requestsAborted: number;
+  maximumSimultaneousRequests: number;
+  sessionRenewals: number;
+  automaticRetries: number;
+}
+
+let activeApp: App | undefined;
 
 const blankConfig = (): EffectiveConfig => ({
   schema_version: 1,
@@ -44,18 +57,44 @@ const blankConfig = (): EffectiveConfig => ({
 });
 
 export class App {
+  private started = false;
   private view: View = "status";
   private setupRequired = false;
   private pollTimer = 0;
+  private freshnessTimer = 0;
   private sessionTimer = 0;
+  private sessionExpiresAtMs = 0;
   private statusController?: AbortController;
-  private statusRequestActive = false;
-  private sessionRenewalActive = false;
+  private statusRequest?: Promise<void>;
+  private sessionRenewal?: Promise<boolean>;
   private privilegedOperationActive = false;
+  private lastStatus?: UiStatus;
+  private statusReceivedAtMonotonicMs = 0;
+  private activeStatusRequests = 0;
+  private readonly counters: BrowserRequestCounters = {
+    requestsStarted: 0,
+    requestsCompleted: 0,
+    requestsAborted: 0,
+    maximumSimultaneousRequests: 0,
+    sessionRenewals: 0,
+    automaticRetries: 0,
+  };
+  private readonly visibilityHandler = (): void => {
+    if (document.hidden) this.stopPolling();
+    else void this.resumeAfterVisibility();
+  };
 
   constructor(private readonly root: HTMLElement) {}
 
+  requestCounters(): Readonly<BrowserRequestCounters> {
+    return { ...this.counters };
+  }
+
   start(): void {
+    if (this.started) return;
+    activeApp?.destroy();
+    activeApp = this;
+    this.started = true;
     this.root.innerHTML = renderShell();
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-view]")
@@ -65,11 +104,18 @@ export class App {
           () => void this.openView(button.dataset.view as View),
         ),
       );
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) this.stopPolling();
-      else void this.resumeAfterVisibility();
-    });
+    document.addEventListener("visibilitychange", this.visibilityHandler);
     void this.connect();
+  }
+
+  destroy(): void {
+    if (!this.started) return;
+    this.started = false;
+    document.removeEventListener("visibilitychange", this.visibilityHandler);
+    this.stopPolling();
+    window.clearTimeout(this.sessionTimer);
+    this.sessionTimer = 0;
+    if (activeApp === this) activeApp = undefined;
   }
 
   private async connect(): Promise<void> {
@@ -90,40 +136,61 @@ export class App {
 
   private scheduleSessionRenewal(expiresInSeconds: number): void {
     window.clearTimeout(this.sessionTimer);
+    this.sessionExpiresAtMs = Date.now() + expiresInSeconds * 1_000;
     const delay = Math.max(30_000, Math.floor(expiresInSeconds * 800));
     this.sessionTimer = window.setTimeout(
-      () => void this.renewSession(),
+      () => void this.renewSessionAndResume(),
       delay,
     );
   }
 
-  private async renewSession(): Promise<boolean> {
-    if (this.sessionRenewalActive || this.privilegedOperationActive)
-      return false;
-    this.sessionRenewalActive = true;
+  private renewSession(): Promise<boolean> {
+    if (this.sessionRenewal) return this.sessionRenewal;
+    if (this.privilegedOperationActive) return Promise.resolve(false);
+    const pendingStatus = this.statusRequest;
     this.stopPolling();
+    this.counters.sessionRenewals += 1;
     this.notify("Local session expired. Reconnecting…", "pending");
-    try {
-      const session = await api.renewLocalSession();
-      this.setupRequired = session.setupRequired;
-      this.scheduleSessionRenewal(session.expiresInSeconds);
-      this.notify("", "info");
-      return true;
-    } catch (error) {
-      this.notify(
-        this.message(error, "The local browser session could not be renewed."),
-        "error",
-      );
-      return false;
-    } finally {
-      this.sessionRenewalActive = false;
-    }
+    const operation = (async (): Promise<boolean> => {
+      try {
+        // Drain the aborted fetch before renewal completes. Otherwise a fast
+        // renewal can coalesce its post-renewal refresh into the request that
+        // is still unwinding, losing that refresh in slower browser engines.
+        await pendingStatus?.catch(() => undefined);
+        const session = await api.renewLocalSession();
+        this.setupRequired = session.setupRequired;
+        this.scheduleSessionRenewal(session.expiresInSeconds);
+        this.notify("", "info");
+        return true;
+      } catch (error) {
+        this.notify(
+          this.message(
+            error,
+            "The local browser session could not be renewed.",
+          ),
+          "error",
+        );
+        return false;
+      }
+    })();
+    this.sessionRenewal = operation.finally(() => {
+      this.sessionRenewal = undefined;
+    });
+    return this.sessionRenewal;
+  }
+
+  private async renewSessionAndResume(): Promise<void> {
+    const renewed = await this.renewSession();
+    if (renewed && this.view === "status" && !document.hidden)
+      await this.refreshStatus();
   }
 
   private async resumeAfterVisibility(): Promise<void> {
     if (this.privilegedOperationActive) return;
-    const renewed = await this.renewSession();
-    if (renewed && this.view === "status") await this.refreshStatus();
+    this.refreshLocalFreshness();
+    const renewalDue = Date.now() >= this.sessionExpiresAtMs - 30_000;
+    if (renewalDue && !(await this.renewSession())) return;
+    if (this.view === "status") await this.refreshStatus();
   }
 
   private main(): HTMLElement {
@@ -148,6 +215,9 @@ export class App {
     this.setCurrentView(view);
     if (view === "status") {
       this.main().innerHTML = renderStatus();
+      this.root
+        .querySelector<HTMLButtonElement>("#refresh-status")
+        ?.addEventListener("click", () => void this.refreshStatus());
       await this.refreshStatus();
       return;
     }
@@ -170,43 +240,129 @@ export class App {
     }
     this.main().innerHTML = renderDiagnostics();
     this.bindDiagnostics();
-    await this.refreshDiagnostics();
   }
 
-  private async refreshStatus(): Promise<void> {
-    if (this.view !== "status" || document.hidden || this.statusRequestActive)
-      return;
-    this.statusRequestActive = true;
-    this.statusController?.abort();
-    this.statusController = new AbortController();
-    try {
-      const status = await api.getUiStatus(this.statusController.signal);
-      if (this.view === "status") updateStatus(this.root, status);
-    } catch (error) {
-      if (!(error instanceof DOMException && error.name === "AbortError")) {
-        this.notify(this.message(error, "Status refresh failed."), "error");
+  private refreshStatus(): Promise<void> {
+    if (this.statusRequest) return this.statusRequest;
+    if (
+      this.view !== "status" ||
+      document.hidden ||
+      this.privilegedOperationActive
+    ) {
+      return Promise.resolve();
+    }
+    if (this.sessionRenewal) {
+      return this.sessionRenewal.then((renewed) =>
+        renewed ? this.refreshStatus() : undefined,
+      );
+    }
+
+    window.clearTimeout(this.pollTimer);
+    this.pollTimer = 0;
+    const controller = new AbortController();
+    this.statusController = controller;
+    const button =
+      this.root.querySelector<HTMLButtonElement>("#refresh-status");
+    if (button) button.disabled = true;
+    this.counters.requestsStarted += 1;
+    this.activeStatusRequests += 1;
+    this.counters.maximumSimultaneousRequests = Math.max(
+      this.counters.maximumSimultaneousRequests,
+      this.activeStatusRequests,
+    );
+    let nextDelayMs = STATUS_INTERVAL_MS;
+
+    const request = (async (): Promise<void> => {
+      try {
+        const status = await api.getUiStatus(controller.signal);
+        if (controller.signal.aborted) {
+          this.counters.requestsAborted += 1;
+          return;
+        }
+        this.counters.requestsCompleted += 1;
+        this.lastStatus = status;
+        this.statusReceivedAtMonotonicMs = performance.now();
+        if (this.view === "status") {
+          updateStatus(this.root, status);
+          this.startFreshnessTicker();
+          this.notify("", "info");
+        }
+      } catch (error) {
+        if (this.isAbortError(error) || controller.signal.aborted) {
+          this.counters.requestsAborted += 1;
+          return;
+        }
+        this.counters.requestsCompleted += 1;
+        if (error instanceof api.ApiError && error.status === 503) {
+          nextDelayMs = error.retryAfterMs ?? STATUS_INTERVAL_MS;
+          this.counters.automaticRetries += 1;
+          this.notify(
+            `Status is temporarily deferred. Retrying in ${Math.ceil(nextDelayMs / 1_000)} seconds.`,
+            "pending",
+          );
+        } else {
+          this.notify(this.message(error, "Status refresh failed."), "error");
+        }
+      } finally {
+        this.activeStatusRequests -= 1;
+        if (this.statusController === controller)
+          this.statusController = undefined;
+        if (button) button.disabled = false;
       }
-    } finally {
-      this.statusRequestActive = false;
+    })();
+
+    const tracked = request.finally(() => {
+      if (this.statusRequest === tracked) this.statusRequest = undefined;
       if (
+        !controller.signal.aborted &&
         this.view === "status" &&
         !document.hidden &&
-        !this.privilegedOperationActive
+        !this.privilegedOperationActive &&
+        !this.sessionRenewal
       ) {
-        window.clearTimeout(this.pollTimer);
         this.pollTimer = window.setTimeout(
           () => void this.refreshStatus(),
-          STATUS_INTERVAL_MS,
+          nextDelayMs,
         );
       }
-    }
+    });
+    this.statusRequest = tracked;
+    return tracked;
   }
 
   private stopPolling(): void {
     window.clearTimeout(this.pollTimer);
     this.pollTimer = 0;
+    window.clearInterval(this.freshnessTimer);
+    this.freshnessTimer = 0;
     this.statusController?.abort();
     this.statusController = undefined;
+  }
+
+  private startFreshnessTicker(): void {
+    window.clearInterval(this.freshnessTimer);
+    if (document.hidden || this.view !== "status" || !this.lastStatus) return;
+    this.freshnessTimer = window.setInterval(
+      () => this.refreshLocalFreshness(),
+      FRESHNESS_TICK_MS,
+    );
+  }
+
+  private refreshLocalFreshness(): void {
+    if (!this.lastStatus || this.view !== "status") return;
+    const elapsedSeconds = Math.floor(
+      Math.max(0, performance.now() - this.statusReceivedAtMonotonicMs) / 1_000,
+    );
+    updateStatusFreshness(this.root, this.lastStatus, elapsedSeconds);
+    if (!document.hidden && this.freshnessTimer === 0)
+      this.startFreshnessTicker();
+  }
+
+  private isAbortError(error: unknown): boolean {
+    return (
+      error instanceof DOMException &&
+      (error.name === "AbortError" || error.code === DOMException.ABORT_ERR)
+    );
   }
 
   private bindSetup(config: EffectiveConfig): void {

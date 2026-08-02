@@ -11,9 +11,28 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    readonly retryAfterMs?: number,
   ) {
     super(message);
   }
+}
+
+const MIN_RETRY_AFTER_MS = 1_000;
+const MAX_RETRY_AFTER_MS = 60_000;
+
+function retryAfterMs(response: Response): number | undefined {
+  const header = response.headers.get("Retry-After")?.trim();
+  if (!header) return undefined;
+
+  const seconds = Number(header);
+  const requestedMs = Number.isFinite(seconds)
+    ? seconds * 1_000
+    : Date.parse(header) - Date.now();
+  if (!Number.isFinite(requestedMs)) return undefined;
+  return Math.min(
+    MAX_RETRY_AFTER_MS,
+    Math.max(MIN_RETRY_AFTER_MS, Math.ceil(requestedMs)),
+  );
 }
 
 let csrfToken = "";
@@ -62,6 +81,7 @@ async function rawRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
       response.status,
       problem.code ?? "request_failed",
       problem.detail ?? "Request failed.",
+      retryAfterMs(response),
     );
   }
   if (response.status === 204) return undefined as T;

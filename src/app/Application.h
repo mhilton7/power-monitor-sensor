@@ -11,6 +11,7 @@
 #include "build_config.h"
 #include "config/ConfigService.h"
 #include "core/Algorithms.h"
+#include "core/HeapTelemetry.h"
 #include "core/MemoryPressurePolicy.h"
 #include "diagnostics/Diagnostics.h"
 #include "meter/IMeter.h"
@@ -78,6 +79,7 @@ private:
   std::atomic<std::uint64_t> aggregation_progress_{0};
   std::atomic<std::uint64_t> network_progress_{0};
   std::atomic<std::uint64_t> sync_progress_{0};
+  EspHeapTelemetry heap_telemetry_{};
   MemoryPressurePolicy memory_pressure_;
   std::uint64_t sample_dropped_{0};
   std::uint64_t action_dropped_{0};

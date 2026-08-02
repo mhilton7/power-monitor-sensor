@@ -31,6 +31,16 @@ struct NetworkStatus {
   std::string last_ip_address;
 };
 
+struct CompactNetworkStatus {
+  bool station_connected{false};
+  bool server_reachable{false};
+  bool server_authenticated{false};
+  std::int32_t rssi_dbm{-127};
+  std::array<char, 16> ip_address{};
+  std::array<char, 64> hostname{};
+  bool truncated{false};
+};
+
 struct WifiDisconnectEvent {
   enum class Kind : std::uint8_t {
     StationStart,
@@ -79,7 +89,9 @@ public:
   void requestSetupApRestart();
   void requestScan();
   void touchSetupActivity();
+  bool setupApActive() const;
   NetworkStatus status() const;
+  CompactNetworkStatus compactStatus() const;
   bool ipChangedSinceHeartbeat();
   void setServerStatus(bool reachable, bool authenticated);
   WifiDisconnectSnapshot wifiDisconnectEvents() const;

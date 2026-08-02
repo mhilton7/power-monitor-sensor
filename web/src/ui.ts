@@ -1,6 +1,7 @@
 import type {
   EffectiveConfig,
   NetworkSettingsPayload,
+  ServerFreshnessState,
   SetupPayload,
   UiDiagnostics,
   UiStatus,
@@ -39,8 +40,9 @@ export const renderShell = (): string => `
   <main id="main" tabindex="-1"></main>`;
 
 export const renderStatus = (): string => `
-  <section class="page-heading"><p class="eyebrow">Sensor status</p>
-    <h1 id="sensor-name">Power Monitor</h1><p>Live measurements and essential health only.</p>
+  <section class="page-heading"><div><p class="eyebrow">Sensor status</p>
+    <h1 id="sensor-name">Power Monitor</h1><p>Live measurements and essential health only.</p></div>
+    <button type="button" id="refresh-status">Refresh status</button>
   </section>
   <section class="power-panel" aria-labelledby="power-title">
     <div><p class="eyebrow">Current power</p><h2 id="power-title"><span id="power">—</span> <small>W</small></h2>
@@ -58,6 +60,7 @@ export const renderStatus = (): string => `
       <div><dt>Signal strength</dt><dd id="signal">—</dd></div>
       <div><dt>Server</dt><dd id="server-state">—</dd></div>
       <div><dt>Last successful heartbeat</dt><dd id="heartbeat-at">—</dd></div>
+      <div id="server-reason-row" hidden><dt>Reason</dt><dd id="server-reason">—</dd></div>
       <div><dt>microSD</dt><dd id="storage-state">—</dd></div>
       <div><dt>PZEM meter</dt><dd id="meter-state">—</dd></div>
       <div><dt>Durable backlog</dt><dd id="backlog">—</dd></div>
@@ -90,6 +93,154 @@ const duration = (seconds: number): string => {
   const minutes = Math.floor((seconds % 3_600) / 60);
   return `${days ? `${days}d ` : ""}${hours ? `${hours}h ` : ""}${minutes}m`;
 };
+
+const safeSeconds = (value: number | null | undefined): number | null =>
+  typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : null;
+
+const statusAgeSeconds = (status: UiStatus): number | null => {
+  const suppliedAge = safeSeconds(status.server?.age_seconds);
+  if (suppliedAge !== null) return suppliedAge;
+
+  const lastSuccess =
+    status.server?.last_success_utc_ms ?? status.sync.last_success_utc_ms;
+  if (lastSuccess === null || !Number.isFinite(lastSuccess)) return null;
+  const serverNow = Date.parse(status.server_now);
+  return Number.isFinite(serverNow)
+    ? Math.max(0, Math.floor((serverNow - lastSuccess) / 1_000))
+    : null;
+};
+
+export interface ServerFreshnessPresentation {
+  state: ServerFreshnessState;
+  ageSeconds: number | null;
+  serverLabel: string;
+  heartbeatLabel: string;
+  reason: string;
+  headerLabel: string;
+}
+
+const ageLabel = (seconds: number | null): string => {
+  if (seconds === null) return "Never";
+  if (seconds === 0) return "Just now";
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"} ago`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  const minuteLabel = `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  return remainder
+    ? `${minuteLabel} ${remainder} second${remainder === 1 ? "" : "s"} ago`
+    : `${minuteLabel} ago`;
+};
+
+export function resolveServerFreshness(
+  status: UiStatus,
+  elapsedSeconds = 0,
+): ServerFreshnessPresentation {
+  const baseAge = statusAgeSeconds(status);
+  const ageSeconds =
+    baseAge === null
+      ? null
+      : Math.max(0, baseAge + Math.floor(Math.max(0, elapsedSeconds)));
+  const expectedSeconds = Math.max(
+    1,
+    status.server?.expected_heartbeat_seconds ?? 15,
+  );
+  const staleAfterSeconds = Math.max(
+    expectedSeconds + 1,
+    status.server?.stale_after_seconds ?? 30,
+  );
+  const offlineAfterSeconds = Math.max(
+    staleAfterSeconds,
+    status.server?.offline_after_seconds ?? staleAfterSeconds,
+  );
+
+  let state: ServerFreshnessState;
+  if (
+    status.server?.state === "unauthenticated" ||
+    status.health.server === "unauthenticated"
+  ) {
+    state = "unauthenticated";
+  } else if (
+    status.server?.state === "offline" ||
+    status.health.wifi === "offline"
+  ) {
+    state = "offline";
+  } else if (ageSeconds === null) {
+    state = "never_connected";
+  } else if (ageSeconds <= expectedSeconds) {
+    state = "live";
+  } else if (ageSeconds < staleAfterSeconds) {
+    state = "delayed";
+  } else if (
+    offlineAfterSeconds > staleAfterSeconds &&
+    ageSeconds >= offlineAfterSeconds
+  ) {
+    state = "offline";
+  } else {
+    // A connected sensor with an old heartbeat is stale. Never promote the
+    // previous sticky `health.server` Boolean to a false Connected label.
+    state = "stale";
+  }
+
+  const labels: Record<ServerFreshnessState, string> = {
+    never_connected: "Never connected",
+    live: "Connected",
+    delayed: "Heartbeat delayed",
+    stale: "Connection stale",
+    offline: "Offline",
+    unauthenticated: "Reachable · authentication required",
+  };
+  const headerLabels: Record<ServerFreshnessState, string> = {
+    never_connected: "Waiting for server",
+    live: "Server connected",
+    delayed: "Heartbeat delayed",
+    stale: "Connection stale",
+    offline: "Server offline",
+    unauthenticated: "Authentication required",
+  };
+  const localDeferral =
+    status.server?.last_attempt_result === "local_resource_deferred" ||
+    /internal_heap_(?:fragmented|reserve_low)/.test(
+      status.server?.last_safe_error ?? status.sync.last_safe_error,
+    );
+  const reason =
+    state === "stale" && localDeferral
+      ? "Synchronization is waiting for a contiguous TLS memory block."
+      : state === "stale"
+        ? "No heartbeat has reached the server within the freshness window."
+        : "";
+
+  return {
+    state,
+    ageSeconds,
+    serverLabel: labels[state],
+    heartbeatLabel: ageLabel(ageSeconds),
+    reason,
+    headerLabel: headerLabels[state],
+  };
+}
+
+export function updateStatusFreshness(
+  root: ParentNode,
+  status: UiStatus,
+  elapsedSeconds = 0,
+): ServerFreshnessPresentation {
+  const freshness = resolveServerFreshness(status, elapsedSeconds);
+  setText(root, "#server-state", freshness.serverLabel);
+  setText(root, "#heartbeat-at", freshness.heartbeatLabel);
+  setText(
+    root,
+    "#header-state",
+    status.health.low_memory && freshness.state === "live"
+      ? "Memory pressure"
+      : freshness.headerLabel,
+  );
+  const reasonRow = root.querySelector<HTMLElement>("#server-reason-row");
+  if (reasonRow) reasonRow.hidden = !freshness.reason;
+  setText(root, "#server-reason", freshness.reason || "—");
+  return freshness;
+}
 
 export function updateStatus(root: ParentNode, status: UiStatus): void {
   setText(root, "#sensor-name", status.device.friendly_name || "Power Monitor");
@@ -127,16 +278,7 @@ export function updateStatus(root: ParentNode, status: UiStatus): void {
     "#signal",
     status.health.wifi === "connected" ? `${status.health.rssi_dbm} dBm` : "—",
   );
-  setText(
-    root,
-    "#server-state",
-    status.health.server === "connected"
-      ? "Connected"
-      : status.health.server === "unauthenticated"
-        ? "Reachable · authentication needed"
-        : "Offline",
-  );
-  setText(root, "#heartbeat-at", time(status.sync.last_success_utc_ms));
+  updateStatusFreshness(root, status);
   setText(
     root,
     "#storage-state",
@@ -154,15 +296,6 @@ export function updateStatus(root: ParentNode, status: UiStatus): void {
   );
   setText(root, "#firmware", status.device.firmware);
   setText(root, "#uptime", duration(status.device.uptime_seconds));
-  setText(
-    root,
-    "#header-state",
-    status.health.low_memory
-      ? "Low-memory mode"
-      : status.health.server === "connected"
-        ? "Server connected"
-        : "Local status",
-  );
 }
 
 export function renderSetup(config: EffectiveConfig, firstRun = false): string {

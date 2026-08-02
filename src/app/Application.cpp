@@ -620,11 +620,10 @@ void Application::healthTask() {
                    task_config::kSerialCommandStackBytes);
       last_health_ms = now;
     }
-    const std::uint32_t free_internal =
-        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const HeapSnapshot heap = heap_telemetry_.snapshot();
+    const std::uint32_t free_internal = heap.free_internal_bytes;
     const std::uint32_t largest_internal =
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                         MALLOC_CAP_8BIT);
+        heap.largest_internal_block_bytes;
     const MemoryPressureUpdate pressure =
         memory_pressure_.update(free_internal, largest_internal, now);
     diagnostics_.setMemoryPressureMetrics(memory_pressure_.metrics(now));
@@ -659,8 +658,10 @@ void Application::healthTask() {
           pressure.current == MemoryPressureState::Normal
               ? "EVT_MEMORY_PRESSURE_RECOVERED"
               : "EVT_MEMORY_PRESSURE_CHANGED",
-          pressure.current == MemoryPressureState::LowMemory ? "warning"
-                                                              : "info",
+          pressure.current == MemoryPressureState::LowTotalMemory ||
+                  pressure.current == MemoryPressureState::Fragmented
+              ? "warning"
+              : "info",
           detail, clock_.utcMs(), config_.identity().boot_id);
     }
     const WifiDisconnectSnapshot wifi_events =

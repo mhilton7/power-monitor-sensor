@@ -7,11 +7,18 @@
 #include <string>
 #include <vector>
 
+#include "api/BoundedCookie.h"
+#include "api/BoundedJsonWriter.h"
+#include "api/CompactUiStatus.h"
+#include "api/StatusResponsePool.h"
 #include "config/AtomicConfigStore.h"
 #include "config/ConfigRecovery.h"
 #include "config/ConfigValidationHelpers.h"
 #include "config/ProvisioningTransaction.h"
 #include "core/Algorithms.h"
+#include "core/DebugAllocationScope.h"
+#include "core/FragmentingInternalHeap.h"
+#include "core/HeapTelemetry.h"
 #include "core/MemoryPressurePolicy.h"
 #include "diagnostics/DiagnosticCore.h"
 #include "meter/PzemProtocol.h"
@@ -19,6 +26,7 @@
 #include "network/NetworkPolicy.h"
 #include "network/ReadingWireFormat.h"
 #include "network/ServerSyncPolicy.h"
+#include "network/ServerSyncScratch.h"
 #include "security/AuthPolicy.h"
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
@@ -247,6 +255,15 @@ void testReadingWireFormat() {
         meter_gap || std::string(flag.as<const char *>()) == "meter_gap";
   }
   check(meter_gap, "null wire measurements carry a meter-gap quality flag");
+
+  JsonDocument oversized_output;
+  JsonArray oversized_readings =
+      oversized_output["readings"].to<JsonArray>();
+  const std::string oversized_record(
+      pm::reading_wire::kMaximumEncodedRecordBytes + 1U, ' ');
+  check(!pm::reading_wire::append(oversized_readings, oversized_record) &&
+            oversized_readings.size() == 0U,
+        "wire translator rejects records beyond its bounded parser budget");
 }
 
 void testDiagnostics() {
@@ -472,6 +489,14 @@ void testServerSyncPolicy() {
             !pm::sync_policy::responseLengthAllowed(-1, 200) &&
             pm::sync_policy::responseLengthAllowed(-1, 204),
         "HTTP response allocation is bounded and rejects chunked JSON");
+  check(pm::sync_policy::responseBodyFitsBuffer(-1, 24U * 1024U) &&
+            pm::sync_policy::responseBodyFitsBuffer(0, 24U * 1024U) &&
+            pm::sync_policy::responseBodyFitsBuffer(24U * 1024U,
+                                                    24U * 1024U) &&
+            !pm::sync_policy::responseBodyFitsBuffer(24U * 1024U + 1U,
+                                                     24U * 1024U),
+        "204 responses without Content-Length never cast the negative "
+        "sentinel to an unsigned buffer size");
   check(pm::sync_policy::maximumResponseBytes(
             "/api/v1/device-heartbeats") == 8U * 1024U &&
             pm::sync_policy::maximumResponseBytes(
@@ -1007,15 +1032,15 @@ void testMemoryPressurePolicy() {
             update.current == pm::MemoryPressureState::Normal,
         "healthy heap begins in normal memory state");
 
-  update = policy.update(79U * 1024U, 31U * 1024U, 1'000U);
+  update = policy.update(79U * 1024U, 40U * 1024U, 1'000U);
   check(update.changed &&
             update.current == pm::MemoryPressureState::PressureWarning,
         "moderate pressure enters warning without low-memory mode");
-  policy.update(70U * 1024U, 27U * 1024U, 2'000U);
-  policy.update(70U * 1024U, 27U * 1024U, 3'000U);
-  update = policy.update(70U * 1024U, 27U * 1024U, 4'000U);
+  policy.update(60U * 1024U, 27U * 1024U, 2'000U);
+  policy.update(60U * 1024U, 27U * 1024U, 3'000U);
+  update = policy.update(60U * 1024U, 27U * 1024U, 4'000U);
   check(update.changed &&
-            update.current == pm::MemoryPressureState::LowMemory,
+            update.current == pm::MemoryPressureState::LowTotalMemory,
         "three consecutive low samples enter low-memory mode");
 
   for (std::uint64_t second = 5U; second < 34U; ++second) {
@@ -1034,9 +1059,743 @@ void testMemoryPressurePolicy() {
             metrics.transition_count == 4U &&
             metrics.cumulative_pressure_ms == 63'000U &&
             metrics.longest_pressure_episode_ms == 63'000U &&
-            metrics.lowest_free_internal_bytes == 70U * 1024U &&
+            metrics.lowest_free_internal_bytes == 60U * 1024U &&
             metrics.lowest_largest_internal_block_bytes == 27U * 1024U,
         "memory pressure evidence retains bounded episode and minimum metrics");
+
+  pm::MemoryPressurePolicy fragmented_policy;
+  update = fragmented_policy.update(72'280U, 24'564U, 1'000U);
+  const pm::MemoryPressureMetrics fragmented_metrics =
+      fragmented_policy.metrics(6'000U);
+  check(update.changed &&
+            update.current == pm::MemoryPressureState::Fragmented &&
+            fragmented_metrics.fragmentation_entry_count == 1U &&
+            fragmented_metrics.current_fragmentation_episode_ms == 5'000U &&
+            fragmented_metrics.free_internal_at_fragmentation_entry_bytes ==
+                72'280U,
+        "high total free memory with a sub-32-KiB largest block is classified "
+        "as fragmentation, not low total memory");
+}
+
+void testBoundedStatusPrimitives() {
+  char json[128]{};
+  pm::BoundedJsonWriter writer(json, sizeof(json));
+  const std::string escaped_input =
+      std::string("quote=\" slash=\\ newline=\n control=") +
+      static_cast<char>(0x01) + " snowman=\xE2\x98\x83";
+  check(writer.literal("{\"value\":") &&
+            writer.string(
+                pm::BoundedTextView(escaped_input.data(), escaped_input.size())) &&
+            writer.literal(",\"zero\":") && writer.number(-0.0, 2U) &&
+            writer.literal("}") && writer.ok() &&
+            std::string(writer.data()).find("quote=\\\"") !=
+                std::string::npos &&
+            std::string(writer.data()).find("slash=\\\\") !=
+                std::string::npos &&
+            std::string(writer.data()).find("newline=\\n") !=
+                std::string::npos &&
+            std::string(writer.data()).find("control=\\u0001") !=
+                std::string::npos &&
+            std::string(writer.data()).find("\"zero\":0.00") !=
+                std::string::npos,
+        "bounded JSON writer escapes hostile text and normalizes negative zero");
+
+  char invalid_json[32]{};
+  const std::string invalid_utf8(1U, static_cast<char>(0xFF));
+  pm::BoundedJsonWriter invalid_writer(invalid_json, sizeof(invalid_json));
+  check(invalid_writer.string(
+            pm::BoundedTextView(invalid_utf8.data(), invalid_utf8.size())) &&
+            std::string(invalid_writer.data()) == "\"\\ufffd\"",
+        "bounded JSON writer replaces invalid UTF-8 deterministically");
+
+  char tiny[8]{};
+  pm::BoundedJsonWriter tiny_writer(tiny, sizeof(tiny));
+  check(!tiny_writer.string("payload-too-large") &&
+            tiny_writer.overflowed() && tiny[sizeof(tiny) - 1U] == '\0',
+        "bounded JSON writer fails closed and remains terminated at capacity");
+
+  pm::StatusResponsePool<2U, 64U> pool;
+  {
+    auto first = pool.acquire();
+    auto second = pool.acquire();
+    auto exhausted = pool.acquire();
+    check(first && second && !exhausted && pool.active() == 2U &&
+              pool.exhaustions() == 1U,
+          "two-client status pool rejects a third client with bounded exhaustion");
+    check(first.setSize(4U), "status response lease accepts an in-bound size");
+    first.release();
+    auto replacement = pool.acquire();
+    check(replacement && pool.active() == 2U,
+          "disconnect-style lease release immediately returns its slot");
+    auto moved = std::move(replacement);
+    check(!replacement && moved,
+          "status response lease is move-only and preserves ownership");
+    moved.release();
+    moved.release();
+    check(pool.active() == 1U,
+          "repeated response cleanup cannot double-release a pool slot");
+  }
+  check(pool.active() == 0U,
+        "all status response slots release when response lifetimes end");
+
+  pm::ServerSyncBuffer scratch;
+  check(scratch.begin(32U), "bounded transport scratch initializes once");
+  char *const original = scratch.data();
+  const std::array<std::uint8_t, 4U> bytes{{1U, 2U, 3U, 4U}};
+  for (std::size_t cycle = 0U; cycle < 100U; ++cycle) {
+    scratch.clear();
+    check(scratch.write(bytes.data(), bytes.size()) == bytes.size(),
+          "bounded transport scratch reuses its fixed allocation");
+  }
+  const std::array<std::uint8_t, 33U> overflow{};
+  scratch.clear();
+  check(scratch.write(overflow.data(), overflow.size()) == 0U &&
+            scratch.overflowed() && scratch.data() == original &&
+            scratch.capacity() == 32U,
+        "bounded transport scratch rejects growth without changing storage");
+
+  pm::ServerSyncScratch transport;
+  check(transport.begin() && transport.ready() &&
+            transport.begin() &&
+            transport.request_body.ready() &&
+            transport.response_body.ready() &&
+            transport.canonical_request.ready() && transport.url.ready() &&
+            transport.canonical_target.capacity() >=
+                pm::ServerSyncScratch::kCanonicalTargetCapacity,
+        "server sync allocates every bounded payload, response, canonical, "
+        "URL, and canonical-target buffer once");
+  char *const canonical_storage = transport.canonical_request.data();
+  char *const url_storage = transport.url.data();
+  for (std::size_t cycle = 0U; cycle < 100U; ++cycle) {
+    transport.canonical_request.clear();
+    transport.url.clear();
+    check(transport.canonical_request.writeText("canonical") &&
+              transport.url.writeText("https://example.test/path") &&
+              transport.canonical_request.data() == canonical_storage &&
+              transport.url.data() == url_storage,
+          "canonical and URL transport scratch retains fixed storage");
+  }
+}
+
+void testCompactStatusSerializationAndFreshness() {
+  pm::ServerFreshnessPolicy policy;
+  check(pm::classifyServerFreshness(true, true, true, 1'000U, 5'000U,
+                                    policy) ==
+            pm::ServerFreshnessState::Live &&
+            pm::classifyServerFreshness(true, true, true, 1'000U, 23'000U,
+                                        policy) ==
+                pm::ServerFreshnessState::Delayed &&
+            pm::classifyServerFreshness(true, true, true, 1'000U, 357'000U,
+                                        policy) ==
+                pm::ServerFreshnessState::Stale &&
+            pm::classifyServerFreshness(false, false, false, 1'000U,
+                                        357'000U, policy) ==
+                pm::ServerFreshnessState::Offline &&
+            pm::classifyServerFreshness(true, true, false, 1'000U, 2'000U,
+                                        policy) ==
+                pm::ServerFreshnessState::Unauthenticated &&
+            pm::classifyServerFreshness(true, false, false, 0U, 2'000U,
+                                        policy) ==
+                pm::ServerFreshnessState::NeverConnected,
+        "freshness distinguishes live, delayed, 356-second stale, offline, "
+        "unauthenticated, and never-connected states");
+
+  pm::CompactUiStatusSnapshot snapshot;
+  pm::copyCompactText(snapshot.friendly_name, "Outdoor \\\"AC\\\"");
+  pm::copyCompactText(snapshot.ip_address, "192.168.0.26");
+  pm::copyCompactText(snapshot.server_now, "2026-08-01T12:00:00Z");
+  pm::copyCompactText(snapshot.last_attempt_result, "success");
+  pm::copyCompactText(snapshot.last_safe_error, "");
+  snapshot.uptime_seconds = 3'600U;
+  snapshot.reading_available = true;
+  snapshot.measured_at_utc_ms = 1'785'580'000'000ULL;
+  snapshot.power_w = 12.8F;
+  snapshot.voltage_v = 245.6F;
+  snapshot.current_a = 0.659F;
+  snapshot.frequency_hz = 60.0F;
+  snapshot.power_factor = 0.98F;
+  snapshot.wifi_connected = true;
+  snapshot.server_reachable = true;
+  snapshot.authenticated = true;
+  snapshot.storage_writable = true;
+  snapshot.meter_healthy = true;
+  snapshot.last_heartbeat_success_utc_ms = 1'785'580'000'000ULL;
+  snapshot.last_heartbeat_success_monotonic_ms = 10'000U;
+  snapshot.current_monotonic_ms = 10'000U;
+  snapshot.newest_sequence = 42U;
+  snapshot.acknowledged_sequence = 40U;
+  snapshot.backlog = 2U;
+  snapshot.heap.free_internal_bytes = 92'000U;
+  snapshot.heap.minimum_free_internal_bytes = 70'000U;
+  snapshot.heap.largest_internal_block_bytes = 52'000U;
+  snapshot.heap.integrity_ok = true;
+  snapshot.server_state = pm::ServerFreshnessState::Live;
+  const pm::CompactUiBuildMetadata metadata{
+      "1.0.9", "abcdef0", "2026-08-01T12:00:00Z", "native-tests",
+      "index-hash", "script-hash", "style-hash"};
+  std::array<char, 2048U> response{};
+  const pm::CompactUiSerializationResult result =
+      pm::serializeCompactUiStatus(snapshot, metadata, response.data(),
+                                   response.size());
+  const std::string body(response.data(), result.bytes);
+  check(result.success && result.bytes < response.size() &&
+            body.find("Outdoor \\\\\\\"AC\\\\\\\"") !=
+                std::string::npos &&
+            body.find("\"state\":\"live\"") != std::string::npos &&
+            body.find("\"age_seconds\":0") != std::string::npos &&
+            body.find("\"largest_internal_block_bytes\":52000") !=
+                std::string::npos,
+        "compact status serializes within two KiB, escapes text, and retains "
+        "a valid zero-second heartbeat age");
+
+  std::array<char, 128U> too_small{};
+  const auto truncated = pm::serializeCompactUiStatus(
+      snapshot, metadata, too_small.data(), too_small.size());
+  check(!truncated.success,
+        "compact status returns a typed serialization failure at its bound");
+}
+
+void testBoundedStatusAuthorizationAndResponsePath() {
+  constexpr char cookies[] =
+      "theme=dark; pm_session="
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; "
+      "pm_csrf=not-read-for-get";
+  const auto session = pm::parseBoundedCookie<64U>(
+      cookies, sizeof(cookies) - 1U, "pm_session");
+  check(session.presented() && !session.overflow && session.view().size() == 64U &&
+            std::memcmp(session.view().data(), "01234567", 8U) == 0,
+        "status authorization parses one session token into bounded request-local storage");
+
+  constexpr char deceptive[] =
+      "not_pm_session=wrong; pm_session=correct; pm_session_extra=wrong";
+  const auto exact = pm::parseBoundedCookie<64U>(
+      deceptive, sizeof(deceptive) - 1U, "pm_session");
+  check(exact.view() == "correct",
+        "bounded cookie parsing requires an exact cookie name");
+
+  constexpr char oversized[] =
+      "pm_session=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefX";
+  const auto rejected = pm::parseBoundedCookie<64U>(
+      oversized, sizeof(oversized) - 1U, "pm_session");
+  check(rejected.presented() && rejected.overflow && rejected.view().empty(),
+        "oversized session cookies remain classified as browser authentication and fail closed");
+
+  pm::CompactUiStatusSnapshot snapshot;
+  pm::copyCompactText(snapshot.friendly_name, "Allocation soak");
+  snapshot.server_state = pm::ServerFreshnessState::Live;
+  const pm::CompactUiBuildMetadata metadata{
+      "1.0.9", "abcdef0", "2026-08-01T12:00:00Z", "native-tests",
+      "index-hash", "script-hash", "style-hash"};
+  pm::StatusResponsePool<2U, 2048U> pool;
+  bool stable = true;
+  for (std::size_t poll = 0U; poll < 10'000U; ++poll) {
+    const auto request_session = pm::parseBoundedCookie<64U>(
+        cookies, sizeof(cookies) - 1U, "pm_session");
+    auto response = pool.acquire();
+    const auto serialized = pm::serializeCompactUiStatus(
+        snapshot, metadata, response.data(), response.capacity());
+    stable = stable && request_session.view() == session.view() && response &&
+             serialized.success && response.setSize(serialized.bytes);
+  }
+  check(stable && pool.active() == 0U && pool.exhaustions() == 0U,
+        "ten thousand authorized status polls reuse bounded cookie and response storage without exhaustion");
+}
+
+void testDebugAllocationScopes() {
+  pm::DebugAllocationScope<4U> scope;
+  scope.begin(pm::DebugAllocationScopeId::HeartbeatJson,
+              pm::DebugAllocationRegion::Psram, 65'536U, 524'288U);
+  check(scope.recordAllocation(1U, 20U * 1024U,
+                               pm::DebugAllocationRegion::Psram) &&
+            scope.recordAllocation(2U, 2U * 1024U,
+                                   pm::DebugAllocationRegion::Psram) &&
+            scope.recordAllocation(3U, 512U,
+                                   pm::DebugAllocationRegion::Internal),
+        "debug allocation scope accepts bounded internal and PSRAM records");
+  const pm::DebugAllocationScopeSnapshot active = scope.snapshot();
+  check(active.allocation_count == 3U &&
+            active.allocated_bytes == 23'040U &&
+            active.freed_bytes == 0U &&
+            active.outstanding_allocations == 3U &&
+            active.outstanding_bytes == 23'040U &&
+            active.largest_single_allocation_bytes == 20U * 1024U &&
+            active.peak_simultaneous_bytes == 23'040U &&
+            active.internal_allocation_count == 1U &&
+            active.internal_allocated_bytes == 512U &&
+            active.psram_allocation_count == 2U &&
+            active.psram_allocated_bytes == 22U * 1024U &&
+            active.non_preferred_allocation_count == 1U &&
+            active.operation_started && !active.operation_ended,
+        "debug allocation scope reports counts, bytes, peak, largest, region, and lifecycle");
+  check(scope.recordFree(2U) && scope.recordFree(1U) &&
+            scope.recordFree(3U),
+        "debug allocation scope releases records in arbitrary order");
+  scope.end(65'536U, 524'288U);
+  const pm::DebugAllocationScopeSnapshot complete = scope.snapshot();
+  check(complete.balanced() && complete.freed_bytes == 23'040U &&
+            complete.largest_internal_block_at_start == 65'536U &&
+            complete.largest_internal_block_at_end == 65'536U &&
+            complete.largest_psram_block_at_start == 524'288U &&
+            complete.largest_psram_block_at_end == 524'288U,
+        "completed allocation scope is balanced and records start/end largest blocks");
+
+  pm::DebugAllocationScope<2U> exhausted;
+  exhausted.begin(pm::DebugAllocationScopeId::UiDiagnostics,
+                  pm::DebugAllocationRegion::Internal, 65'536U, 524'288U);
+  check(exhausted.recordAllocation(10U, 256U,
+                                   pm::DebugAllocationRegion::Internal) &&
+            exhausted.recordAllocation(11U, 256U,
+                                       pm::DebugAllocationRegion::Internal) &&
+            !exhausted.recordAllocation(12U, 256U,
+                                        pm::DebugAllocationRegion::Internal),
+        "debug allocation scope fails closed when fixed record capacity is exhausted");
+  check(exhausted.recordFree(10U) && exhausted.recordFree(11U),
+        "capacity exhaustion does not prevent deterministic cleanup");
+  exhausted.end(65'536U, 524'288U);
+  check(exhausted.snapshot().capacity_exhausted &&
+            !exhausted.snapshot().balanced(),
+        "capacity exhaustion remains visible after cleanup");
+}
+
+void testFragmentationIncidentAndSoaks() {
+  pm::FragmentingInternalHeap<8U> incident(98'304U);
+  const pm::HeapAllocationId middle = incident.allocateAt(24'564U, 9'000U);
+  const pm::HeapAllocationId upper = incident.allocateAt(57'422U, 17'024U);
+  const pm::FragmentingHeapSnapshot incident_snapshot = incident.snapshot();
+  pm::HeapSnapshot heap_snapshot;
+  heap_snapshot.free_internal_bytes =
+      static_cast<std::uint32_t>(incident_snapshot.free_bytes);
+  heap_snapshot.largest_internal_block_bytes =
+      static_cast<std::uint32_t>(incident_snapshot.largest_free_block_bytes);
+  heap_snapshot.integrity_ok = incident_snapshot.integrity_ok;
+  check(middle != pm::kInvalidHeapAllocation &&
+            upper != pm::kInvalidHeapAllocation &&
+            incident_snapshot.free_bytes == 72'280U &&
+            incident_snapshot.largest_free_block_bytes == 24'564U &&
+            incident_snapshot.integrity_ok &&
+            pm::sync_policy::classifyTlsMemory(heap_snapshot) ==
+                pm::sync_policy::TlsMemoryAdmission::Fragmented &&
+            !pm::sync_policy::tlsMemoryReserveAvailable(heap_snapshot),
+        "exact Outdoor-AC incident has ample total memory but cannot admit "
+        "the retained 32-KiB TLS block");
+  std::uint32_t fragmentation_deferrals = 0U;
+  std::uint32_t fragmentation_recoveries = 0U;
+  std::uint32_t external_failures = 0U;
+  std::uint32_t authentication_failures = 0U;
+  pm::DebugAllocationScope<2U> deferred_tls;
+  deferred_tls.begin(pm::DebugAllocationScopeId::TlsTransport,
+                     pm::DebugAllocationRegion::Internal,
+                     incident.largestFreeBlock(), 524'288U);
+  const pm::HeapAllocationId rejected_tls = incident.allocate(32U * 1024U);
+  if (rejected_tls == pm::kInvalidHeapAllocation) {
+    ++fragmentation_deferrals;
+  }
+  deferred_tls.end(incident.largestFreeBlock(), 524'288U);
+  check(rejected_tls == pm::kInvalidHeapAllocation &&
+            deferred_tls.snapshot().balanced() &&
+            fragmentation_deferrals == 1U && external_failures == 0U &&
+            authentication_failures == 0U,
+        "fragmented incident defers TLS locally without external or authentication failure");
+  check(incident.release(middle) && incident.release(upper) &&
+            incident.largestFreeBlock() == 98'304U &&
+            incident.integrityOk(),
+        "releasing optional incident allocations coalesces the arena fully");
+  pm::DebugAllocationScope<2U> recovered_tls;
+  recovered_tls.begin(pm::DebugAllocationScopeId::TlsTransport,
+                      pm::DebugAllocationRegion::Internal,
+                      incident.largestFreeBlock(), 524'288U);
+  const pm::HeapAllocationId retry_tls = incident.allocate(32U * 1024U);
+  const bool retry_recorded =
+      retry_tls != pm::kInvalidHeapAllocation &&
+      recovered_tls.recordAllocation(retry_tls, 32U * 1024U,
+                                     pm::DebugAllocationRegion::Internal);
+  const bool retry_released = retry_recorded && incident.release(retry_tls) &&
+                              recovered_tls.recordFree(retry_tls);
+  recovered_tls.end(incident.largestFreeBlock(), 524'288U);
+  if (retry_released) {
+    ++fragmentation_recoveries;
+  }
+  check(retry_released && recovered_tls.snapshot().balanced() &&
+            fragmentation_recoveries == 1U &&
+            incident.largestFreeBlock() == 98'304U,
+        "coalesced incident retries within the local path and returns freshness to live");
+
+  pm::FragmentingInternalHeap<8U> unrecoverable(98'304U);
+  const auto retained_middle = unrecoverable.allocateAt(24'564U, 9'000U);
+  const auto retained_upper = unrecoverable.allocateAt(57'422U, 17'024U);
+  const auto unrecoverable_tls = unrecoverable.allocate(32U * 1024U);
+  const bool stale = unrecoverable_tls == pm::kInvalidHeapAllocation;
+  const bool heavy_ui_deferred = stale;
+  const std::uint32_t continuing_meter_samples = 60U;
+  const std::uint32_t continuing_storage_intervals = 1U;
+  check(retained_middle != pm::kInvalidHeapAllocation &&
+            retained_upper != pm::kInvalidHeapAllocation && stale &&
+            heavy_ui_deferred && continuing_meter_samples == 60U &&
+            continuing_storage_intervals == 1U &&
+            external_failures == 0U && authentication_failures == 0U,
+        "unrecoverable optional ownership stays stale while meter/storage continue without false external failure");
+
+  struct SoakConfiguration {
+    std::uint32_t duration_seconds{0U};
+    std::uint32_t status_requests_per_client{0U};
+    std::uint32_t client_count{1U};
+    std::uint32_t visibility_cycles{0U};
+    std::uint32_t diagnostics_refreshes{0U};
+    std::uint32_t diagnostics_downloads{0U};
+    std::uint32_t setup_visits{0U};
+    std::uint32_t outage_start_second{0U};
+    std::uint32_t outage_end_second{0U};
+  };
+
+  struct SoakCounters {
+    bool valid{true};
+    std::uint32_t meter_samples{0U};
+    std::uint32_t durable_intervals{0U};
+    std::uint32_t heartbeat_opportunities{0U};
+    std::uint32_t heartbeats_admitted{0U};
+    std::uint32_t heartbeat_successes{0U};
+    std::uint32_t tls_heap_deferrals{0U};
+    std::uint32_t tls_stack_deferrals{0U};
+    std::uint32_t authentication_failures{0U};
+    std::uint32_t network_failures{0U};
+    std::uint32_t status_requests{0U};
+    std::uint32_t status_response_failures{0U};
+    std::uint32_t status_requests_while_hidden{0U};
+    std::uint32_t visibility_pauses{0U};
+    std::uint32_t visibility_resumes{0U};
+    std::uint32_t session_renewals{0U};
+    std::uint32_t session_renewal_loops{0U};
+    std::uint32_t manual_diagnostics_attempts{0U};
+    std::uint32_t diagnostics_refreshes{0U};
+    std::uint32_t diagnostics_downloads{0U};
+    std::uint32_t setup_visits{0U};
+    std::uint32_t storage_scans_from_status{0U};
+    std::uint32_t heartbeat_buffer_reuses{0U};
+    std::uint32_t heartbeat_buffer_growths{0U};
+    std::uint32_t response_buffer_reuses{0U};
+    std::uint32_t response_buffer_growths{0U};
+    std::uint32_t server_outage_heartbeats{0U};
+    std::uint32_t outage_recoveries{0U};
+    std::uint32_t dashboard_offline_transitions{0U};
+    std::uint32_t false_dashboard_offline_transitions{0U};
+    std::uint32_t stale_connected_labels{0U};
+    std::uint32_t allocation_scopes_balanced{0U};
+    std::uint32_t allocation_scopes_unbalanced{0U};
+    std::uint32_t maximum_status_leases{0U};
+    std::uint32_t maximum_requests_per_client{0U};
+    std::uint32_t desktop_clients{0U};
+    std::uint32_t phone_clients{0U};
+    std::uint64_t status_pool_exhaustions{0U};
+    std::size_t warm_largest_internal_block{0U};
+    std::size_t minimum_largest_internal_block{0U};
+    std::size_t ending_largest_internal_block{0U};
+    std::size_t outstanding_allocations_at_end{0U};
+  };
+
+  const auto run_soak = [](const SoakConfiguration &configuration) {
+    SoakCounters counters;
+    pm::FragmentingInternalHeap<16U> arena(196'608U);
+    const pm::HeapAllocationId persistent =
+        arena.allocateAt(65'536U, 32'768U);
+    counters.valid = persistent != pm::kInvalidHeapAllocation;
+    counters.desktop_clients = configuration.client_count > 0U ? 1U : 0U;
+    counters.phone_clients = configuration.client_count > 1U ? 1U : 0U;
+    counters.warm_largest_internal_block = arena.largestFreeBlock();
+    counters.minimum_largest_internal_block =
+        counters.warm_largest_internal_block;
+    pm::StatusResponsePool<2U, 2048U> pool;
+    std::uint32_t completed_status_rounds = 0U;
+    std::uint32_t next_visibility_round =
+        configuration.visibility_cycles == 0U
+            ? 0U
+            : configuration.status_requests_per_client /
+                  (configuration.visibility_cycles + 1U);
+    bool outage_seen = false;
+
+    const auto record_scope = [&counters](
+                                  const pm::DebugAllocationScopeSnapshot &value) {
+      if (value.balanced()) {
+        ++counters.allocation_scopes_balanced;
+      } else {
+        ++counters.allocation_scopes_unbalanced;
+        counters.valid = false;
+      }
+    };
+
+    const auto exercise_internal_operation =
+        [&arena, &counters, &record_scope](
+            const pm::DebugAllocationScopeId scope_id,
+            const std::size_t bytes) {
+          pm::DebugAllocationScope<2U> scope;
+          const std::size_t before = arena.largestFreeBlock();
+          scope.begin(scope_id, pm::DebugAllocationRegion::Internal, before,
+                      524'288U);
+          const pm::HeapAllocationId allocation = arena.allocate(bytes);
+          const bool recorded =
+              allocation != pm::kInvalidHeapAllocation &&
+              scope.recordAllocation(allocation, bytes,
+                                     pm::DebugAllocationRegion::Internal);
+          const bool released = recorded && arena.release(allocation) &&
+                                scope.recordFree(allocation);
+          scope.end(arena.largestFreeBlock(), 524'288U);
+          record_scope(scope.snapshot());
+          counters.valid = counters.valid && released && arena.integrityOk() &&
+                           arena.largestFreeBlock() == before;
+          if (arena.largestFreeBlock() <
+              counters.minimum_largest_internal_block) {
+            counters.minimum_largest_internal_block =
+                arena.largestFreeBlock();
+          }
+          return released;
+        };
+
+    const auto perform_status_round = [&]() {
+      pm::DebugAllocationScope<1U> first_scope;
+      first_scope.begin(pm::DebugAllocationScopeId::UiStatus,
+                        pm::DebugAllocationRegion::Internal,
+                        arena.largestFreeBlock(), 524'288U);
+      auto first = pool.acquire();
+      const bool first_ok = static_cast<bool>(first) && first.setSize(64U);
+      pm::DebugAllocationScope<1U> second_scope;
+      second_scope.begin(pm::DebugAllocationScopeId::UiStatus,
+                         pm::DebugAllocationRegion::Internal,
+                         arena.largestFreeBlock(), 524'288U);
+      auto second = configuration.client_count > 1U ? pool.acquire()
+                                                     : decltype(first){};
+      const bool second_ok = configuration.client_count <= 1U ||
+                             (static_cast<bool>(second) && second.setSize(64U));
+      const std::uint32_t active = pool.active();
+      if (active > counters.maximum_status_leases) {
+        counters.maximum_status_leases = active;
+      }
+      counters.maximum_requests_per_client = 1U;
+      counters.status_requests += configuration.client_count;
+      counters.status_response_failures += first_ok ? 0U : 1U;
+      counters.status_response_failures += second_ok ? 0U : 1U;
+      first.release();
+      second.release();
+      first_scope.end(arena.largestFreeBlock(), 524'288U);
+      record_scope(first_scope.snapshot());
+      if (configuration.client_count > 1U) {
+        second_scope.end(arena.largestFreeBlock(), 524'288U);
+        record_scope(second_scope.snapshot());
+      }
+      counters.valid = counters.valid && first_ok && second_ok &&
+                       pool.active() == 0U && arena.integrityOk();
+    };
+
+    for (std::uint32_t second = 1U;
+         second <= configuration.duration_seconds; ++second) {
+      ++counters.meter_samples;
+      if (second % 60U == 0U) {
+        ++counters.durable_intervals;
+        counters.valid =
+            counters.valid && exercise_internal_operation(
+                                  pm::DebugAllocationScopeId::StoragePage,
+                                  4U * 1024U);
+      }
+
+      const std::uint32_t target_rounds = static_cast<std::uint32_t>(
+          (static_cast<std::uint64_t>(second) *
+           configuration.status_requests_per_client) /
+          configuration.duration_seconds);
+      while (completed_status_rounds < target_rounds) {
+        ++completed_status_rounds;
+        if (next_visibility_round != 0U &&
+            completed_status_rounds == next_visibility_round &&
+            counters.visibility_pauses < configuration.visibility_cycles) {
+          ++counters.visibility_pauses;
+          // The scheduled request is suppressed while hidden. The one request
+          // below occurs only after visibility resumes, so total cadence does
+          // not fan out or catch up.
+          ++counters.visibility_resumes;
+          next_visibility_round = static_cast<std::uint32_t>(
+              ((static_cast<std::uint64_t>(counters.visibility_pauses) + 1U) *
+               configuration.status_requests_per_client) /
+              (configuration.visibility_cycles + 1U));
+        }
+        perform_status_round();
+      }
+
+      if (second % 1'800U == 0U) {
+        counters.session_renewals += configuration.client_count;
+      }
+
+      if (second % 15U == 0U) {
+        ++counters.heartbeat_opportunities;
+        const bool admitted = exercise_internal_operation(
+            pm::DebugAllocationScopeId::TlsTransport, 32U * 1024U);
+        if (admitted) {
+          ++counters.heartbeats_admitted;
+          ++counters.heartbeat_buffer_reuses;
+          ++counters.response_buffer_reuses;
+        } else {
+          ++counters.tls_heap_deferrals;
+        }
+        const bool in_outage =
+            configuration.outage_end_second >
+                configuration.outage_start_second &&
+            second >= configuration.outage_start_second &&
+            second < configuration.outage_end_second;
+        if (admitted && in_outage) {
+          ++counters.server_outage_heartbeats;
+          ++counters.network_failures;
+          if (!outage_seen) {
+            outage_seen = true;
+            ++counters.dashboard_offline_transitions;
+          }
+        } else if (admitted) {
+          ++counters.heartbeat_successes;
+          if (outage_seen &&
+              second >= configuration.outage_end_second &&
+              counters.outage_recoveries == 0U) {
+            ++counters.outage_recoveries;
+          }
+        }
+      }
+
+      if (configuration.setup_visits > counters.setup_visits &&
+          second == configuration.duration_seconds / 4U) {
+        ++counters.setup_visits;
+        counters.valid = counters.valid && exercise_internal_operation(
+                                              pm::DebugAllocationScopeId::UiSetup,
+                                              4U * 1024U);
+      }
+      if (configuration.diagnostics_refreshes > 0U &&
+          second % (configuration.duration_seconds /
+                    configuration.diagnostics_refreshes) == 0U &&
+          counters.diagnostics_refreshes <
+              configuration.diagnostics_refreshes) {
+        ++counters.diagnostics_refreshes;
+        ++counters.manual_diagnostics_attempts;
+        counters.valid =
+            counters.valid && exercise_internal_operation(
+                                  pm::DebugAllocationScopeId::UiDiagnostics,
+                                  8U * 1024U);
+      }
+      if (configuration.diagnostics_downloads > 0U &&
+          second % (configuration.duration_seconds /
+                    configuration.diagnostics_downloads) == 0U &&
+          counters.diagnostics_downloads <
+              configuration.diagnostics_downloads) {
+        ++counters.diagnostics_downloads;
+        counters.valid =
+            counters.valid && exercise_internal_operation(
+                                  pm::DebugAllocationScopeId::UiDiagnostics,
+                                  12U * 1024U);
+      }
+
+      counters.valid = counters.valid && arena.integrityOk() &&
+                       arena.largestFreeBlock() ==
+                           counters.warm_largest_internal_block &&
+                       pool.active() == 0U;
+    }
+    counters.ending_largest_internal_block = arena.largestFreeBlock();
+    counters.status_pool_exhaustions = pool.exhaustions();
+    counters.valid = counters.valid && arena.release(persistent) &&
+                     arena.integrityOk() &&
+                     arena.largestFreeBlock() == 196'608U;
+    counters.outstanding_allocations_at_end = arena.allocationCount();
+    return counters;
+  };
+
+  const SoakCounters historical = run_soak(
+      {2'100U, 341U, 1U, 1U, 1U, 0U, 0U, 0U, 0U});
+  check(historical.valid && historical.meter_samples == 2'100U &&
+            historical.durable_intervals == 35U &&
+            historical.heartbeat_opportunities == 140U &&
+            historical.heartbeats_admitted == 140U &&
+            historical.heartbeat_successes == 140U &&
+            historical.tls_heap_deferrals == 0U &&
+            historical.tls_stack_deferrals == 0U &&
+            historical.authentication_failures == 0U &&
+            historical.network_failures == 0U &&
+            historical.status_requests == 341U &&
+            historical.status_response_failures == 0U &&
+            historical.visibility_pauses == 1U &&
+            historical.visibility_resumes == 1U &&
+            historical.status_requests_while_hidden == 0U &&
+            historical.session_renewals == 1U &&
+            historical.manual_diagnostics_attempts == 1U &&
+            historical.diagnostics_refreshes == 1U &&
+            historical.storage_scans_from_status == 0U &&
+            historical.heartbeat_buffer_reuses == 140U &&
+            historical.heartbeat_buffer_growths == 0U &&
+            historical.response_buffer_reuses == 140U &&
+            historical.response_buffer_growths == 0U &&
+            historical.dashboard_offline_transitions == 0U &&
+            historical.false_dashboard_offline_transitions == 0U &&
+            historical.stale_connected_labels == 0U &&
+            historical.allocation_scopes_unbalanced == 0U &&
+            historical.maximum_status_leases == 1U &&
+            historical.status_pool_exhaustions == 0U &&
+            historical.warm_largest_internal_block ==
+                historical.minimum_largest_internal_block &&
+            historical.warm_largest_internal_block ==
+                historical.ending_largest_internal_block &&
+            historical.outstanding_allocations_at_end == 0U,
+        "35-minute historical 341-request soak covers meter, durable, session, visibility, diagnostics, buffers, and freshness counters");
+
+  const SoakCounters current_policy = run_soak(
+      {2'100U, 211U, 1U, 1U, 1U, 0U, 0U, 0U, 0U});
+  check(current_policy.valid && current_policy.status_requests == 211U &&
+            current_policy.heartbeat_opportunities == 140U &&
+            current_policy.heartbeats_admitted == 140U &&
+            current_policy.status_response_failures == 0U &&
+            current_policy.maximum_requests_per_client == 1U &&
+            current_policy.status_pool_exhaustions == 0U &&
+            current_policy.outstanding_allocations_at_end == 0U,
+        "35-minute current 10-second policy stays within 211 requests with no overlap or leak");
+
+  const SoakCounters day = run_soak(
+      {86'400U, 8'641U, 1U, 4U, 10U, 2U, 1U, 43'200U, 43'320U});
+  check(day.valid && day.meter_samples == 86'400U &&
+            day.durable_intervals == 1'440U &&
+            day.heartbeat_opportunities == 5'760U &&
+            day.heartbeats_admitted == 5'760U &&
+            day.heartbeat_successes == 5'752U &&
+            day.server_outage_heartbeats == 8U &&
+            day.network_failures == 8U && day.outage_recoveries == 1U &&
+            day.status_requests == 8'641U &&
+            day.status_response_failures == 0U &&
+            day.session_renewals == 48U && day.visibility_pauses == 4U &&
+            day.visibility_resumes == 4U && day.setup_visits == 1U &&
+            day.manual_diagnostics_attempts == 10U &&
+            day.diagnostics_refreshes == 10U &&
+            day.diagnostics_downloads == 2U &&
+            day.dashboard_offline_transitions == 1U &&
+            day.false_dashboard_offline_transitions == 0U &&
+            day.stale_connected_labels == 0U &&
+            day.session_renewal_loops == 0U &&
+            day.tls_heap_deferrals == 0U &&
+            day.tls_stack_deferrals == 0U &&
+            day.heartbeat_buffer_growths == 0U &&
+            day.response_buffer_growths == 0U &&
+            day.maximum_requests_per_client == 1U &&
+            day.status_pool_exhaustions == 0U &&
+            day.allocation_scopes_unbalanced == 0U &&
+            day.warm_largest_internal_block ==
+                day.minimum_largest_internal_block &&
+            day.warm_largest_internal_block ==
+                day.ending_largest_internal_block &&
+            day.outstanding_allocations_at_end == 0U,
+        "24-hour soak covers status, meter, durable, session, visibility, setup, diagnostics, and deliberate outage recovery without allocator drift");
+
+  const SoakCounters two_clients = run_soak(
+      {2'100U, 211U, 2U, 2U, 2U, 0U, 0U, 0U, 0U});
+  check(two_clients.valid && two_clients.status_requests == 422U &&
+            two_clients.maximum_status_leases == 2U &&
+            two_clients.maximum_requests_per_client == 1U &&
+            two_clients.desktop_clients == 1U &&
+            two_clients.phone_clients == 1U &&
+            two_clients.session_renewals == 2U &&
+            two_clients.visibility_pauses == 2U &&
+            two_clients.visibility_resumes == 2U &&
+            two_clients.status_pool_exhaustions == 0U &&
+            two_clients.storage_scans_from_status == 0U &&
+            two_clients.heartbeats_admitted == 140U &&
+            two_clients.outstanding_allocations_at_end == 0U,
+        "two-client 35-minute soak admits both fixed response leases without fan-out, history scans, or TLS starvation");
 }
 
 void testProvisioningTransaction() {
@@ -1246,6 +2005,11 @@ int main() {
   testProtocolCanonicalization();
   testAuthenticationPolicy();
   testMemoryPressurePolicy();
+  testBoundedStatusPrimitives();
+  testCompactStatusSerializationAndFreshness();
+  testBoundedStatusAuthorizationAndResponsePath();
+  testDebugAllocationScopes();
+  testFragmentationIncidentAndSoaks();
   testStoragePolicy();
   testCleanupRecoveryPolicy();
   testProvisioningTransaction();

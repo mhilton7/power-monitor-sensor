@@ -2,15 +2,113 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <new>
 #include <utility>
+
+#if !defined(PM_NATIVE_TEST)
+#include <esp_heap_caps.h>
+#endif
 
 #include "core/Models.h"
 
 namespace pm {
 namespace reading_wire {
 namespace {
+
+// ArduinoJson 7 grows a JsonDocument through its Allocator. The reading-batch
+// document itself is PSRAM-backed, but this per-record parser previously used
+// ArduinoJson's default allocator and therefore fragmented scarce internal
+// DRAM once for every durable record. This allocator is deliberately local to
+// one append() call, PSRAM-only on the ESP32, and rejects growth beyond a
+// fixed ceiling. It never falls back to internal RAM.
+class BoundedPsramJsonAllocator final : public ArduinoJson::Allocator {
+public:
+  explicit BoundedPsramJsonAllocator(const std::size_t maximum_bytes)
+      : maximum_bytes_(maximum_bytes) {}
+
+  void *allocate(const std::size_t size) override {
+    if (size == 0U || size > maximum_bytes_ - allocated_bytes_)
+      return nullptr;
+    void *raw = allocateRaw(sizeof(BlockHeader) + size);
+    if (raw == nullptr)
+      return nullptr;
+    auto *header = new (raw) BlockHeader{size};
+    allocated_bytes_ += size;
+    return header + 1;
+  }
+
+  void deallocate(void *pointer) override {
+    if (pointer == nullptr)
+      return;
+    auto *header = static_cast<BlockHeader *>(pointer) - 1;
+    allocated_bytes_ =
+        header->size <= allocated_bytes_ ? allocated_bytes_ - header->size : 0U;
+    freeRaw(header);
+  }
+
+  void *reallocate(void *pointer, const std::size_t size) override {
+    if (pointer == nullptr)
+      return allocate(size);
+    if (size == 0U) {
+      deallocate(pointer);
+      return nullptr;
+    }
+    auto *old_header = static_cast<BlockHeader *>(pointer) - 1;
+    const std::size_t old_size = old_header->size;
+    if (size > maximum_bytes_ - (allocated_bytes_ - old_size))
+      return nullptr;
+    void *raw = reallocateRaw(old_header, sizeof(BlockHeader) + size);
+    if (raw == nullptr)
+      return nullptr;
+    auto *new_header = static_cast<BlockHeader *>(raw);
+    new_header->size = size;
+    allocated_bytes_ = allocated_bytes_ - old_size + size;
+    return new_header + 1;
+  }
+
+private:
+  struct alignas(std::max_align_t) BlockHeader {
+    std::size_t size;
+  };
+
+  static void *allocateRaw(const std::size_t size) {
+#if defined(PM_NATIVE_TEST)
+    return std::malloc(size);
+#else
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+  }
+
+  static void *reallocateRaw(void *pointer, const std::size_t size) {
+#if defined(PM_NATIVE_TEST)
+    return std::realloc(pointer, size);
+#else
+    return heap_caps_realloc(pointer, size,
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+  }
+
+  static void freeRaw(void *pointer) {
+#if defined(PM_NATIVE_TEST)
+    std::free(pointer);
+#else
+    heap_caps_free(pointer);
+#endif
+  }
+
+  const std::size_t maximum_bytes_;
+  std::size_t allocated_bytes_{0U};
+};
+
+// Parsed ArduinoJson nodes are normally below the encoded input size, but a
+// two-times ceiling allows metadata overhead while keeping the allocation
+// deterministic and well below the PSRAM request-body scratch capacity.
+constexpr std::size_t kMaximumParserAllocationBytes =
+    kMaximumEncodedRecordBytes * 2U;
 
 void addQualityFlags(const std::uint32_t flags, JsonArray output) {
   const std::array<std::pair<std::uint32_t, const char *>, 11> names{{
@@ -91,7 +189,12 @@ std::uint32_t serverContractViolationFlags(const JsonDocument &source) {
 } // namespace
 
 bool append(JsonArray output, const std::string &encoded_record) {
-  JsonDocument source;
+  if (encoded_record.empty() ||
+      encoded_record.size() > kMaximumEncodedRecordBytes) {
+    return false;
+  }
+  BoundedPsramJsonAllocator allocator(kMaximumParserAllocationBytes);
+  JsonDocument source(&allocator);
   if (deserializeJson(source, encoded_record) ||
       !source["sequence"].is<std::uint64_t>() ||
       !source["boot_id"].is<const char *>() ||

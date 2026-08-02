@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -14,6 +15,8 @@ public:
   [[nodiscard]] std::uint64_t utcMs() const;
   [[nodiscard]] std::uint64_t monotonicMs() const;
   [[nodiscard]] std::string utcIso8601() const;
+  [[nodiscard]] bool formatUtcIso8601(char *output,
+                                      std::size_t capacity) const;
   [[nodiscard]] std::uint64_t lastTrustedUtcMs() const;
 
 private:

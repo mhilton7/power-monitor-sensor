@@ -162,18 +162,28 @@ std::uint64_t ClockService::monotonicMs() const {
 }
 
 std::string ClockService::utcIso8601() const {
+  char output[80]{};
+  return formatUtcIso8601(output, sizeof(output)) ? output : "";
+}
+
+bool ClockService::formatUtcIso8601(char *output,
+                                    const std::size_t capacity) const {
+  if (output == nullptr || capacity == 0U) {
+    return false;
+  }
+  output[0] = '\0';
   if (!synchronized()) {
-    return "";
+    return true;
   }
   const std::time_t now = std::time(nullptr);
   struct tm broken_down{};
   gmtime_r(&now, &broken_down);
-  char output[80]{};
-  std::snprintf(output, sizeof(output), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                broken_down.tm_year + 1900, broken_down.tm_mon + 1,
-                broken_down.tm_mday, broken_down.tm_hour, broken_down.tm_min,
-                broken_down.tm_sec);
-  return output;
+  const int written =
+      std::snprintf(output, capacity, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                    broken_down.tm_year + 1900, broken_down.tm_mon + 1,
+                    broken_down.tm_mday, broken_down.tm_hour,
+                    broken_down.tm_min, broken_down.tm_sec);
+  return written >= 0 && static_cast<std::size_t>(written) < capacity;
 }
 
 std::uint64_t ClockService::lastTrustedUtcMs() const {

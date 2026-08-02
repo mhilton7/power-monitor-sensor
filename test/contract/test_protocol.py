@@ -15,14 +15,14 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from check_repo import (  # noqa: E402
+from check_repo import (
     RECOVERY_FIRMWARE_IDENTIFIERS,
     embedded_recovery_identifier,
     production_firmware_artifact_paths,
     recovery_identifier_in_contents,
 )
 
-from simulator.protocol import (  # noqa: E402
+from simulator.protocol import (
     body_sha256,
     canonical_path_query,
     canonical_string,
@@ -914,7 +914,7 @@ class ProtocolContractTests(unittest.TestCase):
             "base = retry_after_ms;",
             "sync_policy::kReadingBatchPayloadBytes",
             "sync_policy::kEventBatchPayloadBytes",
-            "sync_policy::tlsMemoryReserveAvailable",
+            "sync_policy::classifyTlsMemory",
             "endpoint_address_cache_.lookup",
             "endpoint_address_cache_.recordTransportFailure",
             "readBoundedResponseBody",
@@ -931,6 +931,17 @@ class ProtocolContractTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, firmware_source)
 
+        sync_policy_header = (ROOT / "src/network/ServerSyncPolicy.h").read_text(
+            encoding="utf-8"
+        )
+        contiguous_guard = re.search(
+            r"kMinimumLargestInternalBlockBytes\s*=\s*(\d+)U\s*\*\s*1024U",
+            sync_policy_header,
+        )
+        self.assertIsNotNone(contiguous_guard)
+        assert contiguous_guard is not None
+        self.assertGreaterEqual(int(contiguous_guard.group(1)), 32)
+
         network_source = (ROOT / "src/network/NetworkService.cpp").read_text(
             encoding="utf-8"
         )
@@ -939,7 +950,7 @@ class ProtocolContractTests(unittest.TestCase):
 
         local_api_source = (ROOT / "src/api/HttpApi.cpp").read_text(encoding="utf-8")
         for marker in (
-            "classifyAuthMode(request)",
+            "classifyAuthMode(request, session_cookie)",
             "RequestAuthMode::LocalBrowserSession",
             "RequestAuthMode::ServerToDeviceHmac",
             "RequestAuthMode::MalformedMixedAuthentication",
@@ -948,18 +959,16 @@ class ProtocolContractTests(unittest.TestCase):
             '"EVT_SERVER_HMAC_REJECTED"',
         ):
             self.assertIn(marker, local_api_source)
-        auth_header = (ROOT / "src/security/AuthService.h").read_text(
-            encoding="utf-8"
-        )
+        auth_header = (ROOT / "src/security/AuthService.h").read_text(encoding="utf-8")
         self.assertIn("static constexpr std::size_t kCapacity = 6U", auth_header)
         self.assertIn("std::array<Entry, kCapacity>", auth_header)
-        sync_source = (ROOT / "src/network/ServerSync.cpp").read_text(
-            encoding="utf-8"
-        )
+        sync_source = (ROOT / "src/network/ServerSync.cpp").read_text(encoding="utf-8")
         self.assertIn(
-            'http.addHeader("X-Request-ID", correlation_id.c_str())', sync_source
+            'http.addHeader("X-Request-ID", correlation_id.data())', sync_source
         )
-        self.assertIn('"pm-" + config_.identity().boot_id', sync_source)
+        self.assertIn('"pm-%s-%lu"', sync_source)
+        self.assertIn("transport_boot_id_.c_str()", sync_source)
+        self.assertNotIn('"pm-" + config_.identity().boot_id', sync_source)
         self.assertGreaterEqual(
             local_api_source.count('addHeader("Connection", "close", false)'),
             8,
@@ -1103,9 +1112,9 @@ class ProtocolContractTests(unittest.TestCase):
             "scanned_event_records % kCooperativeScanRecords == 0U",
         ):
             self.assertIn(marker, source)
-        coordinator = (
-            ROOT / "src/storage/StorageCoordinator.cpp"
-        ).read_text(encoding="utf-8")
+        coordinator = (ROOT / "src/storage/StorageCoordinator.cpp").read_text(
+            encoding="utf-8"
+        )
         for marker in (
             "bool StorageCoordinator::remountStorage()",
             "HighMemoryLease memory_lease(diagnostics_);",
@@ -1114,15 +1123,9 @@ class ProtocolContractTests(unittest.TestCase):
             "request->events || !request->primary_sync",
         ):
             self.assertIn(marker, coordinator)
-        self.assertNotIn(
-            "storage_.remount(storage_.health().spi_hz)", coordinator
-        )
-        task_config = (ROOT / "include/app/TaskConfig.h").read_text(
-            encoding="utf-8"
-        )
-        application = (ROOT / "src/app/Application.cpp").read_text(
-            encoding="utf-8"
-        )
+        self.assertNotIn("storage_.remount(storage_.health().spi_hz)", coordinator)
+        task_config = (ROOT / "include/app/TaskConfig.h").read_text(encoding="utf-8")
+        application = (ROOT / "src/app/Application.cpp").read_text(encoding="utf-8")
         self.assertIn("kAggregationPriority = 3U", task_config)
         self.assertIn("kStoragePriority = 0U", task_config)
         self.assertIn("time-slices recovery with IDLE0", task_config)
@@ -1130,16 +1133,14 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertIn("kHealthStackBytes = 12288U", task_config)
         self.assertIn("task_config::kAggregationPriority", application)
         self.assertIn("task_config::kStoragePriority", application)
-        self.assertIn('&storage_task_, 0);', application)
-        self.assertIn('&network_task_, 1);', application)
-        self.assertIn('&sync_task_, 1);', application)
+        self.assertIn("&storage_task_, 0);", application)
+        self.assertIn("&network_task_, 1);", application)
+        self.assertIn("&sync_task_, 1);", application)
         self.assertIn("ScopedFatDirectoryWatchdogGuard", source)
         self.assertIn("esp_task_wdt_delete(idle_task_)", source)
         self.assertIn("esp_task_wdt_add(idle_task_)", source)
         self.assertIn('"BOOT_MOUNT_RETRY"', application)
-        self.assertIn(
-            "last_retention_ms = clock_.monotonicMs()", application
-        )
+        self.assertIn("last_retention_ms = clock_.monotonicMs()", application)
         self.assertIn(
             "last_storage_cleanup_ack_sequence_ = config_.serverAckSequence()",
             application,
@@ -1153,13 +1154,9 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertIn("health_snapshot_mutex_", header)
         self.assertIn("last_health_snapshot_", header)
         self.assertIn("return remountPreferred();", source)
-        server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(
-            encoding="utf-8"
-        )
+        server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(encoding="utf-8")
         self.assertIn("kHeartbeatStorageWaitMs = 20'000U", server_sync)
-        self.assertIn(
-            'endpoint == "/api/v1/device-heartbeats"', server_sync
-        )
+        self.assertIn('endpoint == "/api/v1/device-heartbeats"', server_sync)
 
     def test_sd_history_pages_are_globally_sequence_ordered(self) -> None:
         source = (ROOT / "src/storage/SdStorage.cpp").read_text(encoding="utf-8")
@@ -1185,9 +1182,7 @@ class ProtocolContractTests(unittest.TestCase):
             "Active segments and any segment with missing/incomplete metadata",
             source,
         )
-        server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(
-            encoding="utf-8"
-        )
+        server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(encoding="utf-8")
         self.assertIn("query.require_syncable = true", server_sync)
         self.assertIn("sequence_state.storage_mounted &&", server_sync)
         self.assertIn('"SEQUENCE_RECONCILIATION_DEFERRED"', server_sync)

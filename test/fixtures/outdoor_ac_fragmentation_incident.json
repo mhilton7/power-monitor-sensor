@@ -1,0 +1,20 @@
+{
+  "duration_seconds": 2100,
+  "status_requests": 341,
+  "heartbeat_interval_seconds": 15,
+  "server_offline_after_seconds": 30,
+  "initial_free_internal_bytes": 72280,
+  "initial_largest_internal_block_bytes": 24564,
+  "tls_required_largest_block_bytes": 32768,
+  "starting_tls_heap_deferrals": 46,
+  "ending_tls_heap_deferrals": 117,
+  "wifi_connected": true,
+  "authentication_failures": 0,
+  "network_failures": 0,
+  "meter_healthy": true,
+  "storage_writable": true,
+  "power_w": 12.8,
+  "voltage_v": 245.6,
+  "current_a": 0.659,
+  "frequency_hz": 60.0
+}

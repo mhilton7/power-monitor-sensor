@@ -1,8 +1,33 @@
 export type HealthState = "connected" | "offline" | "unauthenticated";
 
+export type ServerFreshnessState =
+  | "never_connected"
+  | "live"
+  | "delayed"
+  | "stale"
+  | "offline"
+  | "unauthenticated";
+
+export interface ServerFreshness {
+  state: ServerFreshnessState;
+  last_success_utc_ms: number | null;
+  age_seconds: number | null;
+  expected_heartbeat_seconds: number;
+  stale_after_seconds: number;
+  offline_after_seconds: number;
+  last_attempt_result: string;
+  last_safe_error: string;
+}
+
 export interface UiStatus {
   schema_version: 1;
   server_now: string;
+  /**
+   * Authoritative monotonic freshness supplied by current firmware. It is
+   * optional so a newly deployed WebUI remains compatible with the previous
+   * compact status response during a rolling firmware update.
+   */
+  server?: ServerFreshness;
   device: {
     friendly_name: string;
     firmware: string;

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,8 @@
 #include "build_config.h"
 #include "diagnostics/SerialLogger.h"
 #include "network/ReadingWireFormat.h"
+#include "network/ServerSyncPolicy.h"
+#include "network/ServerSyncScratch.h"
 #include "security/Crypto.h"
 #include "ui/embedded_assets.h"
 #include "version.h"
@@ -30,6 +33,77 @@ namespace {
 constexpr std::uint32_t kMinimumLightUiInternalHeapBytes = 40U * 1024U;
 constexpr std::uint32_t kMinimumHeavyUiInternalHeapBytes = 72U * 1024U;
 constexpr std::uint32_t kMinimumHeavyUiLargestBlockBytes = 28U * 1024U;
+
+constexpr char kStatusCapacityProblem[] =
+    "{\"type\":\"https://powermonitor.local/problems/status_capacity_"
+    "exhausted\",\"title\":\"status_capacity_exhausted\",\"status\":503,"
+    "\"detail\":\"The bounded status response capacity is temporarily in "
+    "use. Retry shortly.\",\"code\":\"status_capacity_exhausted\"}";
+
+constexpr char kStatusSerializationProblem[] =
+    "{\"type\":\"https://powermonitor.local/problems/status_snapshot_"
+    "unavailable\",\"title\":\"status_snapshot_unavailable\",\"status\":503,"
+    "\"detail\":\"The compact status snapshot could not be produced within "
+    "its fixed memory bound.\",\"code\":\"status_snapshot_unavailable\"}";
+
+void sendStaticStatusProblem(AsyncWebServerRequest *request,
+                             const char *body, const std::size_t length) {
+  AsyncWebServerResponse *response = request->beginResponse(
+      503, "application/problem+json",
+      reinterpret_cast<const std::uint8_t *>(body), length);
+  if (response == nullptr) {
+    request->send(503);
+    return;
+  }
+  response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Retry-After", "2");
+  response->addHeader("X-Content-Type-Options", "nosniff");
+  request->send(response);
+}
+
+class PooledUiStatusResponse final : public AsyncAbstractResponse {
+public:
+  PooledUiStatusResponse(UiStatusResponsePool::Lease lease,
+                         Diagnostics &diagnostics)
+      : lease_(std::move(lease)), diagnostics_(diagnostics) {
+    _code = 200;
+    _contentType = "application/json";
+    _contentLength = lease_.size();
+    _sendContentLength = true;
+    addHeader("Cache-Control", "no-store");
+    addHeader("X-Content-Type-Options", "nosniff");
+  }
+
+  ~PooledUiStatusResponse() override {
+    // Return the fixed body slot before recording the lifecycle completion so
+    // allocation/release counters also prove that disconnect/error cleanup did
+    // not strand a lease.
+    lease_.release();
+    diagnostics_.recordUiStatusResponseObjectRelease();
+  }
+
+  bool _sourceValid() const override {
+    return static_cast<bool>(lease_) && lease_.size() == _contentLength;
+  }
+
+  std::size_t _fillBuffer(std::uint8_t *buffer,
+                          const std::size_t maximum) override {
+    if (!lease_ || _sentLength >= lease_.size()) {
+      return 0U;
+    }
+    const std::size_t remaining = lease_.size() - _sentLength;
+    const std::size_t length = std::min(remaining, maximum);
+    std::memcpy(buffer, lease_.data() + _sentLength, length);
+    return length;
+  }
+
+private:
+  UiStatusResponsePool::Lease lease_;
+  Diagnostics &diagnostics_;
+};
+
+static_assert(sizeof(PooledUiStatusResponse) <= 512U,
+              "compact Status response object exceeded its small exception");
 
 struct DeferredHttpResult {
   int status{200};
@@ -978,86 +1052,122 @@ void HttpApi::registerReadRoutes() {
         if (!authorize(request, "", false))
           return;
         diagnostics_.recordUiRequest(UiRequestKind::Status);
-        const NetworkStatus network = network_.status();
-        const StorageHealth storage = storage_.health();
+        UiStatusResponsePool::Lease response_slot =
+            status_response_pool_.acquire();
+        if (!response_slot) {
+          diagnostics_.recordUiStatusPoolExhaustion();
+          sendStaticStatusProblem(request, kStatusCapacityProblem,
+                                  sizeof(kStatusCapacityProblem) - 1U);
+          return;
+        }
+
+        const HeapSnapshot heap_before = heap_telemetry_.snapshot();
+        const CompactNetworkStatus network = network_.compactStatus();
+        const CompactStorageHealth storage = storage_.compactHealth();
         const MeterMetrics meter = meter_.metrics();
-        const SyncMetrics sync = diagnostics_.syncMetrics();
-        const SensorStatusConfig status_config = config_.sensorStatusConfig();
+        const CompactSyncMetrics sync = diagnostics_.compactSyncMetrics();
+        const CompactSensorStatusConfig status_config =
+            config_.compactSensorStatusConfig();
         MeasurementSnapshot latest;
         const bool has_latest = diagnostics_.latest(latest) && latest.valid;
-        const std::uint64_t acknowledgement = config_.serverAckSequence();
+        const std::uint64_t acknowledgement =
+            status_config.server_ack_sequence;
         const std::uint64_t backlog =
             storage.newest_syncable_sequence >= acknowledgement
                 ? storage.newest_syncable_sequence - acknowledgement
                 : 0U;
-        const std::uint32_t free_internal =
-            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        const std::uint32_t largest_internal =
-            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                             MALLOC_CAP_8BIT);
-        JsonDocument document;
-        document["schema_version"] = 1;
-        document["server_now"] = clock_.utcIso8601();
-        JsonObject device = document["device"].to<JsonObject>();
-        device["friendly_name"] = status_config.friendly_name;
-        device["firmware"] = version::FIRMWARE;
-        device["git_commit"] = version::GIT_COMMIT;
-        device["build_timestamp"] = version::BUILD_TIMESTAMP;
-        device["platformio_environment"] = version::PLATFORMIO_ENVIRONMENT;
-        device["uptime_seconds"] = clock_.monotonicMs() / 1000U;
-        JsonObject web_assets = device["web_assets"].to<JsonObject>();
+
+        CompactUiStatusSnapshot snapshot;
+        snapshot.friendly_name = status_config.friendly_name;
+        snapshot.ip_address = network.ip_address;
+        snapshot.uptime_seconds = clock_.monotonicMs() / 1000U;
+        snapshot.generated_utc_ms = clock_.utcMs();
+        snapshot.current_monotonic_ms = clock_.monotonicMs();
+        snapshot.reading_available = has_latest;
+        snapshot.measured_at_utc_ms = has_latest ? latest.utc_ms : 0U;
+        snapshot.power_w = has_latest ? latest.active_power_w : 0.0F;
+        snapshot.voltage_v = has_latest ? latest.voltage_v : 0.0F;
+        snapshot.current_a = has_latest ? latest.current_a : 0.0F;
+        snapshot.frequency_hz = has_latest ? latest.frequency_hz : 0.0F;
+        snapshot.power_factor = has_latest ? latest.power_factor : 0.0F;
+        snapshot.wifi_connected = network.station_connected;
+        snapshot.server_reachable = network.server_reachable;
+        snapshot.authenticated = network.server_authenticated;
+        snapshot.rssi_dbm = network.rssi_dbm;
+        snapshot.storage_writable = storage.writable;
+        snapshot.meter_healthy = meter.last_error == MeterError::None;
+        snapshot.last_heartbeat_success_utc_ms =
+            sync.last_heartbeat_utc_ms;
+        snapshot.last_heartbeat_success_monotonic_ms =
+            sync.last_heartbeat_success_monotonic_ms;
+        snapshot.newest_sequence = storage.newest_sequence;
+        snapshot.acknowledged_sequence = acknowledgement;
+        snapshot.backlog = backlog;
+        snapshot.heap = heap_before;
+        snapshot.memory = diagnostics_.memoryPressureMetrics();
+        snapshot.freshness_policy.expected_heartbeat_seconds =
+            std::max<std::uint32_t>(1U,
+                                    status_config.heartbeat_interval_seconds);
+        snapshot.freshness_policy.stale_after_seconds = 30U;
+        snapshot.freshness_policy.offline_after_seconds = 30U;
+        snapshot.server_state = classifyServerFreshness(
+            snapshot.wifi_connected, snapshot.server_reachable,
+            snapshot.authenticated,
+            snapshot.last_heartbeat_success_monotonic_ms,
+            snapshot.current_monotonic_ms, snapshot.freshness_policy);
+        snapshot.last_attempt_result = sync.last_heartbeat_result;
+        const char *safe_error =
+            sync.last_local_deferral_reason[0] == '\0'
+                ? sync.last_error.data()
+                : sync.last_local_deferral_reason.data();
+        snapshot.truncated = status_config.truncated || network.truncated ||
+                             sync.truncated ||
+                             !copyCompactText(snapshot.last_safe_error,
+                                              safe_error);
+        if (!clock_.formatUtcIso8601(snapshot.server_now.data(),
+                                    snapshot.server_now.size())) {
+          snapshot.server_now[0] = '\0';
+          snapshot.truncated = true;
+        }
+
         const ui::Asset *index_asset = ui::findAsset("/index.html");
         const ui::Asset *script_asset = ui::findAsset("/assets/app.js");
         const ui::Asset *style_asset = ui::findAsset("/assets/style.css");
-        web_assets["index_html_sha256"] =
-            index_asset == nullptr ? "unavailable" : index_asset->sha256;
-        web_assets["app_js_sha256"] =
-            script_asset == nullptr ? "unavailable" : script_asset->sha256;
-        web_assets["style_css_sha256"] =
-            style_asset == nullptr ? "unavailable" : style_asset->sha256;
-        JsonObject reading = document["reading"].to<JsonObject>();
-        if (has_latest) {
-          reading["measured_at_utc_ms"] = latest.utc_ms;
-          reading["power_w"] = latest.active_power_w;
-          reading["voltage_v"] = latest.voltage_v;
-          reading["current_a"] = latest.current_a;
-          reading["frequency_hz"] = latest.frequency_hz;
-          reading["power_factor"] = latest.power_factor;
-        } else {
-          reading["measured_at_utc_ms"] = nullptr;
-          reading["power_w"] = nullptr;
-          reading["voltage_v"] = nullptr;
-          reading["current_a"] = nullptr;
-          reading["frequency_hz"] = nullptr;
-          reading["power_factor"] = nullptr;
+        const CompactUiBuildMetadata metadata{
+            version::FIRMWARE,
+            version::GIT_COMMIT,
+            version::BUILD_TIMESTAMP,
+            version::PLATFORMIO_ENVIRONMENT,
+            index_asset == nullptr ? "unavailable" : index_asset->sha256,
+            script_asset == nullptr ? "unavailable" : script_asset->sha256,
+            style_asset == nullptr ? "unavailable" : style_asset->sha256};
+        const CompactUiSerializationResult serialized =
+            serializeCompactUiStatus(snapshot, metadata, response_slot.data(),
+                                     response_slot.capacity());
+        if (!serialized.success || !response_slot.setSize(serialized.bytes)) {
+          diagnostics_.recordUiStatusDynamicAllocationFailure();
+          sendStaticStatusProblem(request, kStatusSerializationProblem,
+                                  sizeof(kStatusSerializationProblem) - 1U);
+          return;
         }
-        JsonObject health = document["health"].to<JsonObject>();
-        health["wifi"] = network.station_connected ? "connected" : "offline";
-        health["rssi_dbm"] = network.rssi_dbm;
-        health["ip_address"] = network.ip_address;
-        health["server"] =
-            network.server_authenticated
-                ? "connected"
-                : (network.server_reachable ? "unauthenticated" : "offline");
-        health["storage"] = storage.writable ? "writable" : "degraded";
-        health["meter"] =
-            meter.last_error == MeterError::None ? "healthy" : "degraded";
-        health["low_memory"] =
-            free_internal < kMinimumLightUiInternalHeapBytes ||
-            largest_internal < kMinimumHeavyUiLargestBlockBytes;
-        JsonObject sync_json = document["sync"].to<JsonObject>();
-        if (sync.last_heartbeat_utc_ms == 0U) {
-          sync_json["last_success_utc_ms"] = nullptr;
-        } else {
-          sync_json["last_success_utc_ms"] = sync.last_heartbeat_utc_ms;
+        const HeapSnapshot heap_after_serialization =
+            heap_telemetry_.snapshot();
+        AsyncWebServerResponse *response = new (std::nothrow)
+            PooledUiStatusResponse(std::move(response_slot), diagnostics_);
+        if (response == nullptr) {
+          diagnostics_.recordUiStatusDynamicAllocationFailure();
+          sendStaticStatusProblem(request, kStatusSerializationProblem,
+                                  sizeof(kStatusSerializationProblem) - 1U);
+          return;
         }
-        sync_json["newest_sequence"] = storage.newest_sequence;
-        sync_json["acknowledged_sequence"] = acknowledgement;
-        sync_json["backlog"] = backlog;
-        sync_json["last_safe_error"] = sync.last_error;
-        std::string body;
-        serializeJson(document, body);
-        sendJson(request, 200, body);
+        const HeapSnapshot heap_after_response = heap_telemetry_.snapshot();
+        diagnostics_.recordUiStatusResponse(
+            serialized.bytes, heap_before.largest_internal_block_bytes,
+            heap_after_response.largest_internal_block_bytes,
+            heap_after_serialization.largest_internal_block_bytes,
+            heap_after_response.largest_internal_block_bytes,
+            sizeof(PooledUiStatusResponse));
+        request->send(response);
       });
   server_.on(
       "/api/v1/ui/diagnostics", HTTP_GET,
@@ -1072,21 +1182,19 @@ void HttpApi::registerReadRoutes() {
         JsonDocument document;
         document["schema_version"] = 1;
         JsonObject memory = document["memory"].to<JsonObject>();
-        memory["free_heap_bytes"] = ESP.getFreeHeap();
-        memory["minimum_free_heap_bytes"] = ESP.getMinFreeHeap();
+        const HeapSnapshot heap = heap_telemetry_.snapshot();
+        memory["free_heap_bytes"] = heap.free_total_bytes;
+        memory["minimum_free_heap_bytes"] = heap.minimum_free_total_bytes;
         memory["free_internal_heap_bytes"] =
-            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            heap.free_internal_bytes;
         memory["minimum_free_internal_heap_bytes"] =
-            heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL |
-                                            MALLOC_CAP_8BIT);
+            heap.minimum_free_internal_bytes;
         memory["largest_internal_block_bytes"] =
-            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                             MALLOC_CAP_8BIT);
-        memory["free_psram_bytes"] = ESP.getFreePsram();
+            heap.largest_internal_block_bytes;
+        memory["free_psram_bytes"] = heap.free_psram_bytes;
         memory["largest_psram_block_bytes"] =
-            heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM |
-                                             MALLOC_CAP_8BIT);
-        memory["heap_integrity_ok"] = heap_caps_check_integrity_all(false);
+            heap.largest_psram_block_bytes;
+        memory["heap_integrity_ok"] = heap.integrity_ok;
         const MemoryPressureMetrics pressure =
             diagnostics_.memoryPressureMetrics();
         memory["pressure_state"] = memoryPressureStateName(pressure.state);
@@ -1131,11 +1239,40 @@ void HttpApi::registerReadRoutes() {
         sync_json["batch_failures"] = sync.batch_failures;
         sync_json["local_resource_deferrals"] =
             sync.local_resource_deferrals;
+        sync_json["fragmentation_deferrals"] =
+            sync.fragmentation_deferrals;
+        sync_json["fragmentation_recoveries"] =
+            sync.fragmentation_recoveries;
+        sync_json["heartbeat_buffer_capacity"] =
+            ServerSyncScratch::kRequestCapacity;
+        sync_json["heartbeat_buffer_reuses"] =
+            sync.heartbeat_buffer_reuses;
+        sync_json["heartbeat_buffer_growths"] =
+            sync.heartbeat_buffer_growths;
+        sync_json["response_buffer_capacity"] =
+            ServerSyncScratch::kResponseCapacity;
+        sync_json["response_buffer_reuses"] = sync.response_buffer_reuses;
+        sync_json["response_buffer_growths"] = sync.response_buffer_growths;
         sync_json["tls_requests_admitted"] = sync.tls_requests_admitted;
         sync_json["tls_requests_rejected_heap"] =
             sync.tls_requests_rejected_heap;
         sync_json["tls_requests_rejected_stack"] =
             sync.tls_requests_rejected_stack;
+        sync_json["tls_required_largest_block_bytes"] =
+            sync_policy::kMinimumLargestInternalBlockBytes;
+        sync_json["largest_internal_before_tls"] =
+            sync.largest_internal_before_tls;
+        sync_json["largest_internal_after_tls"] =
+            sync.largest_internal_after_tls;
+        sync_json["largest_internal_after_cleanup"] =
+            sync.largest_internal_after_cleanup;
+        sync_json["last_heartbeat_attempt_monotonic_ms"] =
+            sync.last_heartbeat_attempt_monotonic_ms;
+        sync_json["last_heartbeat_success_monotonic_ms"] =
+            sync.last_heartbeat_success_monotonic_ms;
+        sync_json["last_heartbeat_result"] = sync.last_heartbeat_result;
+        sync_json["last_local_deferral_reason"] =
+            sync.last_local_deferral_reason;
         sync_json["acknowledged_sequence"] = acknowledgement;
         sync_json["newest_sequence"] = storage.newest_sequence;
         sync_json["backlog"] =
@@ -1145,6 +1282,32 @@ void HttpApi::registerReadRoutes() {
         sync_json["last_safe_error"] = sync.last_error;
         JsonObject local_http = document["local_http"].to<JsonObject>();
         local_http["ui_status_requests"] = http.ui_status_requests;
+        local_http["ui_status_responses"] = http.ui_status_responses;
+        local_http["ui_status_response_bytes"] =
+            http.ui_status_response_bytes;
+        local_http["ui_status_pool_capacity"] =
+            status_response_pool_.capacity();
+        local_http["ui_status_pool_active"] = status_response_pool_.active();
+        local_http["ui_status_pool_exhaustions"] =
+            status_response_pool_.exhaustions();
+        local_http["ui_status_response_maximum_bytes"] =
+            status_response_pool_.responseCapacity();
+        local_http["ui_status_dynamic_allocation_failures"] =
+            http.ui_status_dynamic_allocation_failures;
+        local_http["ui_status_response_object_allocations"] =
+            http.ui_status_response_object_allocations;
+        local_http["ui_status_response_object_releases"] =
+            http.ui_status_response_object_releases;
+        local_http["ui_status_response_object_bytes"] =
+            http.ui_status_response_object_bytes;
+        local_http["largest_internal_before_ui"] =
+            http.largest_internal_before_ui;
+        local_http["largest_internal_after_ui"] =
+            http.largest_internal_after_ui;
+        local_http["largest_internal_before_ui_response_object"] =
+            http.largest_internal_before_ui_response_object;
+        local_http["largest_internal_after_ui_response_object"] =
+            http.largest_internal_after_ui_response_object;
         local_http["ui_setup_requests"] = http.ui_setup_requests;
         local_http["ui_diagnostics_requests"] =
             http.ui_diagnostics_requests;
@@ -1383,12 +1546,11 @@ void HttpApi::registerReadRoutes() {
         document["last_sync_error"] = sync.last_error;
         document["stack_high_water_bytes"] = sync.stack_high_water_bytes;
         document["stack_margin_percent"] = sync.stack_margin_percent;
-        document["free_heap_bytes"] = ESP.getFreeHeap();
-        document["free_internal_heap_bytes"] =
-            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const HeapSnapshot heap = heap_telemetry_.snapshot();
+        document["free_heap_bytes"] = heap.free_total_bytes;
+        document["free_internal_heap_bytes"] = heap.free_internal_bytes;
         document["largest_internal_block_bytes"] =
-            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                             MALLOC_CAP_8BIT);
+            heap.largest_internal_block_bytes;
         std::string body;
         serializeJson(document, body);
         sendJson(request, 200, body);
@@ -1396,7 +1558,7 @@ void HttpApi::registerReadRoutes() {
           PM_LOG_INFO("WEB", "WEBUI_HEALTH",
                       "status=200 sync_in_progress=%s heap_free=%lu",
                       sync.sync_in_progress ? "true" : "false",
-                      static_cast<unsigned long>(ESP.getFreeHeap()));
+                      static_cast<unsigned long>(heap.free_total_bytes));
         }
       });
   server_.on("/api/v1/info", HTTP_GET, [this](AsyncWebServerRequest *request) {
@@ -2031,7 +2193,9 @@ std::string HttpApi::takeBody(AsyncWebServerRequest *request) const {
 }
 
 RequestAuthMode
-HttpApi::classifyAuthMode(AsyncWebServerRequest *request) const {
+HttpApi::classifyAuthMode(
+    AsyncWebServerRequest *request,
+    const BoundedSessionCookie &session_cookie) const {
   static constexpr std::array<const char *, 6> hmac_headers = {
       "X-PM-Protocol",       "X-PM-Device-ID", "X-PM-Timestamp",
       "X-PM-Nonce",          "X-PM-Content-SHA256",
@@ -2047,25 +2211,27 @@ HttpApi::classifyAuthMode(AsyncWebServerRequest *request) const {
   if (hmac_header_count != 0U) {
     return RequestAuthMode::MalformedMixedAuthentication;
   }
-  if (!cookieValue(request, "pm_session").empty()) {
+  if (session_cookie.presented()) {
     return RequestAuthMode::LocalBrowserSession;
   }
   return RequestAuthMode::Unauthenticated;
 }
 
-bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
+bool HttpApi::authorize(AsyncWebServerRequest *request,
+                        const StringView body,
                         const bool mutation, const bool allow_local_session,
                         const bool require_elevated_local) {
-  if (network_.status().setup_ap_active) {
+  if (network_.setupApActive()) {
     network_.touchSetupActivity();
   }
   const std::uint64_t now = clock_.monotonicMs();
-  const RequestAuthMode mode = classifyAuthMode(request);
+  const BoundedSessionCookie session_cookie = sessionCookie(request);
+  const RequestAuthMode mode = classifyAuthMode(request, session_cookie);
   PM_LOG_DEBUG("AUTH", "AUTH_MODE_CLASSIFIED",
                "route=%s method=%s mode=%s cookie_present=%s",
                request->url().c_str(), request->methodToString(),
                requestAuthModeName(mode),
-               cookieValue(request, "pm_session").empty() ? "false" : "true");
+               session_cookie.presented() ? "true" : "false");
   std::uint64_t *window_started = &hmac_api_window_started_ms_;
   std::uint16_t *requests_in_window = &hmac_api_requests_in_window_;
   const bool browser_mode = mode == RequestAuthMode::LocalBrowserSession;
@@ -2137,7 +2303,8 @@ bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
       return false;
     }
     const LocalSessionResult session_result =
-        localSessionResult(request, mutation, require_elevated_local);
+        localSessionResult(request, session_cookie.view(), mutation,
+                           require_elevated_local);
     if (session_result != LocalSessionResult::Ok) {
       const bool forbidden =
           session_result == LocalSessionResult::CsrfRejected ||
@@ -2307,32 +2474,45 @@ bool HttpApi::authorize(AsyncWebServerRequest *request, const std::string &body,
 
 LocalSessionResult
 HttpApi::localSessionResult(AsyncWebServerRequest *request,
+                            const StringView session_token,
                             const bool mutation,
                             const bool require_elevated) const {
-  const std::string token = cookieValue(request, "pm_session");
   if (!mutation) {
-    return sessions_.validate(token, clock_.monotonicMs(), require_elevated);
+    return sessions_.validate(session_token, clock_.monotonicMs(),
+                              require_elevated);
   }
-  const std::string csrf =
-      request->hasHeader("X-PM-CSRF")
-          ? request->getHeader("X-PM-CSRF")->value().c_str()
-          : "";
-  return sessions_.validateMutation(token, csrf, clock_.monotonicMs(),
-                                    require_elevated);
+  const AsyncWebHeader *csrf_header = request->getHeader("X-PM-CSRF");
+  const StringView csrf =
+      csrf_header == nullptr
+          ? StringView{}
+          : StringView(csrf_header->value().c_str(),
+                       csrf_header->value().length());
+  return sessions_.validateMutation(session_token, csrf,
+                                    clock_.monotonicMs(), require_elevated);
 }
 
 bool HttpApi::localSession(AsyncWebServerRequest *request, const bool mutation,
                            const bool require_elevated) const {
-  return localSessionResult(request, mutation, require_elevated) ==
+  const BoundedSessionCookie session_cookie = sessionCookie(request);
+  return localSessionResult(request, session_cookie.view(), mutation,
+                            require_elevated) ==
          LocalSessionResult::Ok;
 }
 
 bool HttpApi::sameOrigin(AsyncWebServerRequest *request) const {
-  if (!request->hasHeader("Origin"))
+  const AsyncWebHeader *origin_header = request->getHeader("Origin");
+  if (origin_header == nullptr)
     return false;
-  const String origin = request->getHeader("Origin")->value();
-  const String host = request->host();
-  return origin == "http://" + host || origin == "https://" + host;
+  const String &origin = origin_header->value();
+  const String &host = request->host();
+  const auto matches = [&origin, &host](const char *scheme,
+                                        const std::size_t scheme_size) {
+    return origin.length() == scheme_size + host.length() &&
+           std::memcmp(origin.c_str(), scheme, scheme_size) == 0 &&
+           std::memcmp(origin.c_str() + scheme_size, host.c_str(),
+                       host.length()) == 0;
+  };
+  return matches("http://", 7U) || matches("https://", 8U);
 }
 
 void HttpApi::createLocalSession(AsyncWebServerRequest *request,
@@ -2423,6 +2603,17 @@ std::string HttpApi::cookieValue(AsyncWebServerRequest *request,
   return cookies.substr(start, end - start);
 }
 
+HttpApi::BoundedSessionCookie
+HttpApi::sessionCookie(AsyncWebServerRequest *request) const {
+  const AsyncWebHeader *header = request->getHeader("Cookie");
+  if (header == nullptr) {
+    return {};
+  }
+  const String &cookies = header->value();
+  return parseBoundedCookie<kSessionTokenCharacters>(
+      cookies.c_str(), cookies.length(), "pm_session");
+}
+
 void HttpApi::sendJson(AsyncWebServerRequest *request, const int status,
                        const std::string &body, const char *content_type) {
   AsyncWebServerResponse *response =
@@ -2494,10 +2685,10 @@ void HttpApi::sendLocalSessionProblem(AsyncWebServerRequest *request,
 
 bool HttpApi::beginHeavyLocalOperation(AsyncWebServerRequest *request) {
   const SyncMetrics sync = diagnostics_.syncMetrics();
-  const std::uint32_t free_internal =
-      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const HeapSnapshot heap = heap_telemetry_.snapshot();
+  const std::uint32_t free_internal = heap.free_internal_bytes;
   const std::uint32_t largest_internal =
-      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      heap.largest_internal_block_bytes;
   const bool low_memory = free_internal < kMinimumHeavyUiInternalHeapBytes ||
                           largest_internal <
                               kMinimumHeavyUiLargestBlockBytes;
