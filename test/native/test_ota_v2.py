@@ -186,6 +186,78 @@ class OtaManifestVectorTests(unittest.TestCase):
             "const std::string &failure_code = recovery_.failure_code;", service
         )
 
+    def test_ota_uses_one_bounded_tls_lease_per_transaction(self) -> None:
+        service = (ROOT / "src/ota/OtaService.cpp").read_text(encoding="utf-8")
+        workflow = service[
+            service.index("bool OtaService::applyFromManifestUrl") : service.index(
+                "bool OtaService::parseManifest"
+            )
+        ]
+        self.assertNotIn("OtaMemoryLease", service)
+        self.assertNotIn("OtaTransactionLease", workflow)
+        for function in ("fetchText", "downloadAndApply", "postReport"):
+            start = service.index(f"bool OtaService::{function}")
+            section = service[start : service.find("\nbool OtaService::", start + 1)]
+            self.assertIn("OtaTransactionLease lease", section)
+            self.assertIn("lease.activate", section)
+        flush = service[
+            service.index("bool OtaService::flushPendingReportWithLease") : service.index(
+                "void OtaService::markPendingReportDelivered"
+            )
+        ]
+        self.assertNotIn("for (", flush)
+        self.assertEqual(flush.count("postReport("), 1)
+
+    def test_binary_transport_is_destroyed_before_update_finalization(self) -> None:
+        service = (ROOT / "src/ota/OtaService.cpp").read_text(encoding="utf-8")
+        section = service[
+            service.index("bool OtaService::downloadAndApply") : service.index(
+                "bool OtaService::postReport"
+            )
+        ]
+        destroyed = section.index("Stage::HttpTransportDestroyed")
+        finalize = section.index("Update.end(true)")
+        self.assertLess(destroyed, finalize)
+        self.assertIn(
+            "flash finalization never\n  // competes with a retained HTTP/TLS object graph",
+            section,
+        )
+
+    def test_ota_stream_buffer_is_scoped_internal_memory_not_task_stack(self) -> None:
+        service = (ROOT / "src/ota/OtaService.cpp").read_text(encoding="utf-8")
+        task_config = (ROOT / "include/app/TaskConfig.h").read_text(
+            encoding="utf-8"
+        )
+        section = service[
+            service.index("bool OtaService::downloadAndApply") : service.index(
+                "bool OtaService::postReport"
+            )
+        ]
+        self.assertIn("kOtaStreamBufferBytes = 4096U", service)
+        self.assertIn("MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT", service)
+        self.assertIn("heap_caps_free(data_)", service)
+        self.assertIn('error = "ota_internal_stream_buffer_unavailable"', section)
+        self.assertNotIn("std::array<std::uint8_t, 4096U> buffer", section)
+        self.assertIn("kMaintenanceStackBytes = 16U * 1024U", task_config)
+
+    def test_fault_injection_covers_each_major_ota_stream_boundary(self) -> None:
+        policy = (ROOT / "src/ota/OtaFaultInjection.h").read_text(
+            encoding="utf-8"
+        )
+        service = (ROOT / "src/ota/OtaService.cpp").read_text(encoding="utf-8")
+        for point in (
+            "BeforeFirstByte",
+            "AfterMetadata",
+            "AfterUpdateBegin",
+            "HalfwayThroughDownload",
+            "AfterCompleteDownload",
+            "BeforeUpdateEnd",
+            "AfterUpdateEnd",
+            "BeforeReboot",
+        ):
+            self.assertIn(point, policy)
+            self.assertIn(f"Point::{point}", service)
+
 
 class FirmwareDescriptorTests(unittest.TestCase):
     def test_patch_recomputes_descriptor_checksum_and_appended_sha(self) -> None:

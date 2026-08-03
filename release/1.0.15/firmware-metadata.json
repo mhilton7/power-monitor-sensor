@@ -1,0 +1,16 @@
+{
+  "schema_version": "pm-firmware-artifact/1",
+  "version": "1.0.15",
+  "channel": "canary",
+  "project_name": "power-monitor-sensor",
+  "hardware_target": "esp32-s3",
+  "protocol_version": "pm-protocol/1.0.0",
+  "size_bytes": 1588944,
+  "sha256": "0502ff19bdd7da8e45f7bbbaee9d1f0cd429b7a8d3fd395edd59f21689b9678d",
+  "build_hash": "ba29db57037ad26ac6a50847721d08e30184d8fa5f7569662f7843620f1b4dcb",
+  "build_time": "22:36:45",
+  "build_date": "Aug  3 2026",
+  "ota_authentication_mode": "existing_device_hmac",
+  "ota_protocol_version": 2,
+  "release_notes": "Managed-OTA canary for the repaired transaction-scoped TLS lifecycle, allocation-stable Status endpoint, crash ledger, bounded failure reporting, and server reconciliation workflow. Promote only after the physical canary OTA and short live validation pass."
+}

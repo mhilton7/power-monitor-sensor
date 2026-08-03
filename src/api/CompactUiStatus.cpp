@@ -272,6 +272,15 @@ CompactUiSerializationResult serializeCompactUiStatus(
             writer.boolean(snapshot.ota.rollback_supported) &&
             writer.literal(",\"last_result\":") &&
             writer.string(text(snapshot.ota.last_result)) &&
+            writer.literal(",\"lifecycle_stage\":") &&
+            writer.string(text(snapshot.ota.lifecycle_stage)) &&
+            writer.literal(",\"lifecycle_operation_context\":") &&
+            writer.string(text(snapshot.ota.lifecycle_operation_context)) &&
+            writer.literal(",\"lifecycle_task\":") &&
+            writer.string(text(snapshot.ota.lifecycle_task)) &&
+            writer.literal(",\"lifecycle_stack_high_water_bytes\":") &&
+            writer.unsignedValue(
+                snapshot.ota.lifecycle_stack_high_water_bytes) &&
             writer.literal(",\"rollback_detected\":") &&
             writer.boolean(snapshot.ota.rollback_detected) &&
             writer.literal("}}") &&

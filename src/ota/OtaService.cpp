@@ -16,11 +16,14 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_app_format.h>
+#include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
 
 #include "diagnostics/SerialLogger.h"
 #include "network/ResolvedTlsClient.h"
+#include "ota/OtaFaultInjection.h"
+#include "ota/OtaStageLedger.h"
 #include "ota/OtaUpdatePolicy.h"
 #include "security/Crypto.h"
 #include "version.h"
@@ -29,19 +32,52 @@ namespace pm {
 namespace {
 
 constexpr std::size_t kManifestMaximumBytes = 16U * 1024U;
+constexpr std::size_t kOtaStreamBufferBytes = 4096U;
 constexpr std::size_t kImageMetadataBytes =
     sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) +
     sizeof(esp_app_desc_t);
 constexpr std::uint16_t kEsp32S3ChipId = 9U;
 
-class OtaMemoryLease final {
+// A physical 1.0.13 canary proved that reserving the stream buffer in the
+// long-lived maintenance task stack pushed idle internal DRAM below the TLS
+// admission floor. Keep the exact 4 KiB buffer in internal 8-bit memory (flash
+// writes must not depend on PSRAM while its cache can be unavailable), but
+// own it only for the active binary transaction. It is allocated after TLS
+// admission and destroyed with the transport before Update.end().
+class OtaStreamBuffer final {
 public:
-  explicit OtaMemoryLease(Diagnostics &diagnostics)
+  OtaStreamBuffer()
+      : data_(static_cast<std::uint8_t *>(heap_caps_malloc(
+            kOtaStreamBufferBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))) {}
+  ~OtaStreamBuffer() {
+    if (data_ != nullptr)
+      heap_caps_free(data_);
+  }
+  OtaStreamBuffer(const OtaStreamBuffer &) = delete;
+  OtaStreamBuffer &operator=(const OtaStreamBuffer &) = delete;
+
+  explicit operator bool() const { return data_ != nullptr; }
+  std::uint8_t *data() { return data_; }
+  constexpr std::size_t size() const { return kOtaStreamBufferBytes; }
+
+private:
+  std::uint8_t *data_{nullptr};
+};
+
+class OtaTransactionLease final {
+public:
+  OtaTransactionLease(Diagnostics &diagnostics,
+                      const ota_stage::Stage preparing_stage)
       : diagnostics_(diagnostics),
         acquired_(diagnostics_.acquireHighMemoryOperation(
-            MemoryOperationContext::OtaActive, pdMS_TO_TICKS(5000))) {}
+            MemoryOperationContext::TlsPreparing, pdMS_TO_TICKS(5000))) {
+    if (acquired_) {
+      ota_stage::record(ota_stage::Stage::TransportLeaseAcquired);
+      ota_stage::record(preparing_stage);
+    }
+  }
 
-  ~OtaMemoryLease() {
+  ~OtaTransactionLease() {
     if (acquired_) {
       diagnostics_.releaseHighMemoryOperation();
       static constexpr char kOtaOperation[] =
@@ -54,9 +90,25 @@ public:
 
   explicit operator bool() const { return acquired_; }
 
+  bool activate(const ota_stage::Stage active_stage,
+                const std::uint32_t bytes_received = 0U,
+                const std::uint32_t image_size = 0U) {
+    if (!acquired_ || active_) {
+      return acquired_ && active_;
+    }
+    active_ = diagnostics_.transitionHighMemoryOperation(
+        MemoryOperationContext::TlsPreparing,
+        MemoryOperationContext::TlsActive);
+    if (active_) {
+      ota_stage::record(active_stage, bytes_received, image_size);
+    }
+    return active_;
+  }
+
 private:
   Diagnostics &diagnostics_;
   bool acquired_{false};
+  bool active_{false};
 };
 
 class OtaTransportLifecycle final {
@@ -324,6 +376,11 @@ OtaService::OtaService(ConfigService &config, Diagnostics &diagnostics)
 }
 
 bool OtaService::begin() {
+  const auto &identity = config_.identity();
+  ota_stage::beginBoot(
+      identity.boot_id.c_str(), version::FIRMWARE, runningBuildHash().c_str(),
+      diag::SerialLogger::instance().bootCount(),
+      static_cast<std::uint32_t>(esp_reset_reason()));
   initializePartitionStatus();
   ota_v2::RecoveryRecord recovered;
   if (!recovery_store_.load(recovered))
@@ -347,6 +404,11 @@ bool OtaService::begin() {
   xSemaphoreGive(mutex_);
 
   if (recovered.pending_reboot) {
+    ota_stage::bindDeployment(recovered.deployment_id.c_str(),
+                              recovered.attempt);
+    ota_stage::record(ota_stage::Stage::PostBootImageDetected,
+                      recovered.bytes_received, recovered.image_size, false,
+                      recovered.pending_reboot);
     const bool running_pending = runningImagePendingVerification();
     const std::string running_build_hash = runningBuildHash();
     const ota_v2::PostBootAction action = ota_v2::classifyPostBoot(
@@ -367,6 +429,8 @@ bool OtaService::begin() {
                  "installed_and_verified_recovered", {}, true);
       }
     } else if (action == ota_v2::PostBootAction::ReportRollback) {
+      ota_stage::record(ota_stage::Stage::RollbackDetected,
+                        recovered.bytes_received, recovered.image_size);
       if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
         status_.rollback_detected = true;
         status_.pending_reboot = false;
@@ -429,6 +493,8 @@ bool OtaService::checkRunningImage(const bool health_checks_passed) {
     }
     setState(ota_v2::State::Validated, "installed_and_verified", {}, true);
     report_pending_.store(true, std::memory_order_release);
+    ota_stage::record(ota_stage::Stage::PostBootValidated,
+                      recovery_.bytes_received, recovery_.image_size);
     PM_LOG_INFO("OTA", "POST_BOOT_VALIDATED",
                 "version=%s build_hash=%s rollback_cancelled=true",
                 version::FIRMWARE, runningBuildHash().c_str());
@@ -463,6 +529,7 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     std::atomic<bool> &flag;
     ~ProgressRelease() { flag.store(false, std::memory_order_release); }
   } progress_release{in_progress_};
+  ota_stage::record(ota_stage::Stage::WorkflowLockAcquired);
 
   const RuntimeConfig active_config = config_.config();
   if (config_.safeMode()) {
@@ -473,12 +540,6 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
 
   bool install_ready = false;
   {
-    OtaMemoryLease lease(diagnostics_);
-    if (!lease) {
-      setState(ota_v2::State::WaitingForResources, "waiting_for_resources",
-               "ota_high_memory_lease_unavailable", false);
-      return false;
-    }
     setState(ota_v2::State::ManifestCheck, "manifest_check", {}, false);
     std::string manifest_json;
     std::string error;
@@ -486,6 +547,7 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
       setState(ota_v2::State::Failed, "failed", error, false);
       return false;
     }
+    ota_stage::record(ota_stage::Stage::ManifestResponseReceived);
     if (unavailableManifest(manifest_json)) {
       setState(ota_v2::State::ManifestUnavailable, "current", {}, false);
       return false;
@@ -496,6 +558,7 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
                false);
       return false;
     }
+    ota_stage::record(ota_stage::Stage::ManifestParsed);
 
     setState(ota_v2::State::ManifestReceived, "manifest_received", {}, false);
     if (!verifyManifest(manifest, error)) {
@@ -543,6 +606,7 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     recovery_.image_size = manifest.size_bytes;
     recovery_.attempt = manifest.attempt;
     recovery_.last_report_state = last_report_state;
+    ota_stage::bindDeployment(manifest.deployment_id.c_str(), manifest.attempt);
     if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
       status_.deployment_id = manifest.deployment_id;
       status_.release_id = manifest.release_id;
@@ -559,7 +623,10 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     }
     setState(ota_v2::State::ManifestAuthenticated,
              "manifest_authenticated", {}, true);
-    (void)flushPendingReportWithLease();
+    ota_stage::record(ota_stage::Stage::ManifestAuthenticated);
+    if (flushPendingReportWithLease()) {
+      ota_stage::record(ota_stage::Stage::ManifestMilestoneReported);
+    }
 
     if (!withinUpdateWindow(active_config)) {
       setState(ota_v2::State::WaitingForSchedule, "waiting_for_schedule",
@@ -567,13 +634,21 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
       return false;
     }
     setState(ota_v2::State::DownloadStarting, "download_starting", {}, true);
-    (void)flushPendingReportWithLease();
+    if (flushPendingReportWithLease()) {
+      ota_stage::record(ota_stage::Stage::DownloadMilestoneReported, 0U,
+                        manifest.size_bytes);
+    }
     if (!downloadAndApply(manifest, error)) {
       setState(ota_v2::State::Failed, "failed", error, true);
       (void)flushPendingReportWithLease();
       return false;
     }
+    // All stream/TLS/Update objects have been destroyed before durable state
+    // and report catch-up touch Preferences or begin another TLS session.
+    setState(ota_v2::State::PartitionWritten, "partition_written", {}, true);
     (void)flushPendingReportWithLease();
+    ota_stage::record(ota_stage::Stage::RecoveryRecordPersisted,
+                      status().bytes_received, status().image_size);
     if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
       status_.pending_reboot = true;
       status_.progress_percent = 100U;
@@ -581,8 +656,22 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     }
     setState(ota_v2::State::RebootPending, "verified_pending_reboot", {},
              true);
+    if (flushPendingReportWithLease()) {
+      ota_stage::record(ota_stage::Stage::RebootMilestoneReported,
+                        status().bytes_received, status().image_size, false,
+                        true);
+    }
     setState(ota_v2::State::Rebooting, "rebooting", {}, true);
     (void)flushPendingReportWithLease();
+    ota_stage::record(ota_stage::Stage::RebootScheduled,
+                      status().bytes_received, status().image_size, false,
+                      true);
+    if (ota_fault::configured(ota_fault::Point::BeforeReboot)) {
+      setState(ota_v2::State::Failed, "fault_injected",
+               ota_fault::failureCode(ota_fault::Point::BeforeReboot), true,
+               false);
+      return false;
+    }
     install_ready = true;
   }
 
@@ -659,6 +748,8 @@ OtaStatus OtaService::status() const {
 
 CompactOtaStatus OtaService::compactStatus() const {
   const OtaStatus snapshot = status();
+  const ota_stage::Snapshot lifecycle = ota_stage::current();
+  const ota_stage::Snapshot previous = ota_stage::previousBoot();
   CompactOtaStatus compact;
   compact.protocol_version =
       static_cast<std::uint8_t>(snapshot.protocol_version);
@@ -669,6 +760,13 @@ CompactOtaStatus OtaService::compactStatus() const {
   compact.pending_reboot = snapshot.pending_reboot;
   compact.rollback_supported = snapshot.rollback_supported;
   compact.rollback_detected = snapshot.rollback_detected;
+  compact.lifecycle_stack_high_water_bytes =
+      lifecycle.task_stack_high_water_bytes;
+  compact.previous_boot_bytes_received = previous.bytes_received;
+  compact.previous_boot_attempt = previous.attempt;
+  compact.previous_boot_reset_reason_code = previous.reset_reason_code;
+  compact.previous_boot_update_open = previous.update_open;
+  compact.previous_boot_reboot_expected = previous.reboot_expected;
   compact.truncated =
       !copyCompact(compact.authentication_mode,
                    snapshot.authentication_mode) ||
@@ -678,7 +776,23 @@ CompactOtaStatus OtaService::compactStatus() const {
       !copyCompact(compact.target_sha256, snapshot.target_sha256) ||
       !copyCompact(compact.running_partition, snapshot.running_partition) ||
       !copyCompact(compact.target_partition, snapshot.target_partition) ||
-      !copyCompact(compact.last_result, snapshot.last_result);
+      !copyCompact(compact.last_result, snapshot.last_result) ||
+      !copyCompact(compact.lifecycle_stage,
+                   ota_stage::stageName(lifecycle.stage)) ||
+      !copyCompact(compact.lifecycle_operation_context,
+                   lifecycle.operation_context.data()) ||
+      !copyCompact(compact.lifecycle_task, lifecycle.current_task.data()) ||
+      !copyCompact(compact.previous_boot_stage,
+                   ota_stage::stageName(previous.stage)) ||
+      !copyCompact(compact.previous_boot_id, previous.boot_id.data()) ||
+      !copyCompact(compact.previous_boot_firmware,
+                   previous.firmware_version.data()) ||
+      !copyCompact(compact.previous_boot_build_hash,
+                   previous.build_hash.data()) ||
+      !copyCompact(compact.previous_boot_deployment_id,
+                   previous.deployment_id.data()) ||
+      !copyCompact(compact.previous_boot_last_error,
+                   previous.last_error.data());
   return compact;
 }
 
@@ -688,11 +802,7 @@ bool OtaService::rollbackAndReboot() {
     return false;
   setState(ota_v2::State::RolledBack, "manual_rollback", {}, true);
   report_pending_.store(true, std::memory_order_release);
-  {
-    OtaMemoryLease lease(diagnostics_);
-    if (lease)
-      (void)flushPendingReportWithLease();
-  }
+  (void)flushPendingReportWithLease();
   return esp_ota_mark_app_invalid_rollback_and_reboot() == ESP_OK;
 }
 
@@ -715,26 +825,22 @@ bool OtaService::hasPendingReport() const {
 bool OtaService::flushPendingReport() {
   if (!hasPendingReport())
     return true;
-  OtaMemoryLease lease(diagnostics_);
-  if (!lease)
-    return false;
   return flushPendingReportWithLease();
 }
 
 bool OtaService::flushPendingReportWithLease() {
-  for (std::size_t count = 0U; count < 10U; ++count) {
-    const char *desired = ota_v2::reportMilestoneForState(recovery_.state);
-    const char *next =
-        ota_v2::nextReportMilestone(recovery_.last_report_state, desired);
-    if (next == nullptr) {
-      report_pending_.store(false, std::memory_order_release);
-      return true;
-    }
-    std::string error;
-    if (!postReport(next, error))
-      return false;
+  const char *desired = ota_v2::reportMilestoneForState(recovery_.state);
+  const char *next =
+      ota_v2::nextReportMilestone(recovery_.last_report_state, desired);
+  if (next == nullptr) {
+    report_pending_.store(false, std::memory_order_release);
+    return true;
   }
-  return false;
+  // One call performs exactly one HTTPS transaction. Catch-up is deliberately
+  // spread across maintenance iterations (or explicit workflow checkpoints),
+  // so no report burst overlaps the binary stream or retains TLS allocations.
+  std::string error;
+  return postReport(next, error);
 }
 
 void OtaService::markPendingReportDelivered() {
@@ -826,6 +932,12 @@ bool OtaService::fetchText(const std::string &url, std::string &body,
     error = "ota_dns_resolution_failed";
     return false;
   }
+  OtaTransactionLease lease(diagnostics_,
+                            ota_stage::Stage::ManifestPreparing);
+  if (!lease) {
+    error = "ota_high_memory_lease_unavailable";
+    return false;
+  }
   OtaTransportLifecycle lifecycle(diagnostics_, target);
   ResolvedTlsClient client;
   if (!configureTls(client, active_config.server_ca_pem)) {
@@ -843,6 +955,10 @@ bool OtaService::fetchText(const std::string &url, std::string &body,
     return false;
   }
   lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
+  if (!lease.activate(ota_stage::Stage::ManifestRequest)) {
+    error = "ota_tls_context_transition_failed";
+    return false;
+  }
   const int http_status = http.GET();
   lifecycle.record(TlsLifecycleStage::AfterRequest);
   const int content_length = http.getSize();
@@ -910,6 +1026,34 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     xSemaphoreGive(mutex_);
   }
 
+  std::uint32_t received = 0U;
+  bool update_open = false;
+  bool extra_bytes = false;
+  bool protocol_seen = false;
+  std::size_t protocol_index = 0U;
+  ota_v2::StreamTracker stream_tracker(manifest.size_bytes);
+  crypto::Key32 digest{};
+  const auto failUpdate = [&update_open]() {
+    if (update_open) {
+      Update.abort();
+      update_open = false;
+    }
+  };
+  const auto scanProtocol = [&protocol_index, &protocol_seen](
+                                const std::uint8_t *data,
+                                const std::size_t length) {
+    static constexpr char marker[] = PM_PROTOCOL_VERSION;
+    for (std::size_t index = 0U; index < length && !protocol_seen; ++index) {
+      const char byte = static_cast<char>(data[index]);
+      if (byte == marker[protocol_index]) {
+        ++protocol_index;
+        protocol_seen = protocol_index == sizeof(marker) - 1U;
+      } else {
+        protocol_index = byte == marker[0] ? 1U : 0U;
+      }
+    }
+  };
+
   std::string hostname;
   std::uint16_t port = 443U;
   IPAddress address;
@@ -917,6 +1061,16 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
   if (!resolveHttpsTarget(image_url, hostname, port, address,
                           resolution_method)) {
     error = "ota_dns_resolution_failed";
+    return false;
+  }
+  // The transport objects and their high-memory lease live only inside this
+  // scope. Update.end() runs after the scope so flash finalization never
+  // competes with a retained HTTP/TLS object graph.
+  {
+  OtaTransactionLease lease(diagnostics_,
+                            ota_stage::Stage::DownloadPreparing);
+  if (!lease) {
+    error = "ota_high_memory_lease_unavailable";
     return false;
   }
   OtaTransportLifecycle lifecycle(diagnostics_, target);
@@ -936,6 +1090,11 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     return false;
   }
   lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
+  if (!lease.activate(ota_stage::Stage::FirmwareRequest, 0U,
+                      manifest.size_bytes)) {
+    error = "ota_tls_context_transition_failed";
+    return false;
+  }
   const int http_status = http.GET();
   lifecycle.record(TlsLifecycleStage::AfterRequest);
   const int content_length = http.getSize();
@@ -944,12 +1103,19 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     error = "ota_image_size_or_status_invalid";
     return false;
   }
+  ota_stage::record(ota_stage::Stage::FirmwareResponseHeaders, 0U,
+                    manifest.size_bytes);
   WiFiClient *stream = http.getStreamPtr();
   if (stream == nullptr) {
     error = "ota_image_stream_unavailable";
     return false;
   }
-  setState(ota_v2::State::Downloading, "downloading", {}, true);
+  // DownloadStarting was persisted before this request. Avoid Preferences,
+  // JSON and flash metadata churn while mbedTLS and Update own scarce DRAM;
+  // the RTC ledger below is the crash-safe streaming evidence.
+  setState(ota_v2::State::Downloading, "downloading", {}, false);
+  ota_stage::record(ota_stage::Stage::ImageMetadataReceived, 0U,
+                    manifest.size_bytes);
 
   std::array<std::uint8_t, kImageMetadataBytes> metadata{};
   std::size_t metadata_received = 0U;
@@ -979,40 +1145,37 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
   if (!validateImageMetadata(metadata, manifest, error)) {
     return false;
   }
+  ota_stage::record(ota_stage::Stage::ImageMetadataValidated, 0U,
+                    manifest.size_bytes);
+  if (ota_fault::configured(ota_fault::Point::AfterMetadata)) {
+    error = ota_fault::failureCode(ota_fault::Point::AfterMetadata);
+    return false;
+  }
+  OtaStreamBuffer stream_buffer;
+  if (!stream_buffer) {
+    error = "ota_internal_stream_buffer_unavailable";
+    return false;
+  }
   if (!Update.begin(manifest.size_bytes, U_FLASH)) {
     error = "ota_partition_unavailable";
+    return false;
+  }
+  update_open = true;
+  ota_stage::record(ota_stage::Stage::UpdateBeginCompleted,
+                    static_cast<std::uint32_t>(metadata.size()),
+                    manifest.size_bytes, true);
+  if (ota_fault::configured(ota_fault::Point::AfterUpdateBegin)) {
+    error = ota_fault::failureCode(ota_fault::Point::AfterUpdateBegin);
+    Update.abort();
+    update_open = false;
     return false;
   }
 
   mbedtls_sha256_context hash;
   mbedtls_sha256_init(&hash);
   mbedtls_sha256_starts_ret(&hash, 0);
-  std::size_t protocol_index = 0U;
-  bool protocol_seen = false;
-  const auto scanProtocol = [&protocol_index, &protocol_seen](
-                                const std::uint8_t *data,
-                                const std::size_t length) {
-    static constexpr char marker[] = PM_PROTOCOL_VERSION;
-    for (std::size_t index = 0U; index < length && !protocol_seen; ++index) {
-      const char byte = static_cast<char>(data[index]);
-      if (byte == marker[protocol_index]) {
-        ++protocol_index;
-        protocol_seen = protocol_index == sizeof(marker) - 1U;
-      } else {
-        protocol_index = byte == marker[0] ? 1U : 0U;
-      }
-    }
-  };
-
-  bool update_open = true;
-  ota_v2::StreamTracker stream_tracker(manifest.size_bytes);
-  const auto failUpdate = [&update_open]() {
-    if (update_open) {
-      Update.abort();
-      update_open = false;
-    }
-  };
   const bool metadata_written =
+      !ota_fault::configured(ota_fault::Point::BeforeFirstByte) &&
       Update.write(metadata.data(), metadata.size()) == metadata.size();
   if (!stream_tracker.accept(metadata.size(), metadata_written)) {
     error = ota_v2::streamFailureCode(stream_tracker.failure());
@@ -1022,8 +1185,10 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
   }
   mbedtls_sha256_update_ret(&hash, metadata.data(), metadata.size());
   scanProtocol(metadata.data(), metadata.size());
-  std::uint32_t received = static_cast<std::uint32_t>(metadata.size());
-  std::array<std::uint8_t, 4096U> buffer{};
+  received = static_cast<std::uint32_t>(metadata.size());
+  ota_stage::record(ota_stage::Stage::FirstBytesWritten, received,
+                    manifest.size_bytes, true);
+  bool halfway_fault_checked = false;
   while (received < manifest.size_bytes) {
     const int available = stream->available();
     if (available <= 0) {
@@ -1041,13 +1206,13 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
       continue;
     }
     const std::size_t wanted = std::min<std::size_t>(
-        buffer.size(), std::min<std::uint32_t>(
+        stream_buffer.size(), std::min<std::uint32_t>(
                            static_cast<std::uint32_t>(available),
                            manifest.size_bytes - received));
-    const int count = stream->readBytes(buffer.data(), wanted);
+    const int count = stream->readBytes(stream_buffer.data(), wanted);
     const bool written =
         count > 0 &&
-        Update.write(buffer.data(), static_cast<std::size_t>(count)) ==
+        Update.write(stream_buffer.data(), static_cast<std::size_t>(count)) ==
             static_cast<std::size_t>(count);
     if (count <= 0 ||
         !stream_tracker.accept(count > 0 ? static_cast<std::size_t>(count) : 0U,
@@ -1058,11 +1223,27 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
       mbedtls_sha256_free(&hash);
       return false;
     }
-    mbedtls_sha256_update_ret(&hash, buffer.data(),
+    mbedtls_sha256_update_ret(&hash, stream_buffer.data(),
                               static_cast<std::size_t>(count));
-    scanProtocol(buffer.data(), static_cast<std::size_t>(count));
+    scanProtocol(stream_buffer.data(), static_cast<std::size_t>(count));
     received += static_cast<std::uint32_t>(count);
+    if (!halfway_fault_checked && received >= manifest.size_bytes / 2U) {
+      halfway_fault_checked = true;
+      if (ota_fault::configured(
+              ota_fault::Point::HalfwayThroughDownload)) {
+        error = ota_fault::failureCode(
+            ota_fault::Point::HalfwayThroughDownload);
+        failUpdate();
+        mbedtls_sha256_free(&hash);
+        return false;
+      }
+    }
     last_progress_ms = millis();
+    if ((received & 0xFFFFU) < static_cast<std::uint32_t>(count) ||
+        received == manifest.size_bytes) {
+      ota_stage::record(ota_stage::Stage::Streaming, received,
+                        manifest.size_bytes, true);
+    }
     if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
       status_.bytes_received = received;
       status_.progress_percent = static_cast<std::uint8_t>(
@@ -1072,12 +1253,23 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     }
   }
   vTaskDelay(pdMS_TO_TICKS(2));
-  const bool extra_bytes = stream->available() > 0;
-  crypto::Key32 digest{};
+  extra_bytes = stream->available() > 0;
   mbedtls_sha256_finish_ret(&hash, digest.data());
   mbedtls_sha256_free(&hash);
+  ota_stage::record(ota_stage::Stage::ShaFinalized, received,
+                    manifest.size_bytes, true);
+  ota_stage::record(ota_stage::Stage::StreamComplete, received,
+                    manifest.size_bytes, true);
+  if (ota_fault::configured(ota_fault::Point::AfterCompleteDownload)) {
+    error = ota_fault::failureCode(ota_fault::Point::AfterCompleteDownload);
+    failUpdate();
+    return false;
+  }
   cleanup.end();
-  setState(ota_v2::State::BinaryVerifying, "binary_verifying", {}, true);
+  }
+  ota_stage::record(ota_stage::Stage::HttpTransportDestroyed, received,
+                    manifest.size_bytes, true, false, "ota_active");
+  setState(ota_v2::State::BinaryVerifying, "binary_verifying", {}, false);
   const std::string received_hash =
       crypto::hexEncode(digest.data(), digest.size());
   digest.fill(0U);
@@ -1093,14 +1285,36 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     failUpdate();
     return false;
   }
-  setState(ota_v2::State::PartitionWriting, "partition_writing", {}, true);
+  ota_stage::record(ota_stage::Stage::HashVerified, received,
+                    manifest.size_bytes, true);
+  ota_stage::record(ota_stage::Stage::ProtocolMarkerVerified, received,
+                    manifest.size_bytes, true);
+  setState(ota_v2::State::PartitionWriting, "partition_writing", {}, false);
+  ota_stage::record(ota_stage::Stage::UpdateEndBeginning, received,
+                    manifest.size_bytes, true);
+  if (ota_fault::configured(ota_fault::Point::BeforeUpdateEnd)) {
+    error = ota_fault::failureCode(ota_fault::Point::BeforeUpdateEnd);
+    failUpdate();
+    return false;
+  }
   if (!Update.end(true) || !Update.isFinished()) {
     update_open = false;
     error = "ota_finalize_failed";
     return false;
   }
   update_open = false;
-  setState(ota_v2::State::PartitionWritten, "partition_written", {}, true);
+  ota_stage::record(ota_stage::Stage::UpdateEndCompleted, received,
+                    manifest.size_bytes, false, true);
+  ota_stage::record(ota_stage::Stage::BootPartitionSelected, received,
+                    manifest.size_bytes, false, true);
+  if (ota_fault::configured(ota_fault::Point::AfterUpdateEnd)) {
+    (void)esp_ota_set_boot_partition(esp_ota_get_running_partition());
+    error = ota_fault::failureCode(ota_fault::Point::AfterUpdateEnd);
+    return false;
+  }
+  ota_stage::record(ota_stage::Stage::PartitionWritten, received,
+                    manifest.size_bytes, false, true);
+  setState(ota_v2::State::PartitionWritten, "partition_written", {}, false);
   return true;
 }
 
@@ -1126,6 +1340,11 @@ bool OtaService::postReport(const char *report_state, std::string &error) {
     error = "ota_report_dns_failed";
     return false;
   }
+  OtaTransactionLease lease(diagnostics_, ota_stage::Stage::ReportPreparing);
+  if (!lease) {
+    error = "ota_high_memory_lease_unavailable";
+    return false;
+  }
   OtaTransportLifecycle lifecycle(diagnostics_, endpoint);
   ResolvedTlsClient client;
   if (!configureTls(client, active_config.server_ca_pem)) {
@@ -1143,6 +1362,11 @@ bool OtaService::postReport(const char *report_state, std::string &error) {
     return false;
   }
   lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
+  if (!lease.activate(ota_stage::Stage::ReportRequest,
+                      status().bytes_received, status().image_size)) {
+    error = "ota_tls_context_transition_failed";
+    return false;
+  }
   http.addHeader("Content-Type", "application/json");
   const int response = http.POST(
       reinterpret_cast<std::uint8_t *>(const_cast<char *>(body.data())),
@@ -1209,8 +1433,29 @@ void OtaService::setState(const ota_v2::State state,
     pending_reboot = status_.pending_reboot;
     xSemaphoreGive(mutex_);
   }
-  if (persist)
-    (void)persistState(state, error, pending_reboot);
+  bool persisted = false;
+  if (persist) {
+    persisted = persistState(state, error, pending_reboot);
+    if (persisted) {
+      const OtaStatus snapshot = status();
+      ota_stage::record(ota_stage::Stage::RecoveryRecordPersisted,
+                        snapshot.bytes_received, snapshot.image_size,
+                        state == ota_v2::State::Downloading ||
+                            state == ota_v2::State::BinaryVerifying ||
+                            state == ota_v2::State::PartitionWriting,
+                        pending_reboot);
+    }
+  }
+  if (state == ota_v2::State::Failed ||
+      state == ota_v2::State::ManifestRejected ||
+      state == ota_v2::State::RolledBack) {
+    const OtaStatus snapshot = status();
+    ota_stage::recordFailure(error.empty() ? result.c_str() : error.c_str(),
+                             snapshot.bytes_received, snapshot.image_size,
+                             state == ota_v2::State::Downloading ||
+                                 state == ota_v2::State::BinaryVerifying ||
+                                 state == ota_v2::State::PartitionWriting);
+  }
   if (report && persist && state != ota_v2::State::Idle &&
       state != ota_v2::State::ManifestUnavailable) {
     report_pending_.store(true, std::memory_order_release);

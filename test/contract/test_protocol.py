@@ -1016,12 +1016,18 @@ class ProtocolContractTests(unittest.TestCase):
             '"ota_manifest_hmac_invalid"',
             "validateImageMetadata",
             "StreamTracker",
-            "MemoryOperationContext::OtaActive",
+            "MemoryOperationContext::TlsPreparing",
+            "MemoryOperationContext::TlsActive",
             "postReport",
             "esp_ota_mark_app_invalid_rollback_and_reboot",
             '"ota_server_origin_required"',
         ):
             self.assertIn(marker, ota_source)
+        self.assertNotIn(
+            "acquireHighMemoryOperation(\n            MemoryOperationContext::OtaActive",
+            ota_source,
+            "the OTA workflow lock must not retain a broad TLS-memory lease",
+        )
         self.assertNotIn("setInsecure(", ota_source)
         self.assertIn(
             'document["firmware_release_available"].as<bool>()', sync_source

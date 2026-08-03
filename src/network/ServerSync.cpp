@@ -28,6 +28,7 @@
 #include "network/ResolvedTlsClient.h"
 #include "ota/OtaManifestV2.h"
 #include "ota/OtaService.h"
+#include "ota/OtaStageLedger.h"
 #include "security/Crypto.h"
 #include "version.h"
 
@@ -3259,6 +3260,35 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
   JsonObject resources = document["resources"].to<JsonObject>();
   resources["free_heap_bytes"] = ESP.getFreeHeap();
   resources["minimum_free_heap_bytes"] = ESP.getMinFreeHeap();
+  const ota_stage::Snapshot ota_current = ota_stage::current();
+  const ota_stage::Snapshot ota_previous = ota_stage::previousBoot();
+  JsonObject ota_recovery = resources["ota_recovery"].to<JsonObject>();
+  ota_recovery["stage"] = ota_stage::stageName(ota_current.stage);
+  ota_recovery["bytes_received"] = ota_current.bytes_received;
+  ota_recovery["image_size"] = ota_current.image_size;
+  ota_recovery["stack_high_water_bytes"] =
+      ota_current.task_stack_high_water_bytes;
+  ota_recovery["operation_context"] = ota_current.operation_context.data();
+  ota_recovery["current_task"] = ota_current.current_task.data();
+  ota_recovery["previous_boot_stage"] =
+      ota_stage::stageName(ota_previous.stage);
+  ota_recovery["previous_boot_id"] = ota_previous.boot_id.data();
+  ota_recovery["previous_boot_firmware_version"] =
+      ota_previous.firmware_version.data();
+  ota_recovery["previous_boot_build_hash"] =
+      ota_previous.build_hash.data();
+  ota_recovery["previous_boot_deployment_id"] =
+      ota_previous.deployment_id.data();
+  ota_recovery["previous_boot_attempt"] = ota_previous.attempt;
+  ota_recovery["previous_boot_reset_reason_code"] =
+      ota_previous.reset_reason_code;
+  ota_recovery["previous_boot_last_error"] =
+      ota_previous.last_error.data();
+  ota_recovery["previous_boot_bytes_received"] =
+      ota_previous.bytes_received;
+  ota_recovery["previous_boot_update_open"] = ota_previous.update_open;
+  ota_recovery["previous_boot_reboot_expected"] =
+      ota_previous.reboot_expected;
   JsonObject synchronization = resources["synchronization"].to<JsonObject>();
   synchronization["last_heartbeat_result"] = metrics_.last_heartbeat_result;
   synchronization["last_local_deferral_reason"] =

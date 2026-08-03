@@ -228,6 +228,16 @@ class RepositoryHotPathPolicyTests(unittest.TestCase):
     def test_compact_status_route_obeys_repository_policy(self) -> None:
         self.assertEqual(check(ROOT), [])
 
+    def test_status_response_objects_use_bounded_storage(self) -> None:
+        source = (ROOT / "src" / "api" / "HttpApi.cpp").read_text(
+            encoding="utf-8"
+        )
+        handler = status_handler(source)
+        self.assertIn("ui_status_response_objects.acquire()", handler)
+        self.assertIn("new (response_storage)", handler)
+        self.assertNotIn("new (std::nothrow)", handler)
+        self.assertIn("ui_status_response_objects.release(pointer)", source)
+
     def test_prebuilt_mbedtls_limit_and_bounded_alternative_are_explicit(self) -> None:
         document = (ROOT / "docs" / "MEMORY_AND_FRAGMENTATION.md").read_text(
             encoding="utf-8"

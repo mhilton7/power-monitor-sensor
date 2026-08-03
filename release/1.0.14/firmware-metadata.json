@@ -1,0 +1,16 @@
+{
+  "schema_version": "pm-firmware-artifact/1",
+  "version": "1.0.14",
+  "channel": "canary",
+  "project_name": "power-monitor-sensor",
+  "hardware_target": "esp32-s3",
+  "protocol_version": "pm-protocol/1.0.0",
+  "size_bytes": 1588944,
+  "sha256": "e20cb1f1f8be392cff2f533f54125fcbca3bc6cca83f402b7c5caeda3b7d5a60",
+  "build_hash": "bec8e10c5e88553a3c06b027473dc6b69e79d60e1242ab543febed0fe7a1b09e",
+  "build_time": "22:26:26",
+  "build_date": "Aug  3 2026",
+  "ota_authentication_mode": "existing_device_hmac",
+  "ota_protocol_version": 2,
+  "release_notes": "Physical 1.0.13 canary correction: restore idle TLS reserve with a bounded 16 KiB OTA task and scoped internal 4 KiB flash-write buffer; retain transaction-scoped TLS, crash ledger, bounded status responses, and server reconciliation."
+}

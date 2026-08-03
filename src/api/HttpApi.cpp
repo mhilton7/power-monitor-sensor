@@ -1,6 +1,7 @@
 #include "api/HttpApi.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -48,6 +49,42 @@ constexpr char kStatusSerializationProblem[] =
     "\"detail\":\"The compact status snapshot could not be produced within "
     "its fixed memory bound.\",\"code\":\"status_snapshot_unavailable\"}";
 
+template <std::size_t SlotCount, std::size_t SlotSize>
+class FixedResponseObjectPool {
+public:
+  void *acquire() {
+    for (auto &slot : slots_) {
+      bool expected = false;
+      if (slot.in_use.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
+        return slot.storage.data();
+      }
+    }
+    return nullptr;
+  }
+
+  void release(void *pointer) {
+    for (auto &slot : slots_) {
+      if (pointer == slot.storage.data()) {
+        slot.in_use.store(false, std::memory_order_release);
+        return;
+      }
+    }
+  }
+
+private:
+  struct Slot {
+    alignas(std::max_align_t) std::array<std::byte, SlotSize> storage{};
+    std::atomic<bool> in_use{false};
+  };
+  std::array<Slot, SlotCount> slots_{};
+};
+
+FixedResponseObjectPool<kUiStatusResponseSlots, 512U>
+    ui_status_response_objects;
+FixedResponseObjectPool<kLocalHealthResponseSlots, 256U>
+    local_health_response_objects;
+
 void sendStaticStatusProblem(AsyncWebServerRequest *request,
                              const char *body, const std::size_t length) {
   AsyncWebServerResponse *response = request->beginResponse(
@@ -82,6 +119,13 @@ public:
     // not strand a lease.
     lease_.release();
     diagnostics_.recordUiStatusResponseObjectRelease();
+  }
+
+  static void operator delete(void *pointer) noexcept {
+    ui_status_response_objects.release(pointer);
+  }
+  static void operator delete(void *pointer, std::size_t) noexcept {
+    ui_status_response_objects.release(pointer);
   }
 
   bool _sourceValid() const override {
@@ -120,6 +164,13 @@ public:
   }
 
   ~PooledLocalHealthResponse() override { lease_.release(); }
+
+  static void operator delete(void *pointer) noexcept {
+    local_health_response_objects.release(pointer);
+  }
+  static void operator delete(void *pointer, std::size_t) noexcept {
+    local_health_response_objects.release(pointer);
+  }
 
   bool _sourceValid() const override {
     return static_cast<bool>(lease_) && lease_.size() == _contentLength;
@@ -1207,14 +1258,15 @@ void HttpApi::registerReadRoutes() {
         }
         const HeapSnapshot heap_after_serialization =
             heap_telemetry_.snapshot();
-        AsyncWebServerResponse *response = new (std::nothrow)
-            PooledUiStatusResponse(std::move(response_slot), diagnostics_);
-        if (response == nullptr) {
+        void *response_storage = ui_status_response_objects.acquire();
+        if (response_storage == nullptr) {
           diagnostics_.recordUiStatusDynamicAllocationFailure();
           sendStaticStatusProblem(request, kStatusSerializationProblem,
                                   sizeof(kStatusSerializationProblem) - 1U);
           return;
         }
+        AsyncWebServerResponse *response = new (response_storage)
+            PooledUiStatusResponse(std::move(response_slot), diagnostics_);
         const HeapSnapshot heap_after_response = heap_telemetry_.snapshot();
         diagnostics_.recordUiStatusResponse(
             serialized.bytes, heap_before.largest_internal_block_bytes,
@@ -1770,15 +1822,16 @@ void HttpApi::registerReadRoutes() {
                                   sizeof(kStatusSerializationProblem) - 1U);
           return;
         }
-        auto *response = new (std::nothrow)
-            PooledLocalHealthResponse(std::move(response_slot));
-        if (response == nullptr) {
+        void *response_storage = local_health_response_objects.acquire();
+        if (response_storage == nullptr) {
           response_slot.release();
           diagnostics_.recordLocalResponseAllocationFailure();
           sendStaticStatusProblem(request, kStatusCapacityProblem,
                                   sizeof(kStatusCapacityProblem) - 1U);
           return;
         }
+        auto *response = new (response_storage)
+            PooledLocalHealthResponse(std::move(response_slot));
         diagnostics_.recordHttpStatus(200);
         request->send(response);
         if (diag::SerialLogger::instance().allow("webui_health", 30'000U)) {

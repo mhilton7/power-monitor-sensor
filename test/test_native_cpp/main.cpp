@@ -30,6 +30,7 @@
 #include "network/ServerSyncPolicy.h"
 #include "network/ServerSyncScratch.h"
 #include "ota/OtaManifestV2.h"
+#include "ota/OtaFaultInjection.h"
 #include "ota/OtaUpdatePolicy.h"
 #include "security/AuthPolicy.h"
 #include "security/AuthReplayWindow.h"
@@ -1139,6 +1140,26 @@ void testMemoryPressurePolicy() {
                     .tls_transient_minimum_free_internal_bytes ==
                 28U * 1024U,
         "a 28-KiB TLS transient is measured without becoming persistent low memory");
+  pm::MemoryPressurePolicy incident_policy;
+  update = incident_policy.update(30'100U, 15'092U, 1'000U,
+                                  pm::MemoryOperationContext::TlsActive);
+  check(update.current == pm::MemoryPressureState::Normal && !update.changed &&
+            incident_policy.metrics(1'000U)
+                    .tls_transient_minimum_free_internal_bytes == 30'100U,
+        "the physical 30,100/15,092 active-TLS sample remains transient evidence");
+  update = incident_policy.update(75'848U, 34'804U, 5'000U,
+                                  pm::MemoryOperationContext::Idle, true,
+                                  1'000U);
+  check((update.current == pm::MemoryPressureState::Normal ||
+         update.current == pm::MemoryPressureState::Recovering) &&
+            pm::memoryTlsReady(75'848U, 34'804U),
+        "the physical 75,848/34,804 idle sample is TLS-ready recovery evidence");
+  pm::MemoryPressurePolicy incident_fragmentation_policy;
+  update = incident_fragmentation_policy.update(
+      74'244U, 27'636U, 1'000U, pm::MemoryOperationContext::Idle);
+  check(update.current == pm::MemoryPressureState::Fragmented &&
+            !pm::memoryPressureIsLowMemory(update.current),
+        "the physical 74,244/27,636 idle sample is fragmentation, not low total memory");
   update = emergency_policy.update(28U * 1024U, 12U * 1024U, 5'000U,
                                    pm::MemoryOperationContext::Idle, true,
                                    1'000U);
@@ -1838,7 +1859,7 @@ void testBoundedStatusAuthorizationAndResponsePath() {
       "index-hash", "script-hash", "style-hash"};
   pm::StatusResponsePool<2U, 2048U> pool;
   bool stable = true;
-  for (std::size_t poll = 0U; poll < 10'000U; ++poll) {
+  for (std::size_t poll = 0U; poll < 100'000U; ++poll) {
     const auto request_session = pm::parseBoundedCookie<64U>(
         cookies, sizeof(cookies) - 1U, "pm_session");
     auto response = pool.acquire();
@@ -1848,7 +1869,7 @@ void testBoundedStatusAuthorizationAndResponsePath() {
              serialized.success && response.setSize(serialized.bytes);
   }
   check(stable && pool.active() == 0U && pool.exhaustions() == 0U,
-        "ten thousand authorized status polls reuse bounded cookie and response storage without exhaustion");
+        "one hundred thousand authorized status polls reuse bounded cookie and response storage without exhaustion");
 }
 
 void testDebugAllocationScopes() {
@@ -2810,6 +2831,21 @@ void testOtaV2Policy() {
             restored.last_report_state == "partition_written",
         "OTA recovery preserves pending image and report checkpoints across reset");
 }
+
+void testOtaFaultInjectionPolicy() {
+  using pm::ota_fault::Point;
+  using pm::ota_fault::shouldInject;
+  check(shouldInject(0, Point::BeforeFirstByte) &&
+            shouldInject(1, Point::AfterMetadata) &&
+            shouldInject(2, Point::AfterUpdateBegin) &&
+            shouldInject(3, Point::HalfwayThroughDownload) &&
+            shouldInject(4, Point::AfterCompleteDownload) &&
+            shouldInject(5, Point::BeforeUpdateEnd) &&
+            shouldInject(6, Point::AfterUpdateEnd) &&
+            shouldInject(7, Point::BeforeReboot) &&
+            !shouldInject(-1, Point::BeforeReboot),
+        "OTA fault injection selects every major stream boundary without enabling production faults");
+}
 } // namespace
 
 int main() {
@@ -2838,6 +2874,7 @@ int main() {
   testStoragePolicy();
   testCleanupRecoveryPolicy();
   testOtaV2Policy();
+  testOtaFaultInjectionPolicy();
   testProvisioningTransaction();
   if (failures == 0) {
     std::cout << "native C++ tests passed\n";

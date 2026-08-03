@@ -43,7 +43,15 @@ inline constexpr std::uint32_t kServerSyncStackBytes = 24U * 1024U;
 // 8 KiB stack, below the repository's 25% soak requirement. The 12 KiB bound
 // restores headroom without changing task priority or allocating per cycle.
 inline constexpr std::uint32_t kHealthStackBytes = 12288U;
-inline constexpr std::uint32_t kMaintenanceStackBytes = 12U * 1024U;
+// OTA performs certificate verification, HTTP framing, SHA-256, image
+// metadata validation, and the Update writer on this stack. A physical 1.0.13
+// canary proved that keeping 24 KiB permanently allocated reduced idle
+// internal heap below the unchanged 64 KiB TLS admission floor. The 4 KiB
+// stream scratch buffer is now a scoped internal-heap allocation made only
+// after TLS admission, so 16 KiB preserves both stack headroom and idle TLS
+// reserve. The physical OTA validation must retain at least the repository's
+// 25% measured stack margin before this bound is accepted.
+inline constexpr std::uint32_t kMaintenanceStackBytes = 16U * 1024U;
 // Serial configuration commands persist and verify the full atomic
 // configuration, including parsing the private Caddy CA with mbedTLS. An
 // 8 KiB task double-faulted in mbedtls_pem_read_buffer while applying a
