@@ -95,7 +95,7 @@ paths:
       security: [{deviceHmac: []}]
       responses:
         '200':
-          description: Update availability and signed release metadata
+          description: Update availability or a device-specific HMAC-authenticated v2 manifest
           content:
             application/json:
               schema: {$ref: '#/components/schemas/FirmwareManifest'}
@@ -110,6 +110,10 @@ paths:
           in: path
           required: true
           schema: {type: string, format: uuid}
+        - name: deployment_id
+          in: query
+          required: true
+          schema: {type: string, format: uuid}
       responses:
         '200':
           description: Firmware application image
@@ -120,6 +124,19 @@ paths:
           content:
             application/octet-stream:
               schema: {type: string, contentEncoding: binary}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/device-firmware/report:
+    post:
+      operationId: reportFirmwareDeploymentState
+      security: [{deviceHmac: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FirmwareReport'}
+      responses:
+        '200': {description: Idempotent deployment milestone recorded}
+        '204': {description: Idempotent deployment milestone recorded}
         default: {$ref: '#/components/responses/Problem'}
 components:
   securitySchemes:
@@ -153,9 +170,20 @@ components:
         pzem_model: {type: string, pattern: '^PZEM-004T V4'}
         sd_present: {type: boolean}
         sd_required: {const: true}
+        ota: {$ref: '#/components/schemas/OtaCapability'}
         supported_endpoints:
           type: array
           items: {type: string}
+    OtaCapability:
+      type: object
+      additionalProperties: false
+      required: [supported, protocol_version, authentication_mode, rollback_supported, partition_size_bytes]
+      properties:
+        supported: {const: true}
+        protocol_version: {const: 2}
+        authentication_mode: {const: existing_device_hmac}
+        rollback_supported: {type: boolean}
+        partition_size_bytes: {type: integer, minimum: 1, maximum: 6291456}
     EnrollmentClaim:
       type: object
       required: [token, protocol_version, hardware_id, capabilities]
@@ -216,6 +244,7 @@ components:
         boot_id: {type: string}
         firmware_version: {type: string}
         firmware_build_hash: {type: string}
+        ota: {$ref: '#/components/schemas/OtaCapability'}
         uptime_seconds: {type: integer, minimum: 0}
         reboot_reason: {type: string}
         current_ip: {type: [string, 'null']}
@@ -350,33 +379,59 @@ components:
         applied: {type: array, items: {type: string}}
         rejected: {type: object}
     FirmwareManifest:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [available, protocol_version]
+          properties:
+            available: {const: false}
+            protocol_version: {const: pm-protocol/1.0.0}
+        - type: object
+          additionalProperties: false
+          required: [schema_version, protocol_version, deployment_id, release_id, device_id, version, project_name, hardware_target, protocol_min, protocol_max, size_bytes, sha256, build_hash, not_before, expires_at, allow_downgrade, attempt, hmac_algorithm, hmac_key_context, download_path, manifest_hmac]
+          properties:
+            schema_version: {const: pm-ota-manifest/2}
+            protocol_version: {const: pm-protocol/1.0.0}
+            deployment_id: {type: string, format: uuid}
+            release_id: {type: string, format: uuid}
+            device_id: {type: string, format: uuid}
+            version: {type: string, minLength: 5, maxLength: 80}
+            project_name: {const: power-monitor-sensor}
+            hardware_target: {const: esp32-s3}
+            protocol_min: {const: pm-protocol/1.0.0}
+            protocol_max: {const: pm-protocol/1.0.0}
+            size_bytes: {type: integer, minimum: 1, maximum: 6291456}
+            sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+            build_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+            not_before: {type: string, format: date-time}
+            expires_at: {type: string, format: date-time}
+            allow_downgrade: {type: boolean}
+            attempt: {type: integer, minimum: 1}
+            hmac_algorithm: {const: HMAC-SHA256}
+            hmac_key_context: {const: pm-ota-manifest-v2/server-to-device}
+            download_path:
+              type: string
+              pattern: '^/api/v1/device-firmware/[0-9a-f-]{36}/download\?deployment_id=[0-9a-f-]{36}$'
+            manifest_hmac: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+    FirmwareReport:
       type: object
       additionalProperties: false
-      required: [available]
+      required: [device_id, deployment_id, release_id, attempt, state, current_firmware_version, current_build_hash, target_version, target_sha256, bytes_received, image_size, progress, boot_id, failure_code, failure_summary]
       properties:
-        available: {type: boolean}
-        protocol_version: {const: pm-protocol/1.0.0}
+        device_id: {type: string, format: uuid}
         deployment_id: {type: string, format: uuid}
-        version: {type: string, pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'}
-        channel: {enum: [development, canary, stable]}
-        hardware_target: {const: esp32-s3-n16r8}
-        protocol_min: {type: string, minLength: 1, maxLength: 64}
-        protocol_max: {type: string, minLength: 1, maxLength: 64}
-        size_bytes: {type: integer, minimum: 1, maximum: 6291456}
-        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
-        signature:
+        release_id: {type: string, format: uuid}
+        attempt: {type: integer, minimum: 1}
+        state:
           type: string
-          description: Base64 encoding of the exact 64-byte Ed25519 signature over sorted compact JSON containing version, channel, hardware_target, protocol_min, protocol_max, sha256, signing_key_id, and release_notes.
-          minLength: 88
-          maxLength: 88
-        signing_key_id: {type: string, minLength: 1, maxLength: 128}
-        release_notes: {type: string, maxLength: 4096}
-        download_path:
-          type: string
-          pattern: '^/api/v1/device-firmware/[0-9a-fA-F-]{36}/download$'
-      oneOf:
-        - properties:
-            available: {const: false}
-        - required: [deployment_id, version, channel, hardware_target, protocol_min, protocol_max, size_bytes, sha256, signature, signing_key_id, release_notes, download_path]
-          properties:
-            available: {const: true}
+          enum: [manifest_authenticated, download_started, downloading, binary_verified, partition_written, rebooting, post_boot_validation, validated, failed, rollback_detected, rolled_back]
+        current_firmware_version: {type: string, minLength: 1, maxLength: 80}
+        current_build_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        target_version: {type: string, minLength: 1, maxLength: 80}
+        target_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        bytes_received: {type: integer, minimum: 0}
+        image_size: {type: integer, minimum: 1, maximum: 6291456}
+        progress: {type: integer, minimum: 0, maximum: 100}
+        boot_id: {type: string, format: uuid}
+        failure_code: {type: [string, 'null'], pattern: '^[a-z0-9][a-z0-9_]{0,79}$'}
+        failure_summary: {type: [string, 'null'], maxLength: 256}

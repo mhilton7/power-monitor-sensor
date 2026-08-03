@@ -1,0 +1,16 @@
+{
+  "schema_version": "pm-firmware-artifact/1",
+  "version": "1.0.11",
+  "channel": "stable",
+  "project_name": "power-monitor-sensor",
+  "hardware_target": "esp32-s3",
+  "protocol_version": "pm-protocol/1.0.0",
+  "size_bytes": 1574464,
+  "sha256": "74447d23603114b0bd779c705ac1fca50aa0a24a91b4e21037b5059491142d8f",
+  "build_hash": "2cf49e1fd1bd390c13a54ccdab085d59ea540ef0787d46f5db802f890b1e7802",
+  "build_time": "03:00:00",
+  "build_date": "Aug  3 2026",
+  "ota_authentication_mode": "existing_device_hmac",
+  "ota_protocol_version": 2,
+  "release_notes": "Power Monitor Sensor Agent 1.0.11: pm-protocol/1.0.0 production release. Physical PZEM, microSD, enclosure, and device-authenticated HMAC OTA validation remain required on the target installation."
+}

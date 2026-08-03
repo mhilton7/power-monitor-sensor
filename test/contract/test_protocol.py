@@ -859,18 +859,27 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertEqual(
             set(available_release["required"]),
             {
+                "schema_version",
+                "protocol_version",
                 "deployment_id",
+                "release_id",
+                "device_id",
                 "version",
-                "channel",
+                "project_name",
                 "hardware_target",
                 "protocol_min",
                 "protocol_max",
                 "size_bytes",
                 "sha256",
-                "signature",
-                "signing_key_id",
-                "release_notes",
+                "build_hash",
+                "not_before",
+                "expires_at",
+                "allow_downgrade",
+                "attempt",
+                "hmac_algorithm",
+                "hmac_key_context",
                 "download_path",
+                "manifest_hmac",
             },
         )
         self.assertEqual(
@@ -993,17 +1002,51 @@ class ProtocolContractTests(unittest.TestCase):
 
         ota_source = (ROOT / "src/ota/OtaService.cpp").read_text(encoding="utf-8")
         for marker in (
-            "crypto_sign_ed25519_verify_detached",
+            "otaManifestKey",
+            "crypto::base64UrlEncode",
+            "crypto::constantTimeEqual",
             "addDeviceAuthentication",
             "ResolvedTlsClient",
             "resolveHttpsTarget",
             "MDNS.queryHost",
             "setResolvedEndpoint",
-            '"release_notes"',
-            '"ota_public_key_unavailable"',
+            '"ota_manifest_hmac_invalid"',
+            "validateImageMetadata",
+            "StreamTracker",
+            "MemoryOperationContext::OtaActive",
+            "postReport",
+            "esp_ota_mark_app_invalid_rollback_and_reboot",
             '"ota_server_origin_required"',
         ):
             self.assertIn(marker, ota_source)
+        self.assertNotIn("setInsecure(", ota_source)
+        self.assertIn(
+            'document["firmware_release_available"].as<bool>()', sync_source
+        )
+        self.assertIn("sync_policy::manifestPollDeadline", sync_source)
+        report_schema = contract["components"]["schemas"]["FirmwareReport"]
+        self.assertEqual(
+            report_schema["properties"]["state"]["enum"],
+            [
+                "manifest_authenticated",
+                "download_started",
+                "downloading",
+                "binary_verified",
+                "partition_written",
+                "rebooting",
+                "post_boot_validation",
+                "validated",
+                "failed",
+                "rollback_detected",
+                "rolled_back",
+            ],
+        )
+        release_generator = (ROOT / "tools/generate_release.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"--legacy-signing-key-id"', release_generator)
+        self.assertNotIn('"--signing-key-id"', release_generator)
+        self.assertIn('staging / "firmware-metadata.json"', release_generator)
         config_source = (ROOT / "src/config/ConfigService.cpp").read_text(
             encoding="utf-8"
         )

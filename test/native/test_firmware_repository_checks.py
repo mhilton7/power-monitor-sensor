@@ -228,6 +228,34 @@ class RepositoryHotPathPolicyTests(unittest.TestCase):
     def test_compact_status_route_obeys_repository_policy(self) -> None:
         self.assertEqual(check(ROOT), [])
 
+    def test_prebuilt_mbedtls_limit_and_bounded_alternative_are_explicit(self) -> None:
+        document = (ROOT / "docs" / "MEMORY_AND_FRAGMENTATION.md").read_text(
+            encoding="utf-8"
+        )
+        platform = (ROOT / "platformio.ini").read_text(encoding="utf-8")
+        sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for directory in (ROOT / "src", ROOT / "include")
+            for path in directory.rglob("*.*")
+            if path.suffix in {".cpp", ".h"}
+        )
+        scratch = (ROOT / "src" / "network" / "ServerSyncScratch.h").read_text(
+            encoding="utf-8"
+        )
+        policy = (ROOT / "src" / "network" / "ServerSyncPolicy.h").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("prebuilt framework archives", document)
+        self.assertIn("CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384", document)
+        self.assertIn("CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH is not set", document)
+        self.assertIn("no `setBufferSizes` method", document)
+        self.assertNotIn("CONFIG_MBEDTLS_DYNAMIC_BUFFER", platform)
+        self.assertNotIn(".setBufferSizes(", sources)
+        self.assertIn("kRequestCapacity = 20U * 1024U", scratch)
+        self.assertIn("kResponseCapacity = 24U * 1024U", scratch)
+        self.assertIn("kMaximumResponseBytes = 24U * 1024U", policy)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -132,7 +132,9 @@ private:
                    bool rate_limited = false);
   void sendLocalSessionProblem(AsyncWebServerRequest *request, int status,
                                const char *code, const char *detail);
-  bool beginHeavyLocalOperation(AsyncWebServerRequest *request);
+  bool beginHeavyLocalOperation(
+      AsyncWebServerRequest *request,
+      MemoryOperationContext context = MemoryOperationContext::HeavyLocalUi);
   void endHeavyLocalOperation();
   void sendPage(AsyncWebServerRequest *request, const HistoryPage &page,
                 bool ndjson);

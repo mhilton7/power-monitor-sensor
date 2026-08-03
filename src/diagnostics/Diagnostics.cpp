@@ -9,6 +9,7 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 
 #include "build_config.h"
 #include "diagnostics/SerialLogger.h"
@@ -160,15 +161,52 @@ MemoryPressureMetrics Diagnostics::memoryPressureMetrics() const {
   return copy;
 }
 
-bool Diagnostics::acquireHighMemoryOperation(const TickType_t timeout) const {
-  return high_memory_mutex_ != nullptr &&
-         xSemaphoreTake(high_memory_mutex_, timeout) == pdTRUE;
+bool Diagnostics::acquireHighMemoryOperation(
+    const MemoryOperationContext context, const TickType_t timeout) const {
+  if (context == MemoryOperationContext::Idle ||
+      high_memory_mutex_ == nullptr ||
+      xSemaphoreTake(high_memory_mutex_, timeout) != pdTRUE) {
+    return false;
+  }
+  high_memory_context_.store(static_cast<std::uint8_t>(context),
+                             std::memory_order_release);
+  return true;
+}
+
+bool Diagnostics::transitionHighMemoryOperation(
+    const MemoryOperationContext expected,
+    const MemoryOperationContext next) const {
+  if (!memoryOperationTransitionAllowed(expected, next)) {
+    return false;
+  }
+  std::uint8_t expected_value = static_cast<std::uint8_t>(expected);
+  return high_memory_context_.compare_exchange_strong(
+      expected_value, static_cast<std::uint8_t>(next),
+      std::memory_order_acq_rel);
 }
 
 void Diagnostics::releaseHighMemoryOperation() const {
   if (high_memory_mutex_ != nullptr) {
+    const MemoryOperationContext completed = memoryOperationContext();
+    if (requiresPostOperationMemoryGrace(completed)) {
+      high_memory_completed_ms_.store(
+          static_cast<std::uint64_t>(esp_timer_get_time()) / 1000U,
+          std::memory_order_release);
+    }
+    high_memory_context_.store(
+        static_cast<std::uint8_t>(MemoryOperationContext::Idle),
+        std::memory_order_release);
     xSemaphoreGive(high_memory_mutex_);
   }
+}
+
+MemoryOperationContext Diagnostics::memoryOperationContext() const {
+  return static_cast<MemoryOperationContext>(
+      high_memory_context_.load(std::memory_order_acquire));
+}
+
+std::uint64_t Diagnostics::lastMemoryOperationCompletedMs() const {
+  return high_memory_completed_ms_.load(std::memory_order_acquire);
 }
 
 void Diagnostics::recordHttpStatus(const int status,

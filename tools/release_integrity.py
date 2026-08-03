@@ -227,7 +227,7 @@ def validate_release_bundle(
                 f"release artifact does not match build provenance: {name}"
             )
     ota_path = release_directory / "ota.bin"
-    if artifact_metadata(ota_path) != artifact_metadata(
+    if ota_path.exists() and artifact_metadata(ota_path) != artifact_metadata(
         release_directory / "firmware.bin"
     ):
         raise ReleaseIntegrityError("ota.bin must be identical to firmware.bin")

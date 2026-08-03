@@ -10,6 +10,14 @@ Reads: `GET /api/v1/health`, `/info`, `/live`, `/readings`, `/events`, `/storage
 
 Mutations: `PUT /api/v1/config`, `PUT /api/v1/network-settings`, `POST /api/v1/sync/ack`, `/setup/apply`, `/enrollment/reenroll`, `/ota/apply`, and `/actions/{test-pzem,test-sd,remount-sd,rebuild-index,prepare-card-removal,test-dns,test-ntp,test-server-tls,test-heartbeat,reboot,network-reset,factory-reset,rollback-ota}`. Long work uses a bounded worker or maintenance queue.
 
+`GET /api/v1/ota/status` exposes bounded, non-secret v2 state: protocol and
+authentication mode, target deployment/release/version/hash, progress and byte
+count, running/next partition, pending verification, last result/failure, and
+rollback evidence. It never includes the enrollment secret, derived manifest
+key, request signatures, or canonical key material. Local `/ota/apply` and
+rollback remain elevated maintenance actions; normal installation is initiated
+from the central server, not by uploading a binary to this HTTP UI.
+
 For backward compatibility, `/readings`, `/events`, configuration, network settings, setup, acknowledgement, and reenrollment return their final HTTP 200 response when `Prefer` is omitted. AsyncTCP remains nonblocking while the response waits on the bounded worker. A caller that sends `Prefer: respond-async` receives HTTP 202 plus an opaque job ID and polls `/api/v1/history-jobs` or `/api/v1/auth/password-jobs`. The embedded UI opts into this polling behavior. Password login always uses the password-job flow.
 
 Password-job authorization depends on the operation that created the job. A login request requires an exact same-origin non-privileged session and CSRF token; its result is bound to that creator session and cannot elevate a different session even if its opaque identifier is disclosed. Configuration, setup, network-settings, and local reenrollment results require a local session or device HMAC as applicable to the initiating operation. A synchronization acknowledgement result is HMAC-only.
@@ -83,7 +91,38 @@ curl -H 'X-PM-Protocol: pm-protocol/1.0.0' \
 
 ## Server-facing API
 
-Outbound endpoints: enrollment claim, `POST /api/v1/device-heartbeats`, `/device-readings/batch`, `/device-events/batch`, `/device-config/report`; authenticated `GET /api/v1/device-config/effective` and `/device-firmware/manifest`. Enrollment returns HTTP 201 and a URL-safe secret that is stored exactly as returned. Heartbeats use `heartbeat/1.0.0`, reading batches use `reading-batch/1.0.0`, and configuration reports carry the server configuration version independently of the sensor's local configuration revision. HTTPS public-CA and hostname validation are mandatory; current firmware rejects fingerprint-only operation because the ESP32 client cannot safely pin before an authenticated handshake. Sequence batches are idempotent: identical retransmission succeeds, conflicting content is 409, and acknowledgement advances only through contiguous sequences. Durable values outside the shared 0–400 V, 40–70 Hz, or 0–1 power-factor domains are sent as null measurements with a gap/range quality flag so one bad interval cannot block the contiguous cursor. Retained startup intervals that lack trustworthy UTC bounds remain immutable on the card but are omitted from server batches; `oldest_syncable_sequence` lets the server close that exact unsyncable prefix without fabricating timestamps.
+Outbound endpoints include enrollment claim,
+`POST /api/v1/device-heartbeats`, `/device-readings/batch`, `/device-events/batch`,
+`/device-config/report`, and `/device-firmware/report`; authenticated reads use
+`GET /api/v1/device-config/effective`, `/device-firmware/manifest`, and the
+manifest's same-origin relative firmware download path. Enrollment returns HTTP
+201 and a URL-safe secret that is stored exactly as returned. Heartbeats use
+`heartbeat/1.0.0`, reading batches use `reading-batch/1.0.0`, and configuration
+reports carry the server configuration version independently of the sensor's
+local configuration revision.
+
+OTA v2 capability is reported at enrollment and in signed heartbeats as
+`supported`, `protocol_version: 2`,
+`authentication_mode: existing_device_hmac`, `rollback_supported`, and the
+runtime update-partition size. The available `pm-ota-manifest/2` response is
+canonical-HMAC authenticated for the exact device and attempt. The sensor
+rejects cross-device, modified, future/expired, incompatible, replayed,
+same-version, unauthorized-downgrade, wrong-origin, wrong-size, or wrong-hash
+updates. Milestone reports are attempt-aware and idempotent; download and
+partition write are not equivalent to server-confirmed completion. See
+[OTA](OTA.md).
+
+HTTPS public-CA and hostname validation are mandatory; current firmware rejects
+fingerprint-only operation because the ESP32 client cannot safely pin before an
+authenticated handshake. Sequence batches are idempotent: identical
+retransmission succeeds, conflicting content is 409, and acknowledgement
+advances only through contiguous sequences. Durable values outside the shared
+0–400 V, 40–70 Hz, or 0–1 power-factor domains are sent as null measurements
+with a gap/range quality flag so one bad interval cannot block the contiguous
+cursor. Retained startup intervals that lack trustworthy UTC bounds remain
+immutable on the card but are omitted from server batches;
+`oldest_syncable_sequence` lets the server close that exact unsyncable prefix
+without fabricating timestamps.
 
 Errors use `application/problem+json` with RFC 9457 `type`, `title`, `status`, `detail`, `instance`, and optional `code`. Treat 409/422 as protocol/config faults; network/5xx failures retry with bounded exponential backoff plus jitter. Different protocol IDs are explicitly rejected.
 

@@ -1,6 +1,9 @@
 # Security model
 
-Assets include Wi-Fi credentials, enrollment secret, directional keys, local password verifier, setup credential, OTA key, history, config, and cursor. Threats include impersonation, replay, CSRF, brute force, malicious OTA, media tampering, leakage, and resource exhaustion.
+Assets include Wi-Fi credentials, enrollment secret, derived directional keys,
+local password verifier, setup credential, OTA recovery state, history, config,
+and cursor. Threats include impersonation, replay, CSRF, brute force, malicious
+OTA, media tampering, leakage, and resource exhaustion.
 
 - Outbound HTTPS requires a CA PEM with certificate-chain and hostname validation. The legacy fingerprint field is retained for protocol/configuration compatibility but fingerprint-only operation fails closed; no production path calls `setInsecure()`.
 - Single-use enrollment and at least 256 random secret bits feed separate RFC 5869 directional keys.
@@ -10,7 +13,23 @@ Assets include Wi-Fi credentials, enrollment secret, directional keys, local pas
 - Secrets are write-only. Config/health/metrics/logs/bundles and serial output redact credentials, keys, cookies, and signatures. Firmware never prints the setup-AP password. `SETUP_AP_READY` contains only the non-secret SSID and directs the physically present installer to `Set-SensorSetupPassword.ps1`. That helper accepts no password argument, uses hidden `SecureString` prompts, sends the password directly over the exclusively opened USB serial port, does not echo or log the command, and clears its temporary BSTR and mutable character buffers as practical. A random non-secret 16-hex request ID binds each submission to its `SETUP_AP_PASSWORD_APPLIED` or `SETUP_AP_PASSWORD_REJECTED` result. These fixed-field control records use a bounded serial path that is independent of diagnostic filtering and queue pressure.
 - Bodies, pages, queues, responses, SD lines, OTA, and timeouts are bounded. Authenticated APIs use a burst ceiling, history reads are separately throttled, and HTTP callbacks delegate long work.
 - First-run config, Wi-Fi password, enrollment token, and administrator verifier changes are guarded by a verified rollback journal. A reset before journal removal restores the prior credentials and config generation instead of exposing a partial provisioned state.
-- OTA requires a locally provisioned Ed25519 public key and matching key ID, HMAC-authenticated same-origin manifest/download requests, target/protocol/channel/version/size/hash checks, dual slots, post-boot confirmation, and rollback. Remote configuration cannot replace the local OTA trust root.
+- Existing-trust OTA v2 uses the enrolled device secret only as HKDF-SHA256
+  input, with the device UUID as UTF-8 salt and the distinct
+  `pm-ota-manifest-v2/server-to-device` context. The derived 32-byte manifest
+  key is never persisted or exposed. HMAC-authenticated same-origin requests,
+  a device-specific canonical manifest HMAC, target/project/protocol/version/
+  size/hash checks, inactive-slot writes, post-boot confirmation, and automatic
+  rollback all remain mandatory. Historical Ed25519 public-key metadata may be
+  retained for legacy records, but no public-key paste or new private key is
+  required for the ordinary v2 workflow.
+- OTA never reads or requires `cert.key`, `root.key`, `tls.key`, a Caddy private
+  key, a browser-supplied hash, or a new OTA certificate. The configured public
+  CA and hostname/SNI validation remain mandatory; `setInsecure()` is forbidden.
+- The high-memory coordinator serializes TLS/OTA and other heavy work. A local
+  resource deferral is fail-closed and retried; it is not permission to weaken
+  TLS, drop manifest authentication, or misreport server reachability. Only a
+  persistent low-total-memory state maps the legacy `health.low_memory` Boolean
+  to true. See [Memory and fragmentation](MEMORY_AND_FRAGMENTATION.md).
 - SD CRC is integrity/error detection, not confidentiality/authenticity. Protect media and encrypt backups as needed.
 
 Deploy on an IoT VLAN, block inbound Internet, and permit only DNS, NTP, and configured allowlisted server hosts. Current firmware uses outbound push only. The v1 pull/hybrid values fail closed because the local HTTP listener does not provide the mutually authenticated HTTPS transport required for central polling. The authenticated local reenrollment workflow revokes the existing device secret before claiming a new single-use token; factory reset also erases credentials.

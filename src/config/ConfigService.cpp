@@ -31,6 +31,30 @@ constexpr persistence::SlotKeys kEnrollmentSlots{"enroll_a", "enroll_b",
 constexpr char kProvisioningTransactionKey[] = "provision_txn";
 constexpr TickType_t kStateReadTimeout = pdMS_TO_TICKS(25);
 
+bool canonicalizeLowercaseUuid(std::string &value) {
+  if (value.size() != 36U)
+    return false;
+  for (std::size_t index = 0U; index < value.size(); ++index) {
+    const bool separator =
+        index == 8U || index == 13U || index == 18U || index == 23U;
+    if (separator) {
+      if (value[index] != '-')
+        return false;
+      continue;
+    }
+    if ((value[index] >= '0' && value[index] <= '9') ||
+        (value[index] >= 'a' && value[index] <= 'f')) {
+      continue;
+    }
+    if (value[index] >= 'A' && value[index] <= 'F') {
+      value[index] = static_cast<char>(value[index] - 'A' + 'a');
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 class PreferencesBlobStore final : public persistence::BlobStore {
 public:
   bool read(const char *key, std::vector<std::uint8_t> &value) override {
@@ -1223,6 +1247,37 @@ bool ConfigService::directionalKeys(crypto::Key32 &device_to_server,
   server_to_device = crypto::hkdfSha256(secret.data(), secret.size(),
                                         "pm-server-to-device-v1");
   std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+  return true;
+}
+
+bool ConfigService::otaManifestKey(
+    crypto::Key32 &server_to_device_ota) const {
+  std::vector<std::uint8_t> secret;
+  std::string device_id;
+  {
+    RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+    if (!state || !identity_.enrolled || identity_.device_id.size() != 36U ||
+        enrollment_secret_.size() < 32U || enrollment_secret_.size() > 64U) {
+      server_to_device_ota.fill(0U);
+      return false;
+    }
+    secret = enrollment_secret_;
+    device_id = identity_.device_id;
+  }
+  if (!canonicalizeLowercaseUuid(device_id)) {
+    server_to_device_ota.fill(0U);
+    std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+    std::fill(device_id.begin(), device_id.end(), '\0');
+    return false;
+  }
+  static constexpr char context[] =
+      "pm-ota-manifest-v2/server-to-device";
+  server_to_device_ota = crypto::hkdfSha256(
+      secret.data(), secret.size(),
+      reinterpret_cast<const std::uint8_t *>(device_id.data()),
+      device_id.size(), context);
+  std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+  std::fill(device_id.begin(), device_id.end(), '\0');
   return true;
 }
 

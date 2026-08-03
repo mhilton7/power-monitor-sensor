@@ -7,6 +7,7 @@
 
 #include "core/HeapTelemetry.h"
 #include "core/MemoryPressurePolicy.h"
+#include "ota/CompactOtaStatus.h"
 
 namespace pm {
 
@@ -61,6 +62,8 @@ struct CompactUiStatusSnapshot {
 
   HeapSnapshot heap{};
   MemoryPressureMetrics memory{};
+  MemoryOperationContext operation_context{MemoryOperationContext::Idle};
+  CompactOtaStatus ota{};
   ServerFreshnessPolicy freshness_policy{};
   ServerFreshnessState server_state{ServerFreshnessState::NeverConnected};
 };

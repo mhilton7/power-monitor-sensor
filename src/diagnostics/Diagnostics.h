@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -195,8 +196,18 @@ public:
   void setMemoryPressureMetrics(const MemoryPressureMetrics &metrics);
   MemoryPressureMetrics memoryPressureMetrics() const;
   bool acquireHighMemoryOperation(
+      MemoryOperationContext context,
       TickType_t timeout = pdMS_TO_TICKS(5000)) const;
+  bool transitionHighMemoryOperation(MemoryOperationContext expected,
+                                     MemoryOperationContext next) const;
+  bool acquireHighMemoryOperation(
+      TickType_t timeout = pdMS_TO_TICKS(5000)) const {
+    return acquireHighMemoryOperation(MemoryOperationContext::TlsPreparing,
+                                      timeout);
+  }
   void releaseHighMemoryOperation() const;
+  MemoryOperationContext memoryOperationContext() const;
+  std::uint64_t lastMemoryOperationCompletedMs() const;
   void recordHttpStatus(int status, bool rejected_signature = false,
                         bool rate_limited = false);
   void recordBrowserSessionRejection();
@@ -245,6 +256,9 @@ private:
 
   mutable SemaphoreHandle_t mutex_{nullptr};
   mutable SemaphoreHandle_t high_memory_mutex_{nullptr};
+  mutable std::atomic<std::uint8_t> high_memory_context_{
+      static_cast<std::uint8_t>(MemoryOperationContext::Idle)};
+  mutable std::atomic<std::uint64_t> high_memory_completed_ms_{0U};
   MeasurementSnapshot latest_;
   bool has_latest_{false};
   std::uint64_t committed_sequence_{0};

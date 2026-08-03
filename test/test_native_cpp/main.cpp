@@ -27,6 +27,8 @@
 #include "network/ReadingWireFormat.h"
 #include "network/ServerSyncPolicy.h"
 #include "network/ServerSyncScratch.h"
+#include "ota/OtaManifestV2.h"
+#include "ota/OtaUpdatePolicy.h"
 #include "security/AuthPolicy.h"
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
@@ -550,6 +552,14 @@ void testServerSyncPolicy() {
             !pm::sync_policy::shouldScheduleEventIdleDelay(false, false),
         "event-page polling keeps its short deadline until the page is "
         "consumed");
+  check(pm::sync_policy::manifestPollDeadline(true, 3'600'000U, 15'000U) ==
+                15'000U &&
+            pm::sync_policy::manifestPollDeadline(false, 3'600'000U,
+                                                  15'000U) == 3'600'000U &&
+            pm::sync_policy::manifestPollDeadline(true, 10'000U, 15'000U) ==
+                10'000U,
+        "heartbeat release availability advances only a future manifest "
+        "deadline and a false response preserves in-flight work");
 
   pm::sync_policy::EndpointAddressCache address_cache;
   std::uint32_t cached_address = 99U;
@@ -1027,41 +1037,40 @@ void testAuthenticationPolicy() {
 
 void testMemoryPressurePolicy() {
   pm::MemoryPressurePolicy policy;
-  auto update = policy.update(96U * 1024U, 48U * 1024U, 0U);
+  auto update = policy.update(72'348U, 33'780U, 0U);
   check(!update.changed &&
             update.current == pm::MemoryPressureState::Normal,
-        "healthy heap begins in normal memory state");
+        "the measured 72,348/33,780-byte idle baseline is normal");
 
-  update = policy.update(79U * 1024U, 40U * 1024U, 1'000U);
-  check(update.changed &&
-            update.current == pm::MemoryPressureState::PressureWarning,
-        "moderate pressure enters warning without low-memory mode");
-  policy.update(60U * 1024U, 27U * 1024U, 2'000U);
-  policy.update(60U * 1024U, 27U * 1024U, 3'000U);
-  update = policy.update(60U * 1024U, 27U * 1024U, 4'000U);
-  check(update.changed &&
-            update.current == pm::MemoryPressureState::LowTotalMemory,
-        "three consecutive low samples enter low-memory mode");
+  update = policy.update(40U * 1024U, 24U * 1024U, 1'000U,
+                         pm::MemoryOperationContext::TlsPreparing);
+  update = policy.update(35U * 1024U, 20U * 1024U, 2'000U,
+                         pm::MemoryOperationContext::TlsActive);
+  update = policy.update(38'000U, 22'000U, 3'000U,
+                         pm::MemoryOperationContext::TlsActive);
+  check(update.current == pm::MemoryPressureState::Normal &&
+            !pm::memoryPressureIsLowMemory(update.current),
+        "expected TLS allocation minima never become persistent low memory");
 
-  for (std::uint64_t second = 5U; second < 34U; ++second) {
-    policy.update(96U * 1024U, 48U * 1024U, second * 1'000U);
-  }
-  update = policy.update(96U * 1024U, 48U * 1024U, 34'000U);
-  check(update.changed &&
-            update.current == pm::MemoryPressureState::Recovering,
-        "low-memory mode requires sustained recovery and minimum dwell");
-  update = policy.update(96U * 1024U, 48U * 1024U, 64'000U);
-  check(update.changed &&
-            update.current == pm::MemoryPressureState::Normal,
-        "recovery dwell returns to normal without threshold oscillation");
-  const pm::MemoryPressureMetrics metrics = policy.metrics(64'000U);
-  check(metrics.entry_count == 1U && metrics.recovery_count == 1U &&
-            metrics.transition_count == 4U &&
-            metrics.cumulative_pressure_ms == 63'000U &&
-            metrics.longest_pressure_episode_ms == 63'000U &&
-            metrics.lowest_free_internal_bytes == 60U * 1024U &&
-            metrics.lowest_largest_internal_block_bytes == 27U * 1024U,
-        "memory pressure evidence retains bounded episode and minimum metrics");
+  update = policy.update(85'744U, 32U * 1024U, 3'500U,
+                         pm::MemoryOperationContext::Idle, true, 3'000U);
+  check(update.current == pm::MemoryPressureState::Normal,
+        "post-TLS cleanup observes the bounded grace period");
+  update = policy.update(85'744U, 32U * 1024U, 6'000U,
+                         pm::MemoryOperationContext::Idle, true, 3'000U);
+  const pm::MemoryPressureMetrics tls_metrics = policy.metrics(6'000U);
+  check(update.current == pm::MemoryPressureState::Normal &&
+            tls_metrics.tls_transient_minimum_free_internal_bytes ==
+                35U * 1024U &&
+            tls_metrics.tls_ready &&
+            tls_metrics.operation_context == pm::MemoryOperationContext::Idle,
+        "85,744-byte post-operation heap returns to normal and retains TLS evidence");
+
+  policy.update(39U * 1024U, 21U * 1024U, 7'000U,
+                pm::MemoryOperationContext::OtaActive);
+  check(policy.metrics(7'000U).ota_transient_minimum_free_internal_bytes ==
+            39U * 1024U,
+        "OTA transients are recorded separately from TLS transients");
 
   pm::MemoryPressurePolicy fragmented_policy;
   update = fragmented_policy.update(72'280U, 24'564U, 1'000U);
@@ -1072,9 +1081,351 @@ void testMemoryPressurePolicy() {
             fragmented_metrics.fragmentation_entry_count == 1U &&
             fragmented_metrics.current_fragmentation_episode_ms == 5'000U &&
             fragmented_metrics.free_internal_at_fragmentation_entry_bytes ==
-                72'280U,
+                72'280U &&
+            !pm::memoryPressureIsLowMemory(update.current) &&
+            !pm::memoryTlsReady(72'280U, 24'564U),
         "high total free memory with a sub-32-KiB largest block is classified "
         "as fragmentation, not low total memory");
+
+  pm::MemoryPressurePolicy low_policy;
+  low_policy.update(55U * 1024U, 28U * 1024U, 1'000U);
+  low_policy.update(55U * 1024U, 28U * 1024U, 2'000U);
+  update = low_policy.update(55U * 1024U, 28U * 1024U, 3'000U);
+  check(update.current == pm::MemoryPressureState::LowTotalMemory &&
+            pm::memoryPressureIsLowMemory(update.current),
+        "three genuinely low idle samples enter low-total memory");
+  update = low_policy.update(60U * 1024U, 30U * 1024U, 4'000U);
+  check(update.current == pm::MemoryPressureState::LowTotalMemory,
+        "an intermediate 60-KiB sample cannot clear low-total memory");
+  low_policy.update(85'744U, 32U * 1024U, 5'000U);
+  low_policy.update(85'744U, 32U * 1024U, 6'000U);
+  update = low_policy.update(85'744U, 32U * 1024U, 7'000U);
+  check(update.current == pm::MemoryPressureState::Recovering &&
+            !pm::memoryPressureIsLowMemory(update.current),
+        "three safe post-cleanup samples move low-total memory to recovering");
+  low_policy.update(85'744U, 32U * 1024U, 8'000U);
+  low_policy.update(85'744U, 32U * 1024U, 9'000U);
+  update = low_policy.update(85'744U, 32U * 1024U, 10'000U);
+  check(update.current == pm::MemoryPressureState::Normal &&
+            low_policy.metrics(10'000U).entry_count == 1U &&
+            low_policy.metrics(10'000U).recovery_count == 1U,
+        "sustained safe evidence completes low-memory recovery");
+
+  pm::MemoryPressurePolicy grace_policy;
+  grace_policy.update(72'348U, 33'780U, 0U);
+  grace_policy.update(38'000U, 20'000U, 1'000U,
+                      pm::MemoryOperationContext::TlsActive);
+  grace_policy.update(52U * 1024U, 28U * 1024U, 2'500U,
+                      pm::MemoryOperationContext::Idle, true, 2'000U);
+  grace_policy.update(52U * 1024U, 28U * 1024U, 3'500U,
+                      pm::MemoryOperationContext::Idle, true, 2'000U);
+  update = grace_policy.update(52U * 1024U, 28U * 1024U, 4'500U,
+                               pm::MemoryOperationContext::Idle, true, 2'000U);
+  check(update.current == pm::MemoryPressureState::Normal,
+        "low samples inside the three-second cleanup grace are ignored");
+  grace_policy.update(52U * 1024U, 28U * 1024U, 5'000U,
+                      pm::MemoryOperationContext::Idle, true, 2'000U);
+  grace_policy.update(52U * 1024U, 28U * 1024U, 6'000U,
+                      pm::MemoryOperationContext::Idle, true, 2'000U);
+  update = grace_policy.update(52U * 1024U, 28U * 1024U, 7'000U,
+                               pm::MemoryOperationContext::Idle, true, 2'000U);
+  check(update.current == pm::MemoryPressureState::LowTotalMemory,
+        "genuine sustained low memory is evaluated after cleanup grace");
+
+  pm::MemoryPressurePolicy emergency_policy;
+  update = emergency_policy.update(28U * 1024U, 12U * 1024U, 1'000U,
+                                   pm::MemoryOperationContext::TlsActive);
+  check(update.current == pm::MemoryPressureState::LowTotalMemory &&
+            update.changed,
+        "the 28-KiB emergency floor fails immediately even during TLS");
+  pm::MemoryPressurePolicy integrity_policy;
+  update = integrity_policy.update(80U * 1024U, 40U * 1024U, 1'000U,
+                                   pm::MemoryOperationContext::OtaActive,
+                                   false);
+  check(update.current == pm::MemoryPressureState::LowTotalMemory,
+        "heap-integrity failure is immediately critical during OTA");
+
+  pm::MemoryPressurePolicy warning_policy;
+  update = warning_policy.update(60U * 1024U, 30U * 1024U, 1'000U);
+  check(update.current == pm::MemoryPressureState::PressureWarning &&
+            !pm::memoryPressureIsLowMemory(pm::MemoryPressureState::Normal) &&
+            !pm::memoryPressureIsLowMemory(
+                pm::MemoryPressureState::PressureWarning) &&
+            !pm::memoryPressureIsLowMemory(
+                pm::MemoryPressureState::Fragmented) &&
+            pm::memoryPressureIsLowMemory(
+                pm::MemoryPressureState::LowTotalMemory) &&
+            !pm::memoryPressureIsLowMemory(
+                pm::MemoryPressureState::Recovering),
+        "only LowTotalMemory maps to the legacy low-memory Boolean");
+  check(pm::memoryTlsReady(64U * 1024U, 32U * 1024U) &&
+            !pm::memoryTlsReady(64U * 1024U - 1U, 32U * 1024U) &&
+            !pm::memoryTlsReady(64U * 1024U, 32U * 1024U - 1U),
+        "TLS readiness retains the 64-KiB total and 32-KiB contiguous guards");
+  check(pm::memoryOperationTransitionAllowed(
+            pm::MemoryOperationContext::TlsPreparing,
+            pm::MemoryOperationContext::TlsActive) &&
+            !pm::memoryOperationTransitionAllowed(
+                pm::MemoryOperationContext::Idle,
+                pm::MemoryOperationContext::TlsActive) &&
+            !pm::memoryOperationTransitionAllowed(
+                pm::MemoryOperationContext::TlsActive,
+                pm::MemoryOperationContext::TlsPreparing) &&
+            pm::requiresPostOperationMemoryGrace(
+                pm::MemoryOperationContext::TlsActive) &&
+            pm::requiresPostOperationMemoryGrace(
+                pm::MemoryOperationContext::OtaActive) &&
+            !pm::requiresPostOperationMemoryGrace(
+                pm::MemoryOperationContext::TlsPreparing),
+        "high-memory context permits only preparing-to-active TLS transition "
+        "and records grace only after real TLS or OTA activity");
+}
+
+void testOperationAwareMemorySoaks() {
+  pm::MemoryPressurePolicy hour_policy;
+  std::uint64_t last_expected_operation_completed_ms = 0U;
+  std::uint32_t heartbeats = 0U;
+  std::uint32_t status_polls = 1U;
+  std::uint32_t meter_samples = 0U;
+  std::uint32_t durable_records = 0U;
+  std::uint32_t session_renewals = 0U;
+  std::uint32_t diagnostics_requests = 0U;
+  std::uint32_t ota_manifest_checks = 0U;
+  std::uint32_t ota_downloads = 0U;
+  bool false_low = false;
+  bool allocation_stable = true;
+  pm::FragmentingInternalHeap<16U> hour_arena(196'608U);
+  const pm::HeapAllocationId hour_persistent =
+      hour_arena.allocateAt(65'536U, 32'768U);
+  const std::size_t hour_warm_largest = hour_arena.largestFreeBlock();
+  pm::StatusResponsePool<2U, 2048U> hour_status_pool;
+  for (std::uint32_t second = 1U; second <= 3'600U; ++second) {
+    ++meter_samples;
+    const std::uint64_t now_ms = static_cast<std::uint64_t>(second) * 1'000U;
+    pm::MemoryOperationContext context = pm::MemoryOperationContext::Idle;
+    std::uint32_t free_internal = 72'348U;
+    std::uint32_t largest_internal = 33'780U;
+    if (second % 15U == 0U) {
+      context = pm::MemoryOperationContext::TlsActive;
+      free_internal = 38'000U;
+      largest_internal = 20'000U;
+      last_expected_operation_completed_ms = now_ms;
+      ++heartbeats;
+    } else if (second >= 1'800U && second <= 1'804U) {
+      context = pm::MemoryOperationContext::OtaActive;
+      free_internal = 39'000U;
+      largest_internal = 21'000U;
+      last_expected_operation_completed_ms = now_ms;
+      if (second == 1'801U) {
+        ++ota_manifest_checks;
+        ++ota_downloads;
+      }
+    } else if (second % 900U == 17U) {
+      context = pm::MemoryOperationContext::DiagnosticsActive;
+      ++diagnostics_requests;
+    }
+    if (second % 10U == 0U) {
+      ++status_polls;
+      auto response = hour_status_pool.acquire();
+      allocation_stable = allocation_stable && response &&
+                          response.setSize(64U) &&
+                          hour_status_pool.active() == 1U;
+    }
+    if (second % 60U == 0U) {
+      ++durable_records;
+    }
+    if (second == 1'800U) {
+      ++session_renewals;
+    }
+    std::size_t transient_bytes = 0U;
+    if (context == pm::MemoryOperationContext::TlsActive ||
+        context == pm::MemoryOperationContext::OtaActive) {
+      transient_bytes = 32U * 1024U;
+    } else if (context == pm::MemoryOperationContext::DiagnosticsActive) {
+      transient_bytes = 8U * 1024U;
+    } else if (second % 60U == 0U) {
+      transient_bytes = 4U * 1024U;
+    }
+    if (transient_bytes != 0U) {
+      const pm::HeapAllocationId transient =
+          hour_arena.allocate(transient_bytes);
+      allocation_stable =
+          allocation_stable && transient != pm::kInvalidHeapAllocation &&
+          hour_arena.release(transient) && hour_arena.integrityOk() &&
+          hour_arena.largestFreeBlock() == hour_warm_largest &&
+          hour_arena.allocationCount() == 1U;
+    }
+    const auto update = hour_policy.update(
+        free_internal, largest_internal, now_ms, context, true,
+        last_expected_operation_completed_ms);
+    false_low = false_low ||
+                update.current == pm::MemoryPressureState::LowTotalMemory;
+  }
+  const pm::MemoryPressureMetrics hour_metrics =
+      hour_policy.metrics(3'600'000U);
+  const bool hour_arena_released =
+      hour_arena.release(hour_persistent) && hour_arena.integrityOk() &&
+      hour_arena.allocationCount() == 0U &&
+      hour_arena.largestFreeBlock() == 196'608U;
+  check(!false_low && hour_metrics.state == pm::MemoryPressureState::Normal &&
+            hour_metrics.entry_count == 0U && heartbeats == 240U &&
+            status_polls == 361U && meter_samples == 3'600U &&
+            durable_records == 60U && session_renewals == 1U &&
+            diagnostics_requests == 4U && ota_manifest_checks == 1U &&
+            ota_downloads == 1U && allocation_stable &&
+            hour_arena_released && hour_status_pool.active() == 0U &&
+            hour_status_pool.exhaustions() == 0U &&
+            hour_metrics.tls_transient_minimum_free_internal_bytes == 38'000U &&
+            hour_metrics.ota_transient_minimum_free_internal_bytes == 39'000U,
+        "one-hour operation-aware soak covers 15-second TLS, 10-second Status, "
+        "durable writes, diagnostics, and OTA without a false memory latch");
+
+  pm::MemoryPressurePolicy day_policy;
+  last_expected_operation_completed_ms = 0U;
+  std::uint32_t day_heartbeats = 0U;
+  std::uint32_t day_heartbeat_opportunities = 0U;
+  std::uint32_t day_status_polls = 1U;
+  std::uint32_t day_meter_samples = 0U;
+  std::uint32_t day_durable_records = 0U;
+  std::uint32_t day_session_renewals = 0U;
+  std::uint32_t day_diagnostics_requests = 0U;
+  std::uint32_t outage_heartbeat_failures = 0U;
+  std::uint32_t outage_recoveries = 0U;
+  std::uint32_t fragmentation_observations = 0U;
+  std::uint32_t genuine_low_observations = 0U;
+  std::uint32_t ota_successes = 0U;
+  std::uint32_t ota_rollbacks = 0U;
+  bool low_outside_injected_episode = false;
+  bool outage_seen = false;
+  bool day_allocation_stable = true;
+  pm::FragmentingInternalHeap<16U> day_arena(196'608U);
+  const pm::HeapAllocationId day_persistent =
+      day_arena.allocateAt(65'536U, 32'768U);
+  const std::size_t day_warm_largest = day_arena.largestFreeBlock();
+  pm::StatusResponsePool<2U, 2048U> day_status_pool;
+  for (std::uint32_t second = 1U; second <= 86'400U; ++second) {
+    ++day_meter_samples;
+    const std::uint64_t now_ms = static_cast<std::uint64_t>(second) * 1'000U;
+    pm::MemoryOperationContext context = pm::MemoryOperationContext::Idle;
+    std::uint32_t free_internal = 72'348U;
+    std::uint32_t largest_internal = 33'780U;
+    const bool fragmentation_episode =
+        second >= 20'000U && second <= 20'009U;
+    const bool low_episode = second >= 40'000U && second <= 40'002U;
+    const bool low_intermediate = second == 40'003U;
+    const bool ota_success_window =
+        second >= 60'000U && second <= 60'004U;
+    const bool ota_rollback_window =
+        second >= 70'000U && second <= 70'004U;
+    if (second % 15U == 0U) {
+      ++day_heartbeat_opportunities;
+      if (second >= 43'200U && second < 43'320U) {
+        ++outage_heartbeat_failures;
+        outage_seen = true;
+      } else if (outage_seen && second >= 43'320U &&
+                 outage_recoveries == 0U) {
+        ++outage_recoveries;
+      }
+    }
+    if (fragmentation_episode) {
+      free_internal = 72'280U;
+      largest_internal = 24'564U;
+    } else if (low_episode) {
+      free_internal = 52U * 1024U;
+      largest_internal = 28U * 1024U;
+    } else if (low_intermediate) {
+      free_internal = 60U * 1024U;
+      largest_internal = 30U * 1024U;
+    } else if (ota_success_window || ota_rollback_window) {
+      context = pm::MemoryOperationContext::OtaActive;
+      free_internal = 37'000U;
+      largest_internal = 20'500U;
+      last_expected_operation_completed_ms = now_ms;
+      if (second == 60'000U) {
+        ++ota_successes;
+      }
+      if (second == 70'000U) {
+        ++ota_rollbacks;
+      }
+    } else if (second % 8'640U == 17U) {
+      context = pm::MemoryOperationContext::DiagnosticsActive;
+      ++day_diagnostics_requests;
+    } else if (second % 15U == 0U) {
+      context = pm::MemoryOperationContext::TlsActive;
+      free_internal = 36'000U;
+      largest_internal = 20'000U;
+      last_expected_operation_completed_ms = now_ms;
+      ++day_heartbeats;
+    }
+    if (second % 10U == 0U) {
+      ++day_status_polls;
+      auto response = day_status_pool.acquire();
+      day_allocation_stable = day_allocation_stable && response &&
+                              response.setSize(64U) &&
+                              day_status_pool.active() == 1U;
+    }
+    if (second % 60U == 0U) {
+      ++day_durable_records;
+    }
+    if (second % 1'800U == 0U) {
+      ++day_session_renewals;
+    }
+    std::size_t transient_bytes = 0U;
+    if (context == pm::MemoryOperationContext::TlsActive ||
+        context == pm::MemoryOperationContext::OtaActive) {
+      transient_bytes = 32U * 1024U;
+    } else if (context == pm::MemoryOperationContext::DiagnosticsActive) {
+      transient_bytes = 8U * 1024U;
+    } else if (second % 60U == 0U) {
+      transient_bytes = 4U * 1024U;
+    }
+    if (transient_bytes != 0U) {
+      const pm::HeapAllocationId transient =
+          day_arena.allocate(transient_bytes);
+      day_allocation_stable =
+          day_allocation_stable && transient != pm::kInvalidHeapAllocation &&
+          day_arena.release(transient) && day_arena.integrityOk() &&
+          day_arena.largestFreeBlock() == day_warm_largest &&
+          day_arena.allocationCount() == 1U;
+    }
+    const auto update = day_policy.update(
+        free_internal, largest_internal, now_ms, context, true,
+        last_expected_operation_completed_ms);
+    if (update.current == pm::MemoryPressureState::Fragmented) {
+      ++fragmentation_observations;
+    }
+    if (update.current == pm::MemoryPressureState::LowTotalMemory) {
+      ++genuine_low_observations;
+      low_outside_injected_episode =
+          low_outside_injected_episode ||
+          !(second >= 40'002U && second <= 40'010U);
+    }
+  }
+  const pm::MemoryPressureMetrics day_metrics =
+      day_policy.metrics(86'400'000U);
+  const bool day_arena_released =
+      day_arena.release(day_persistent) && day_arena.integrityOk() &&
+      day_arena.allocationCount() == 0U &&
+      day_arena.largestFreeBlock() == 196'608U;
+  check(!low_outside_injected_episode &&
+            day_metrics.state == pm::MemoryPressureState::Normal &&
+            day_metrics.entry_count == 1U &&
+            day_metrics.recovery_count == 2U &&
+            day_metrics.fragmentation_entry_count == 1U &&
+            day_metrics.fragmentation_recovery_count == 1U &&
+            day_heartbeat_opportunities == 5'760U &&
+            day_heartbeats > 5'750U && day_status_polls == 8'641U &&
+            day_meter_samples == 86'400U && day_durable_records == 1'440U &&
+            day_session_renewals == 48U && day_diagnostics_requests == 10U &&
+            outage_heartbeat_failures == 8U && outage_recoveries == 1U &&
+            fragmentation_observations > 0U &&
+            genuine_low_observations > 0U && ota_successes == 1U &&
+            ota_rollbacks == 1U && day_allocation_stable &&
+            day_arena_released && day_status_pool.active() == 0U &&
+            day_status_pool.exhaustions() == 0U,
+        "twenty-four-hour memory soak recovers from one fragmentation and one "
+        "genuine low-total episode while TLS, OTA success, and rollback "
+        "transients remain operation-scoped");
 }
 
 void testBoundedStatusPrimitives() {
@@ -1229,6 +1580,24 @@ void testCompactStatusSerializationAndFreshness() {
   snapshot.heap.minimum_free_internal_bytes = 70'000U;
   snapshot.heap.largest_internal_block_bytes = 52'000U;
   snapshot.heap.integrity_ok = true;
+  snapshot.ota.protocol_version = 2U;
+  pm::copyCompactText(snapshot.ota.authentication_mode,
+                      "existing_device_hmac");
+  pm::copyCompactText(snapshot.ota.state, "downloading");
+  pm::copyCompactText(snapshot.ota.deployment_id,
+                      "12345678-1234-1234-1234-123456789abc");
+  pm::copyCompactText(snapshot.ota.target_version, "1.0.11");
+  pm::copyCompactText(
+      snapshot.ota.target_sha256,
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+  pm::copyCompactText(snapshot.ota.running_partition, "ota_0");
+  pm::copyCompactText(snapshot.ota.target_partition, "ota_1");
+  pm::copyCompactText(snapshot.ota.last_result, "in_progress");
+  snapshot.ota.bytes_received = 524'288U;
+  snapshot.ota.image_size = 1'048'576U;
+  snapshot.ota.progress_percent = 50U;
+  snapshot.ota.in_progress = true;
+  snapshot.ota.rollback_supported = true;
   snapshot.server_state = pm::ServerFreshnessState::Live;
   const pm::CompactUiBuildMetadata metadata{
       "1.0.9", "abcdef0", "2026-08-01T12:00:00Z", "native-tests",
@@ -1241,12 +1610,48 @@ void testCompactStatusSerializationAndFreshness() {
   check(result.success && result.bytes < response.size() &&
             body.find("Outdoor \\\\\\\"AC\\\\\\\"") !=
                 std::string::npos &&
-            body.find("\"state\":\"live\"") != std::string::npos &&
-            body.find("\"age_seconds\":0") != std::string::npos &&
-            body.find("\"largest_internal_block_bytes\":52000") !=
-                std::string::npos,
+             body.find("\"state\":\"live\"") != std::string::npos &&
+             body.find("\"age_seconds\":0") != std::string::npos &&
+             body.find("\"low_memory\":false") != std::string::npos &&
+             body.find("\"memory_state\":\"normal\"") !=
+                 std::string::npos &&
+             body.find("\"memory_severity\":\"normal\"") !=
+                 std::string::npos &&
+             body.find("\"tls_ready\":true") != std::string::npos &&
+             body.find("\"operation_context\":\"idle\"") !=
+                 std::string::npos &&
+             body.find("\"authentication_mode\":\"existing_device_hmac\"") !=
+                 std::string::npos &&
+             body.find("\"progress_percent\":50") != std::string::npos &&
+             body.find("\"rollback_supported\":true") !=
+                 std::string::npos &&
+             body.find("\"largest_internal_block_bytes\":52000") !=
+                 std::string::npos,
         "compact status serializes within two KiB, escapes text, and retains "
-        "a valid zero-second heartbeat age");
+        "freshness plus explicit memory diagnostics");
+
+  constexpr std::array<pm::MemoryPressureState, 5U> memory_states{{
+      pm::MemoryPressureState::Normal,
+      pm::MemoryPressureState::PressureWarning,
+      pm::MemoryPressureState::Fragmented,
+      pm::MemoryPressureState::LowTotalMemory,
+      pm::MemoryPressureState::Recovering,
+  }};
+  bool low_mapping_valid = true;
+  for (const pm::MemoryPressureState state : memory_states) {
+    snapshot.memory.state = state;
+    const auto mapped = pm::serializeCompactUiStatus(
+        snapshot, metadata, response.data(), response.size());
+    const std::string mapped_body(response.data(), mapped.bytes);
+    const bool serialized_low =
+        mapped_body.find("\"low_memory\":true") != std::string::npos;
+    low_mapping_valid =
+        low_mapping_valid && mapped.success &&
+        serialized_low == (state == pm::MemoryPressureState::LowTotalMemory);
+  }
+  check(low_mapping_valid,
+        "compact status sets low_memory only for LowTotalMemory");
+  snapshot.memory.state = pm::MemoryPressureState::Normal;
 
   std::array<char, 128U> too_small{};
   const auto truncated = pm::serializeCompactUiStatus(
@@ -1988,6 +2393,278 @@ void testCleanupRecoveryPolicy() {
   check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
         "unknown cleanup stage is fail-safe");
 }
+
+pm::ota_v2::Manifest otaVectorManifest() {
+  pm::ota_v2::Manifest manifest;
+  manifest.available = true;
+  manifest.schema_version = "pm-ota-manifest/2";
+  manifest.protocol_version = "pm-protocol/1.0.0";
+  manifest.deployment_id = "123e4567-e89b-12d3-a456-426614174001";
+  manifest.release_id = "123e4567-e89b-12d3-a456-426614174002";
+  manifest.device_id = "123e4567-e89b-12d3-a456-426614174000";
+  manifest.version = "1.0.11";
+  manifest.project_name = "power-monitor-sensor";
+  manifest.hardware_target = "esp32-s3";
+  manifest.protocol_min = "pm-protocol/1.0.0";
+  manifest.protocol_max = "pm-protocol/1.0.0";
+  manifest.size_bytes = 1'456'789U;
+  manifest.sha256 = std::string(64U, 'a');
+  for (std::size_t index = 1U; index < manifest.sha256.size(); index += 2U)
+    manifest.sha256[index] = 'b';
+  manifest.build_hash = std::string(64U, 'c');
+  for (std::size_t index = 1U; index < manifest.build_hash.size(); index += 2U)
+    manifest.build_hash[index] = 'd';
+  manifest.not_before = "2026-08-02T20:00:00Z";
+  manifest.expires_at = "2026-08-03T20:00:00Z";
+  manifest.allow_downgrade = false;
+  manifest.attempt = 1U;
+  manifest.hmac_algorithm = "HMAC-SHA256";
+  manifest.hmac_key_context = "pm-ota-manifest-v2/server-to-device";
+  manifest.download_path =
+      "/api/v1/device-firmware/123e4567-e89b-12d3-a456-426614174002/"
+      "download?deployment_id=123e4567-e89b-12d3-a456-426614174001";
+  manifest.manifest_hmac =
+      "X5isSei-HPTOld2nWqS5TNgklg8rooUIg7hlix9WuRY";
+  return manifest;
+}
+
+void testOtaV2Policy() {
+  using namespace pm::ota_v2;
+  const Manifest vector = otaVectorManifest();
+  const std::string expected_canonical =
+      "{\"allow_downgrade\":false,\"attempt\":1,\"build_hash\":\"" +
+      vector.build_hash +
+      "\",\"deployment_id\":\"123e4567-e89b-12d3-a456-426614174001\","
+      "\"device_id\":\"123e4567-e89b-12d3-a456-426614174000\","
+      "\"download_path\":\"/api/v1/device-firmware/"
+      "123e4567-e89b-12d3-a456-426614174002/download?deployment_id="
+      "123e4567-e89b-12d3-a456-426614174001\","
+      "\"expires_at\":\"2026-08-03T20:00:00Z\","
+      "\"hardware_target\":\"esp32-s3\","
+      "\"hmac_algorithm\":\"HMAC-SHA256\","
+      "\"hmac_key_context\":\"pm-ota-manifest-v2/server-to-device\","
+      "\"not_before\":\"2026-08-02T20:00:00Z\","
+      "\"project_name\":\"power-monitor-sensor\","
+      "\"protocol_max\":\"pm-protocol/1.0.0\","
+      "\"protocol_min\":\"pm-protocol/1.0.0\","
+      "\"protocol_version\":\"pm-protocol/1.0.0\","
+      "\"release_id\":\"123e4567-e89b-12d3-a456-426614174002\","
+      "\"schema_version\":\"pm-ota-manifest/2\",\"sha256\":\"" +
+      vector.sha256 +
+      "\",\"size_bytes\":1456789,\"version\":\"1.0.11\"}";
+  check(canonicalManifest(vector) == expected_canonical,
+        "OTA v2 canonical bytes match the shared Python vector");
+
+  std::string encoded = expected_canonical;
+  encoded.pop_back();
+  encoded += ",\"manifest_hmac\":\"" + vector.manifest_hmac + "\"}";
+  Manifest parsed;
+  std::string error;
+  check(parseManifest(encoded, parsed, error) &&
+            canonicalManifest(parsed) == expected_canonical,
+        "OTA v2 strict manifest parser accepts the normative vector");
+  const std::string duplicate =
+      encoded.substr(0U, encoded.size() - 1U) +
+      ",\"attempt\":2}";
+  check(!parseManifest(duplicate, parsed, error),
+        "OTA v2 rejects duplicate manifest keys");
+  const std::string unexpected =
+      encoded.substr(0U, encoded.size() - 1U) + ",\"extra\":true}";
+  check(!parseManifest(unexpected, parsed, error),
+        "OTA v2 rejects unexpected manifest keys");
+  std::string wrong_download = encoded;
+  const std::string release_path = vector.release_id + "/download";
+  const std::size_t release_path_offset = wrong_download.find(release_path);
+  wrong_download.replace(release_path_offset, vector.release_id.size(),
+                         "123e4567-e89b-12d3-a456-426614174099");
+  check(!parseManifest(wrong_download, parsed, error),
+        "OTA v2 binds the download route to the signed release ID");
+
+  std::int64_t not_before = 0;
+  check(parseUtcTimestamp(vector.not_before, not_before),
+        "OTA v2 parses strict UTC deployment timestamps");
+  PolicyContext policy;
+  policy.device_id = vector.device_id;
+  policy.current_version = "1.0.10";
+  policy.current_protocol = "pm-protocol/1.0.0";
+  policy.hardware_target = "esp32-s3-n16r8";
+  policy.project_name = "power-monitor-sensor";
+  policy.now_unix_seconds = not_before + 1;
+  policy.partition_size_bytes = 0x600000U;
+  check(validatePolicy(vector, policy, error),
+        "OTA v2 accepts compatible device-specific upgrade");
+
+  Manifest changed = vector;
+  changed.device_id = "123e4567-e89b-12d3-a456-426614174999";
+  check(!validatePolicy(changed, policy, error) &&
+            error == "ota_manifest_device_mismatch",
+        "OTA v2 rejects cross-device replay");
+  policy.now_unix_seconds = not_before - 1;
+  check(!validatePolicy(vector, policy, error) &&
+            error == "ota_manifest_not_yet_valid",
+        "OTA v2 rejects future deployment");
+  std::int64_t expires_at = 0;
+  check(parseUtcTimestamp(vector.expires_at, expires_at),
+        "OTA v2 parses expiration timestamp");
+  policy.now_unix_seconds = expires_at;
+  check(!validatePolicy(vector, policy, error) &&
+            error == "ota_manifest_expired",
+        "OTA v2 rejects expired deployment");
+  policy.now_unix_seconds = not_before + 1;
+  changed = vector;
+  changed.project_name = "other-project";
+  check(!validatePolicy(changed, policy, error) &&
+            error == "ota_project_incompatible",
+        "OTA v2 rejects wrong project");
+  changed = vector;
+  changed.hardware_target = "esp32-c3";
+  check(!validatePolicy(changed, policy, error) &&
+            error == "ota_hardware_incompatible",
+        "OTA v2 rejects wrong chip family");
+  changed = vector;
+  changed.protocol_max = "pm-protocol/2.0.0";
+  check(!validatePolicy(changed, policy, error) &&
+            error == "ota_protocol_incompatible",
+        "OTA v2 rejects wrong protocol range");
+  changed = vector;
+  changed.version = policy.current_version;
+  check(!validatePolicy(changed, policy, error) &&
+            error == "ota_same_version_rejected",
+        "OTA v2 rejects same-version binary");
+  changed.version = "1.0.9";
+  check(!validatePolicy(changed, policy, error) &&
+            error == "ota_downgrade_rejected",
+        "OTA v2 blocks unauthorized downgrade");
+  changed.allow_downgrade = true;
+  check(validatePolicy(changed, policy, error),
+        "OTA v2 permits authenticated explicit downgrade");
+  changed = vector;
+  policy.partition_size_bytes = vector.size_bytes - 1U;
+  check(!validatePolicy(changed, policy, error) &&
+            error == "ota_partition_too_small",
+        "OTA v2 enforces actual inactive partition size");
+  check(validSemver("1.0.11-rc.1+build.7") &&
+            compareSemver("1.0.11-rc.1", "1.0.11") < 0,
+        "OTA v2 implements Semantic Version precedence");
+
+  StreamTracker success(8U);
+  check(success.accept(4U) && success.accept(4U) && success.finish(true),
+        "OTA stream accepts exact successful partition write");
+  StreamTracker timeout(8U);
+  timeout.timeout();
+  check(timeout.failure() == StreamFailure::Timeout,
+        "OTA stream classifies timeout");
+  StreamTracker reset(8U);
+  reset.connectionReset();
+  check(reset.failure() == StreamFailure::ConnectionReset,
+        "OTA stream classifies connection reset");
+  StreamTracker truncated(8U);
+  check(truncated.accept(4U) && !truncated.finish(true) &&
+            truncated.failure() == StreamFailure::Truncated,
+        "OTA stream rejects truncated image");
+  StreamTracker extra(8U);
+  check(!extra.accept(9U) && extra.failure() == StreamFailure::ExtraBytes,
+        "OTA stream rejects extra bytes");
+  StreamTracker hash(8U);
+  check(hash.accept(8U) && !hash.finish(false) &&
+            hash.failure() == StreamFailure::Sha256Mismatch,
+        "OTA stream rejects SHA-256 mismatch");
+  StreamTracker writer(8U);
+  check(!writer.accept(4U, false) &&
+            writer.failure() == StreamFailure::PartitionWriteFailure,
+        "OTA stream rejects inactive-partition write failure");
+
+  check(classifyPostBoot(true, true, "1.0.11", "target-build", "1.0.11",
+                         "target-build", "1.0.10", "previous-build", true) ==
+            PostBootAction::Validate,
+        "pending OTA image validates only after health and authenticated identity match");
+  check(classifyPostBoot(true, false, "1.0.11", "target-build", "1.0.11",
+                         "target-build", "1.0.10", "previous-build", true) ==
+            PostBootAction::Rollback,
+        "pending OTA image rolls back after health failure");
+  check(classifyPostBoot(true, true, "1.0.12", "target-build", "1.0.11",
+                         "target-build", "1.0.10", "previous-build", true) ==
+            PostBootAction::Rollback,
+        "pending OTA image with the wrong running version rolls back");
+  check(classifyPostBoot(true, true, "1.0.11", "wrong-build", "1.0.11",
+                         "target-build", "1.0.10", "previous-build", true) ==
+            PostBootAction::Rollback,
+        "same-version pending OTA image with the wrong build hash rolls back");
+  check(classifyPostBoot(true, true, "1.0.11", "target-build", "1.0.11",
+                         "target-build", "1.0.10", "previous-build", false) ==
+            PostBootAction::Rollback,
+        "pending OTA image without authenticated recovery metadata rolls back");
+  check(classifyPostBoot(false, false, "1.0.10", "previous-build", "1.0.11",
+                         "target-build", "1.0.10", "previous-build", true) ==
+            PostBootAction::ReportRollback,
+        "previous image reports automatic rollback on next boot");
+  check(classifyPostBoot(false, true, "1.0.11", "target-build", "1.0.11",
+                         "target-build", "1.0.10", "previous-build", true) ==
+            PostBootAction::Validate,
+        "already-valid target identity recovers a validation report after a checkpoint gap");
+  check(std::string(reportMilestoneForState(State::DownloadStarting)) ==
+                "download_started" &&
+            std::string(reportMilestoneForState(State::BinaryVerifying)) ==
+                "downloading" &&
+            std::string(reportMilestoneForState(State::RebootPending)) ==
+                "partition_written" &&
+            std::string(reportMilestoneForState(State::Rebooting)) ==
+                "rebooting",
+        "OTA internal lifecycle states map to the strict server aliases");
+  const char *report = nextReportMilestone({}, "validated");
+  bool report_sequence_valid = report != nullptr &&
+                               std::string(report) == "manifest_authenticated";
+  std::string last_report = report == nullptr ? std::string{} : report;
+  constexpr std::array<const char *, 7U> remaining_reports{{
+      "download_started", "downloading", "binary_verified",
+      "partition_written", "rebooting", "post_boot_validation", "validated",
+  }};
+  for (const char *expected : remaining_reports) {
+    report = nextReportMilestone(last_report, "validated");
+    report_sequence_valid =
+        report_sequence_valid && report != nullptr && report == std::string(expected);
+    if (report != nullptr)
+      last_report = report;
+  }
+  check(report_sequence_valid &&
+            nextReportMilestone(last_report, "validated") == nullptr &&
+            std::string(nextReportMilestone("rebooting", "rolled_back")) ==
+                "rollback_detected" &&
+            std::string(nextReportMilestone("rollback_detected",
+                                            "rolled_back")) == "rolled_back" &&
+            std::string(nextReportMilestone("download_started", "failed")) ==
+                "failed" &&
+            !reportStateAcceptsFailureEvidence("manifest_authenticated") &&
+            !reportStateAcceptsFailureEvidence("rebooting") &&
+            reportStateAcceptsFailureEvidence("failed") &&
+            reportStateAcceptsFailureEvidence("rollback_detected") &&
+            reportStateAcceptsFailureEvidence("rolled_back"),
+        "OTA report checkpoints replay every legal install and rollback transition");
+
+  RecoveryRecord recovery;
+  recovery.deployment_id = vector.deployment_id;
+  recovery.release_id = vector.release_id;
+  recovery.target_version = vector.version;
+  recovery.target_sha256 = vector.sha256;
+  recovery.target_build_hash = vector.build_hash;
+  recovery.previous_version = "1.0.10";
+  recovery.previous_build_hash = vector.build_hash;
+  recovery.image_size = vector.size_bytes;
+  recovery.bytes_received = vector.size_bytes;
+  recovery.progress_percent = 100U;
+  recovery.attempt = 1U;
+  recovery.state = State::RebootPending;
+  recovery.last_report_state = "partition_written";
+  recovery.pending_reboot = true;
+  RecoveryRecord restored;
+  check(parseRecovery(serializeRecovery(recovery), restored) &&
+            restored.pending_reboot && restored.state == State::RebootPending &&
+            restored.image_size == vector.size_bytes &&
+            restored.bytes_received == vector.size_bytes &&
+            restored.progress_percent == 100U &&
+            restored.last_report_state == "partition_written",
+        "OTA recovery preserves pending image and report checkpoints across reset");
+}
 } // namespace
 
 int main() {
@@ -2005,6 +2682,7 @@ int main() {
   testProtocolCanonicalization();
   testAuthenticationPolicy();
   testMemoryPressurePolicy();
+  testOperationAwareMemorySoaks();
   testBoundedStatusPrimitives();
   testCompactStatusSerializationAndFreshness();
   testBoundedStatusAuthorizationAndResponsePath();
@@ -2012,6 +2690,7 @@ int main() {
   testFragmentationIncidentAndSoaks();
   testStoragePolicy();
   testCleanupRecoveryPolicy();
+  testOtaV2Policy();
   testProvisioningTransaction();
   if (failures == 0) {
     std::cout << "native C++ tests passed\n";

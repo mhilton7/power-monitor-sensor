@@ -365,7 +365,7 @@ disabled.
 | `PM-TASK-001` | TASK | Task or primitive creation failed | Inspect boot heap and exact build |
 | `PM-TASK-002` | TASK | Stack/history resource low or busy | Run `tasks` and capture high-water marks |
 | `PM-MEM-001` | MEMORY | Free heap is below 32 KiB | Capture `memory`, `tasks`, and the operation preceding the warning |
-| `PM-OTA-005` | OTA | Manifest signature invalid | Use the enrolled public key and correctly signed manifest |
+| `PM-OTA-005` | OTA | Manifest authentication invalid | Verify the device is still enrolled, the server used the device-derived OTA HMAC key, and the canonical v2 manifest was not altered in transit |
 | `PM-OTA-008` | OTA | Downloaded image hash mismatched | Regenerate/rehost the release artifact |
 
 Unknown Wi-Fi reasons retain their original numeric code as `PM-WIFI-099`.

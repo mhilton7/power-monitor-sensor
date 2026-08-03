@@ -36,7 +36,10 @@ def canonical(manifest: dict) -> bytes:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Sign a central-server OTA manifest with an external Ed25519 private key"
+        description=(
+            "Sign an optional legacy OTA manifest with an external Ed25519 "
+            "private key; Existing-Trust OTA v2 does not use this tool"
+        )
     )
     parser.add_argument("unsigned_manifest", type=Path)
     parser.add_argument(
@@ -54,7 +57,8 @@ def main() -> None:
         )
     except ImportError as error:
         raise SystemExit(
-            "install the pinned release dependency 'cryptography' in an isolated environment"
+            "install the pinned release dependency 'cryptography' in an "
+            "isolated environment"
         ) from error
     manifest = json.loads(args.unsigned_manifest.read_text(encoding="utf-8"))
     manifest.pop("signature", None)

@@ -19,10 +19,13 @@ std::uint64_t monotonicMs() {
 
 class HighMemoryLease final {
 public:
-  explicit HighMemoryLease(Diagnostics &diagnostics,
-                           const TickType_t timeout = pdMS_TO_TICKS(5000))
+  explicit HighMemoryLease(
+      Diagnostics &diagnostics,
+      const MemoryOperationContext context =
+          MemoryOperationContext::StorageMaintenance,
+      const TickType_t timeout = pdMS_TO_TICKS(5000))
       : diagnostics_(diagnostics),
-        acquired_(diagnostics_.acquireHighMemoryOperation(timeout)) {}
+        acquired_(diagnostics_.acquireHighMemoryOperation(context, timeout)) {}
 
   ~HighMemoryLease() {
     if (acquired_) {

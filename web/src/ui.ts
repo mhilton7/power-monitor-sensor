@@ -1,5 +1,6 @@
 import type {
   EffectiveConfig,
+  MemoryState,
   NetworkSettingsPayload,
   ServerFreshnessState,
   SetupPayload,
@@ -57,13 +58,17 @@ export const renderStatus = (): string => `
   <section class="panel" aria-labelledby="health-title"><h2 id="health-title">Health</h2>
     <dl class="status-rows">
       <div><dt>Wi-Fi</dt><dd id="wifi-state">—</dd></div>
+      <div><dt>IP address</dt><dd id="ip-address">—</dd></div>
       <div><dt>Signal strength</dt><dd id="signal">—</dd></div>
       <div><dt>Server</dt><dd id="server-state">—</dd></div>
       <div><dt>Last successful heartbeat</dt><dd id="heartbeat-at">—</dd></div>
       <div id="server-reason-row" hidden><dt>Reason</dt><dd id="server-reason">—</dd></div>
       <div><dt>microSD</dt><dd id="storage-state">—</dd></div>
       <div><dt>PZEM meter</dt><dd id="meter-state">—</dd></div>
+      <div><dt>Memory</dt><dd id="memory-state">—</dd></div>
+      <div><dt>TLS readiness</dt><dd id="tls-ready">—</dd></div>
       <div><dt>Durable backlog</dt><dd id="backlog">—</dd></div>
+      <div><dt>OTA</dt><dd id="ota-status">—</dd></div>
       <div><dt>Firmware</dt><dd id="firmware">—</dd></div>
       <div><dt>Uptime</dt><dd id="uptime">—</dd></div>
     </dl>
@@ -120,6 +125,40 @@ export interface ServerFreshnessPresentation {
   reason: string;
   headerLabel: string;
 }
+
+export const memoryStateLabel = (state: MemoryState): string =>
+  ({
+    normal: "Memory normal",
+    pressure_warning: "Reduced memory headroom",
+    fragmented: "Memory fragmented · TLS waiting for a contiguous block",
+    low_total_memory: "Low memory",
+    recovering: "Memory recovering",
+  })[state];
+
+export const otaStatusLabel = (ota: UiStatus["ota"]): string => {
+  if (!ota) return "Not reported";
+  if (
+    ota.rollback_detected ||
+    ota.state === "rollback_detected" ||
+    ota.state === "rolled_back"
+  ) {
+    return "Automatic rollback confirmed";
+  }
+  if (ota.in_progress) {
+    const target = ota.target_version ? ` to ${ota.target_version}` : "";
+    return `Installing${target} · ${ota.progress_percent}%`;
+  }
+  if (ota.pending_reboot || ota.state === "reboot_pending") {
+    return "Firmware verified · reboot pending";
+  }
+  if (ota.state === "completed" || ota.state === "validated") {
+    return "Installed and verified";
+  }
+  if (ota.state === "failed" || ota.last_result === "failed") {
+    return "Update failed";
+  }
+  return ota.protocol_version >= 2 ? "Ready for server OTA" : "Legacy OTA only";
+};
 
 const ageLabel = (seconds: number | null): string => {
   if (seconds === null) return "Never";
@@ -229,13 +268,7 @@ export function updateStatusFreshness(
   const freshness = resolveServerFreshness(status, elapsedSeconds);
   setText(root, "#server-state", freshness.serverLabel);
   setText(root, "#heartbeat-at", freshness.heartbeatLabel);
-  setText(
-    root,
-    "#header-state",
-    status.health.low_memory && freshness.state === "live"
-      ? "Memory pressure"
-      : freshness.headerLabel,
-  );
+  setText(root, "#header-state", freshness.headerLabel);
   const reasonRow = root.querySelector<HTMLElement>("#server-reason-row");
   if (reasonRow) reasonRow.hidden = !freshness.reason;
   setText(root, "#server-reason", freshness.reason || "—");
@@ -278,6 +311,7 @@ export function updateStatus(root: ParentNode, status: UiStatus): void {
     "#signal",
     status.health.wifi === "connected" ? `${status.health.rssi_dbm} dBm` : "—",
   );
+  setText(root, "#ip-address", status.health.ip_address || "—");
   updateStatusFreshness(root, status);
   setText(
     root,
@@ -289,11 +323,21 @@ export function updateStatus(root: ParentNode, status: UiStatus): void {
     "#meter-state",
     status.health.meter === "healthy" ? "Healthy" : "Degraded",
   );
+  const memoryState =
+    status.health.memory_state ??
+    (status.health.low_memory ? "low_total_memory" : "normal");
+  setText(root, "#memory-state", memoryStateLabel(memoryState));
+  setText(
+    root,
+    "#tls-ready",
+    status.health.tls_ready === false ? "Waiting" : "Ready",
+  );
   setText(
     root,
     "#backlog",
     `${status.sync.backlog} reading${status.sync.backlog === 1 ? "" : "s"}`,
   );
+  setText(root, "#ota-status", otaStatusLabel(status.ota));
   setText(root, "#firmware", status.device.firmware);
   setText(root, "#uptime", duration(status.device.uptime_seconds));
 }
@@ -327,8 +371,6 @@ export function renderSetup(config: EffectiveConfig, firstRun = false): string {
       <label>Sample interval (s)<input name="sample_interval_seconds" type="number" min="1" max="60" value="${config.sample_interval_seconds}"></label>
       <label>Durable log interval (s)<input name="durable_log_interval_seconds" type="number" min="10" max="3600" value="${config.durable_log_interval_seconds}"></label>
       <label>Heartbeat interval (s)<input name="heartbeat_interval_seconds" type="number" min="5" max="3600" value="${config.heartbeat_interval_seconds}"></label>
-      <label class="wide">OTA signing public key (leave blank to keep current)<textarea name="ota_signing_public_key_pem" rows="4" autocomplete="off"></textarea></label>
-      <label>OTA signing key ID<input name="ota_signing_key_id" value="${escapeHtml(config.ota_signing_key_id)}"></label>
     </div></details>
     <p id="setup-result" class="wide" role="status"></p>
     <button class="primary wide" type="submit">Save and verify setup</button>
@@ -348,8 +390,6 @@ export function readSetupForm(form: HTMLFormElement): SetupPayload {
     server_url: value(form, "server_url"),
     server_ca_pem: value(form, "server_ca_pem"),
     server_fingerprint: "",
-    ota_signing_public_key_pem: value(form, "ota_signing_public_key_pem"),
-    ota_signing_key_id: value(form, "ota_signing_key_id"),
     enrollment_token: value(form, "enrollment_token"),
     admin_password: value(form, "admin_password"),
     connection_mode: "push",
@@ -362,7 +402,6 @@ export function readConfiguredSetupForm(
   current: EffectiveConfig,
 ): { config: EffectiveConfig; network: NetworkSettingsPayload } {
   const ca = value(form, "server_ca_pem");
-  const otaKey = value(form, "ota_signing_public_key_pem");
   return {
     config: {
       ...current,
@@ -390,9 +429,7 @@ export function readConfiguredSetupForm(
       server_url: value(form, "server_url"),
       tls_trust_action: ca ? "replace_ca" : "keep",
       server_ca_pem: ca || undefined,
-      ota_trust_action: otaKey ? "replace" : "keep",
-      ota_signing_public_key_pem: otaKey || undefined,
-      ota_signing_key_id: value(form, "ota_signing_key_id") || undefined,
+      ota_trust_action: "keep",
       connection_mode: "push",
     },
   };
@@ -404,7 +441,6 @@ export const clearSecrets = (form: HTMLFormElement): void => {
     "server_ca_pem",
     "enrollment_token",
     "admin_password",
-    "ota_signing_public_key_pem",
   ]) {
     const field = form.elements.namedItem(name) as
       | HTMLInputElement
@@ -439,6 +475,21 @@ export function updateDiagnostics(root: ParentNode, data: UiDiagnostics): void {
   const list = root.querySelector<HTMLElement>("#diagnostic-values");
   if (!list) return;
   list.innerHTML = [
+    row("Memory state", memoryStateLabel(data.memory.memory_state)),
+    row("Memory severity", data.memory.severity),
+    row("TLS readiness", data.memory.tls_ready ? "Ready" : "Waiting"),
+    row("High-memory owner", data.memory.high_memory_owner),
+    row(
+      "TLS transient minimum",
+      `${data.memory.tls_transient_minimum_free_internal_bytes.toLocaleString()} B`,
+    ),
+    row(
+      "OTA transient minimum",
+      `${data.memory.ota_transient_minimum_free_internal_bytes.toLocaleString()} B`,
+    ),
+    row("Fragmentation entries", String(data.memory.fragmentation_entries)),
+    row("Low-total entries", String(data.memory.low_total_entries)),
+    row("Recoveries", String(data.memory.recoveries)),
     row(
       "Free internal heap",
       `${data.memory.free_internal_heap_bytes.toLocaleString()} B`,

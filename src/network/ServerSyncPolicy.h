@@ -6,6 +6,7 @@
 #include <string>
 
 #include "core/HeapTelemetry.h"
+#include "core/MemoryPressurePolicy.h"
 #include "core/StringView.h"
 
 namespace pm {
@@ -30,6 +31,11 @@ constexpr std::uint32_t kMinimumInternalHeapBytes = 64U * 1024U;
 // requirement while this exact binary awaits separate physical validation;
 // the independent total-heap guard preserves the remaining network/UI reserve.
 constexpr std::uint32_t kMinimumLargestInternalBlockBytes = 32U * 1024U;
+static_assert(kMinimumInternalHeapBytes == kTlsMinimumFreeInternalBytes,
+              "TLS total-heap guard must match memory diagnostics");
+static_assert(kMinimumLargestInternalBlockBytes ==
+                  kTlsMinimumLargestInternalBlockBytes,
+              "TLS contiguous-block guard must match memory diagnostics");
 constexpr std::uint32_t kMinimumPostResponseInternalHeapBytes = 24U * 1024U;
 
 enum class QueueResult : std::uint8_t {
@@ -196,6 +202,17 @@ constexpr bool secondaryOperationsAllowed(
 constexpr bool shouldScheduleEventIdleDelay(
     const bool operation_succeeded, const bool page_job_pending) {
   return operation_succeeded && !page_job_pending;
+}
+constexpr std::uint64_t manifestPollDeadline(
+    const bool firmware_release_available,
+    const std::uint64_t current_deadline_ms, const std::uint64_t now_ms) {
+  // Heartbeat and manifest requests share the server-sync single-flight
+  // owner. Moving the deadline to now schedules the manifest for the next
+  // tick, after the heartbeat transport has been destroyed. A false signal
+  // preserves any existing deadline or deployment work.
+  return firmware_release_available && current_deadline_ms > now_ms
+             ? now_ms
+             : current_deadline_ms;
 }
 
 } // namespace sync_policy

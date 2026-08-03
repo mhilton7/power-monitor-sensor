@@ -138,7 +138,7 @@ Limits measurementLimits(const MeasurementRuntimeConfig &config) {
 
 Application::Application()
     : network_(config_, clock_), storage_coordinator_(storage_, diagnostics_),
-      ota_(config_) {}
+      ota_(config_, diagnostics_) {}
 
 bool Application::begin() {
   Serial.begin(pins::SERIAL_BAUD);
@@ -221,6 +221,11 @@ bool Application::begin() {
   if (!config_.begin()) {
     PM_LOG_FATAL("CONFIG", "CONFIG_INIT_FAILED",
                  "error=PM-CONFIG-001 storage=nvs");
+    return false;
+  }
+  if (!ota_.begin()) {
+    PM_LOG_FATAL("OTA", "RECOVERY_INIT_FAILED",
+                 "error=PM-OTA-011 configuration_erased=false");
     return false;
   }
   logger.setLevel(
@@ -535,8 +540,14 @@ void Application::syncTask() {
       "name=ServerSyncTask core=%d priority=%u stack_bytes=%lu watchdog=false",
       xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
       static_cast<unsigned long>(task_config::kServerSyncStackBytes));
+  std::uint64_t next_ota_report_ms = 0U;
   for (;;) {
     sync_->tick();
+    const std::uint64_t now = clock_.monotonicMs();
+    if (ota_.hasPendingReport() && now >= next_ota_report_ms) {
+      (void)ota_.flushPendingReport();
+      next_ota_report_ms = now + 30'000U;
+    }
     ++sync_progress_;
     vTaskDelay(pdMS_TO_TICKS(250));
   }
@@ -624,8 +635,11 @@ void Application::healthTask() {
     const std::uint32_t free_internal = heap.free_internal_bytes;
     const std::uint32_t largest_internal =
         heap.largest_internal_block_bytes;
-    const MemoryPressureUpdate pressure =
-        memory_pressure_.update(free_internal, largest_internal, now);
+    const MemoryOperationContext operation_context =
+        diagnostics_.memoryOperationContext();
+    const MemoryPressureUpdate pressure = memory_pressure_.update(
+        free_internal, largest_internal, now, operation_context,
+        heap.integrity_ok, diagnostics_.lastMemoryOperationCompletedMs());
     diagnostics_.setMemoryPressureMetrics(memory_pressure_.metrics(now));
     if (pressure.changed) {
       const bool constrained =
@@ -633,13 +647,15 @@ void Application::healthTask() {
       PM_LOG_WARN(
           "MEMORY", "MEMORY_PRESSURE_STATE_CHANGED",
           "previous=%s current=%s transitions=%lu free_internal=%lu "
-          "largest_internal=%lu primary_measurement_preserved=true "
+          "largest_internal=%lu operation_context=%s "
+          "primary_measurement_preserved=true "
           "heavy_ui_deferred=%s",
           memoryPressureStateName(pressure.previous),
           memoryPressureStateName(pressure.current),
           static_cast<unsigned long>(memory_pressure_.transitions()),
           static_cast<unsigned long>(free_internal),
           static_cast<unsigned long>(largest_internal),
+          memoryOperationContextName(operation_context),
           constrained ? "true" : "false");
       const MemoryPressureMetrics memory = memory_pressure_.metrics(now);
       char detail[384]{};

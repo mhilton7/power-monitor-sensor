@@ -1,0 +1,33 @@
+{
+  "schema": "pm-ota-manifest-test-vector/1",
+  "description": "Existing device credential OTA manifest HKDF and HMAC vector",
+  "secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "device_id": "123e4567-e89b-12d3-a456-426614174000",
+  "hkdf_salt_utf8": "123e4567-e89b-12d3-a456-426614174000",
+  "hkdf_info_utf8": "pm-ota-manifest-v2/server-to-device",
+  "derived_key_hex": "9e30ed43a977846f163063fb8288c3f56233328b510dbf9d386b3623250af94d",
+  "manifest_without_hmac": {
+    "schema_version": "pm-ota-manifest/2",
+    "protocol_version": "pm-protocol/1.0.0",
+    "deployment_id": "123e4567-e89b-12d3-a456-426614174001",
+    "release_id": "123e4567-e89b-12d3-a456-426614174002",
+    "device_id": "123e4567-e89b-12d3-a456-426614174000",
+    "version": "1.0.11",
+    "project_name": "power-monitor-sensor",
+    "hardware_target": "esp32-s3",
+    "protocol_min": "pm-protocol/1.0.0",
+    "protocol_max": "pm-protocol/1.0.0",
+    "size_bytes": 1456789,
+    "sha256": "abababababababababababababababababababababababababababababababab",
+    "build_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "not_before": "2026-08-02T20:00:00Z",
+    "expires_at": "2026-08-03T20:00:00Z",
+    "allow_downgrade": false,
+    "attempt": 1,
+    "hmac_algorithm": "HMAC-SHA256",
+    "hmac_key_context": "pm-ota-manifest-v2/server-to-device",
+    "download_path": "/api/v1/device-firmware/123e4567-e89b-12d3-a456-426614174002/download?deployment_id=123e4567-e89b-12d3-a456-426614174001"
+  },
+  "canonical_json_utf8": "{\"allow_downgrade\":false,\"attempt\":1,\"build_hash\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"deployment_id\":\"123e4567-e89b-12d3-a456-426614174001\",\"device_id\":\"123e4567-e89b-12d3-a456-426614174000\",\"download_path\":\"/api/v1/device-firmware/123e4567-e89b-12d3-a456-426614174002/download?deployment_id=123e4567-e89b-12d3-a456-426614174001\",\"expires_at\":\"2026-08-03T20:00:00Z\",\"hardware_target\":\"esp32-s3\",\"hmac_algorithm\":\"HMAC-SHA256\",\"hmac_key_context\":\"pm-ota-manifest-v2/server-to-device\",\"not_before\":\"2026-08-02T20:00:00Z\",\"project_name\":\"power-monitor-sensor\",\"protocol_max\":\"pm-protocol/1.0.0\",\"protocol_min\":\"pm-protocol/1.0.0\",\"protocol_version\":\"pm-protocol/1.0.0\",\"release_id\":\"123e4567-e89b-12d3-a456-426614174002\",\"schema_version\":\"pm-ota-manifest/2\",\"sha256\":\"abababababababababababababababababababababababababababababababab\",\"size_bytes\":1456789,\"version\":\"1.0.11\"}",
+  "manifest_hmac_base64url": "X5isSei-HPTOld2nWqS5TNgklg8rooUIg7hlix9WuRY"
+}

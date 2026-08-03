@@ -231,6 +231,7 @@ public:
                       const std::string &ota_public_key);
   bool directionalKeys(crypto::Key32 &device_to_server,
                        crypto::Key32 &server_to_device) const;
+  bool otaManifestKey(crypto::Key32 &server_to_device_ota) const;
   std::string otaPublicKey() const;
 
   std::string ensureSetupPassword();

@@ -28,6 +28,26 @@ The bounded memory policy distinguishes:
 | `low_total_memory` | Total internal memory is below the floor | Preserve meter/storage; defer heavy UI and TLS |
 | `recovering` | Hysteresis is proving stable headroom | Keep optional work bounded until normal |
 
+The calibrated policy uses exact internal-heap thresholds:
+
+- `normal` evidence requires at least 68 KiB total and a largest block of at
+  least 32 KiB;
+- `fragmented` requires at least 64 KiB total with a largest block below
+  32 KiB;
+- `low_total_memory` requires three consecutive idle samples below 56 KiB;
+- below 32 KiB, failed heap integrity, or a critical allocation failure enters
+  the critical state immediately in every operation context; and
+- after TLS/OTA cleanup, a three-second grace precedes idle classification.
+  Three safe samples move a latched low/fragmented state to `recovering`, and
+  three more safe samples return it to `normal`.
+
+Samples taken in `tls_preparing`, `tls_active`, or `ota_active` record transient
+minima but do not classify persistent pressure unless an emergency condition is
+present. A latched `low_total_memory` state remains latched through an
+intermediate 60 KiB or fragmented sample; only the safe recovery sequence can
+clear it. The legacy `health.low_memory` Boolean is true only for
+`low_total_memory`.
+
 Fragmentation never increments authentication, Wi-Fi-disconnect, or external
 transport-failure counters. It does not enter external exponential backoff.
 The local retry path is bounded and resumes after optional allocations are
@@ -136,6 +156,41 @@ libraries. The single-flight task destroys them after every bounded request;
 task-owned payload, response, signing, URL, and cached configuration storage is
 reused around that deliberate transport lifecycle.
 
+## Pinned mbedTLS result (Phase 27)
+
+The pinned `espressif32@6.13.0` Arduino platform links the ESP-IDF/mbedTLS
+libraries supplied as prebuilt framework archives. The selected ESP32-S3
+`qio_opi` framework configuration was inspected in both its shipped
+`tools/sdk/esp32s3/sdkconfig` and generated `include/sdkconfig.h`. It reports:
+
+```text
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384
+# CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH is not set
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=y
+```
+
+The dynamic-buffer and dynamic-free configuration options requested by the
+audit are not enabled in that prebuilt framework. The pinned
+`WiFiClientSecure` API also exposes no `setBufferSizes` method. Adding
+`CONFIG_MBEDTLS_*` names to this application's `build_flags` would compile the
+application against different declarations without rebuilding the linked
+mbedTLS archives; it would not safely change the library and could create an
+ABI/configuration mismatch. This repair therefore does not invent an
+unsupported runtime call or claim those options are active. Enabling them
+would require a separately pinned and fully rebuilt Arduino-as-component or
+custom framework, followed by the same TLS, OTA, rollback, and memory-soak
+validation.
+
+The safe optimization for the current framework is at the application
+boundary: one serialized TLS/OTA owner, a 64 KiB total/32 KiB contiguous
+admission guard, 20 KiB reusable request and 24 KiB reusable response buffers
+in PSRAM, a 2 KiB canonical-HMAC buffer, a 1 KiB URL buffer, a 16 KiB bounded
+OTA manifest parser, and exact `Content-Length` checks before reading bounded
+responses or firmware. TLS objects remain internal-memory and
+transaction-local so their destructors run before the high-memory lease records
+the post-operation grace timestamp.
+
 ## Exact incident fixture
 
 The native incident fixture records:
@@ -221,13 +276,12 @@ measurements. No COM port, serial monitor, upload, or physical ESP32 soak is
 part of this repair run.
 
 `native-sanitized` enables AddressSanitizer, UndefinedBehaviorSanitizer, and
-LeakSanitizer on host toolchains that provide their runtimes. The repository's
-pinned Windows MinGW 5.1 package does not include those runtime libraries, so
-that host runs checked libstdc++ iterators plus stack canaries and prints the
-limitation explicitly. It must not be described as an ASan result. A separate
-native test build compiled with Visual C++ `/fsanitize=address` also passed on
-this host. The installed Windows toolchain does not provide UBSan or
-LeakSanitizer, so neither is claimed.
+LeakSanitizer only on host toolchains that provide their runtimes. The
+repository's pinned Windows MinGW 5.1 package does not include those runtime
+libraries. On this Windows validation run the environment therefore used
+checked libstdc++ iterators and `-fstack-protector-all`; its build and native
+test executable passed. It was not an ASan, UBSan, or LeakSanitizer run, and no
+separate sanitizer-capable toolchain was run for this source revision.
 
 Physical deployment validation remains a later step. It must use the exact
 binary and matching ELF hash, confirm real heap/stack telemetry, and must not

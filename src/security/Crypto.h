@@ -24,6 +24,12 @@ std::string hmacSha256Hex(const std::uint8_t *key, std::size_t key_length,
                           const std::string &data);
 Key32 hkdfSha256(const std::uint8_t *secret, std::size_t secret_length,
                  const std::string &info);
+Key32 hkdfSha256(const std::uint8_t *secret, std::size_t secret_length,
+                 const std::uint8_t *salt, std::size_t salt_length,
+                 const std::string &info);
+std::string base64UrlEncode(const std::uint8_t *data, std::size_t length);
+bool base64UrlDecode(const std::string &encoded,
+                     std::vector<std::uint8_t> &output);
 bool constantTimeEqual(const std::string &left, const std::string &right);
 
 inline bool constantTimeEqualPortable(const std::string &left,

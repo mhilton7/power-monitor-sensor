@@ -8,6 +8,8 @@ import {
   renderSetup,
   renderShell,
   renderStatus,
+  memoryStateLabel,
+  otaStatusLabel,
   resolveServerFreshness,
   updateDiagnostics,
   updateStatus,
@@ -46,6 +48,10 @@ const status: UiStatus = {
     storage: "writable",
     meter: "healthy",
     low_memory: false,
+    memory_state: "normal",
+    memory_severity: "normal",
+    tls_ready: true,
+    operation_context: "idle",
   },
   sync: {
     last_success_utc_ms: Date.parse("2026-07-31T13:59:58Z"),
@@ -53,6 +59,24 @@ const status: UiStatus = {
     acknowledged_sequence: 19,
     backlog: 0,
     last_safe_error: "",
+  },
+  ota: {
+    protocol_version: 2,
+    authentication_mode: "existing_device_hmac",
+    state: "idle",
+    deployment_id: "",
+    target_version: "",
+    target_sha256: "",
+    bytes_received: 0,
+    image_size: 0,
+    progress_percent: 0,
+    running_partition: "ota_0",
+    target_partition: "ota_1",
+    in_progress: false,
+    pending_reboot: false,
+    rollback_supported: true,
+    last_result: "never",
+    rollback_detected: false,
   },
 };
 
@@ -93,6 +117,16 @@ const diagnostics: UiDiagnostics = {
     free_psram_bytes: 8_000_000,
     largest_psram_block_bytes: 7_000_000,
     heap_integrity_ok: true,
+    memory_state: "normal",
+    severity: "normal",
+    tls_ready: true,
+    operation_context: "diagnostics_active",
+    high_memory_owner: "diagnostics_active",
+    tls_transient_minimum_free_internal_bytes: 36_000,
+    ota_transient_minimum_free_internal_bytes: 38_000,
+    fragmentation_entries: 1,
+    low_total_entries: 0,
+    recoveries: 1,
   },
   tasks: {
     server_sync_stack_bytes: 24_576,
@@ -182,6 +216,16 @@ describe("minimal WebUI", () => {
     updateStatus(document, status);
     expect(document.querySelector("#power")?.textContent).toBe("0.8");
     expect(document.body.textContent).toContain("120.4 V");
+    expect(document.querySelector("#ip-address")?.textContent).toBe(
+      "192.168.0.202",
+    );
+    expect(document.querySelector("#memory-state")?.textContent).toBe(
+      "Memory normal",
+    );
+    expect(document.querySelector("#tls-ready")?.textContent).toBe("Ready");
+    expect(document.querySelector("#ota-status")?.textContent).toBe(
+      "Ready for server OTA",
+    );
     const zero = structuredClone(status);
     zero.reading.power_w = 0;
     updateStatus(document, zero);
@@ -195,6 +239,41 @@ describe("minimal WebUI", () => {
       "Waiting for the first reading",
     );
     expect(document.body.firstElementChild).toBe(main);
+  });
+
+  it("renders OTA progress and rollback as status only, without upload controls", () => {
+    const installing = structuredClone(status.ota)!;
+    installing.in_progress = true;
+    installing.target_version = "1.0.11";
+    installing.progress_percent = 42;
+    expect(otaStatusLabel(installing)).toBe("Installing to 1.0.11 · 42%");
+    installing.in_progress = false;
+    installing.rollback_detected = true;
+    expect(otaStatusLabel(installing)).toBe("Automatic rollback confirmed");
+    document.body.innerHTML = renderStatus();
+    expect(document.querySelector('input[type="file"]')).toBeNull();
+    expect(document.querySelector("[data-action*='ota']")).toBeNull();
+  });
+
+  it.each([
+    ["normal", "Memory normal"],
+    ["pressure_warning", "Reduced memory headroom"],
+    ["fragmented", "Memory fragmented · TLS waiting for a contiguous block"],
+    ["low_total_memory", "Low memory"],
+    ["recovering", "Memory recovering"],
+  ] as const)("maps %s to its precise local label", (state, label) => {
+    expect(memoryStateLabel(state)).toBe(label);
+    document.body.innerHTML = renderShell();
+    document.querySelector("#main")!.innerHTML = renderStatus();
+    const mapped = structuredClone(status);
+    mapped.health.memory_state = state;
+    mapped.health.low_memory = state === "low_total_memory";
+    mapped.health.tls_ready = state !== "fragmented";
+    updateStatus(document, mapped);
+    expect(document.querySelector("#memory-state")?.textContent).toBe(label);
+    expect(document.querySelector("#header-state")?.textContent).toBe(
+      "Server connected",
+    );
   });
 
   it.each([
@@ -250,6 +329,11 @@ describe("minimal WebUI", () => {
     document.body.innerHTML = renderSetup(config);
     const details = document.querySelector("details")!;
     expect(details.hasAttribute("open")).toBe(false);
+    expect(
+      document.querySelector('[name="ota_signing_public_key_pem"]'),
+    ).toBeNull();
+    expect(document.querySelector('[name="ota_signing_key_id"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("OTA signing");
     expect(
       (document.querySelector('[name="server_ca_pem"]') as HTMLTextAreaElement)
         .value,

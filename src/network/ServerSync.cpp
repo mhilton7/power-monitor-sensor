@@ -26,6 +26,8 @@
 #include "diagnostics/SerialLogger.h"
 #include "network/ReadingWireFormat.h"
 #include "network/ResolvedTlsClient.h"
+#include "ota/OtaManifestV2.h"
+#include "ota/OtaService.h"
 #include "security/Crypto.h"
 #include "version.h"
 
@@ -293,7 +295,8 @@ public:
   explicit HighMemoryLease(Diagnostics &diagnostics,
                            const TickType_t timeout = pdMS_TO_TICKS(5000))
       : diagnostics_(diagnostics),
-        acquired_(diagnostics_.acquireHighMemoryOperation(timeout)) {}
+        acquired_(diagnostics_.acquireHighMemoryOperation(
+            MemoryOperationContext::TlsPreparing, timeout)) {}
 
   ~HighMemoryLease() {
     if (acquired_) {
@@ -303,9 +306,23 @@ public:
 
   explicit operator bool() const { return acquired_; }
 
+  bool transitionToTlsActive() {
+    if (!acquired_) {
+      return false;
+    }
+    if (tls_active_) {
+      return true;
+    }
+    tls_active_ = diagnostics_.transitionHighMemoryOperation(
+        MemoryOperationContext::TlsPreparing,
+        MemoryOperationContext::TlsActive);
+    return tls_active_;
+  }
+
 private:
   Diagnostics &diagnostics_;
   bool acquired_{false};
+  bool tls_active_{false};
 };
 
 bool readBoundedResponseBody(HTTPClient &http, ClockService &clock,
@@ -1101,6 +1118,12 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
   capabilities["pzem_model"] = "PZEM-004T V4";
   capabilities["sd_present"] = storage_ready;
   capabilities["sd_required"] = true;
+  JsonObject ota = capabilities["ota"].to<JsonObject>();
+  ota["supported"] = true;
+  ota["protocol_version"] = ota_v2::kProtocolVersion;
+  ota["authentication_mode"] = ota_v2::kAuthenticationMode;
+  ota["rollback_supported"] = true;
+  ota["partition_size_bytes"] = OtaService::updatePartitionSize();
   JsonArray endpoints = capabilities["supported_endpoints"].to<JsonArray>();
   endpoints.add("/api/v1/health");
   endpoints.add("/api/v1/live");
@@ -1533,6 +1556,15 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
             sequence_state.local_journal_high_water));
   }
   immediate_sync_ = document["immediate_sync_requested"].as<bool>();
+  const bool firmware_release_available =
+      document["firmware_release_available"].as<bool>();
+  next_manifest_poll_ms_ = sync_policy::manifestPollDeadline(
+      firmware_release_available, next_manifest_poll_ms_,
+      clock_.monotonicMs());
+  if (firmware_release_available) {
+    PM_LOG_INFO("OTA", "MANIFEST_POLL_RELEASED",
+                "source=heartbeat next_tick=true concurrent_tls=false");
+  }
   if (!cursor_regressed && sync_policy::shouldReleaseReadingBackoff(
           immediate_sync_, acknowledgement, newest_sequence,
           immediate_sync_release_recorded_,
@@ -2334,10 +2366,7 @@ bool ServerSync::checkFirmwareManifest() {
   const ServerSyncRuntimeConfig sync_config = config_.serverSyncRuntimeConfig();
   PM_LOG_DEBUG("OTA", "REMOTE_MANIFEST_CHECK_BEGIN", "channel=%s current=%s",
                sync_config.ota_channel.c_str(), version::FIRMWARE);
-  const std::string endpoint =
-      "/api/v1/device-firmware/manifest?channel=" +
-      crypto::percentEncode(sync_config.ota_channel) +
-      "&current=" + crypto::percentEncode(version::FIRMWARE);
+  const std::string endpoint = "/api/v1/device-firmware/manifest";
   const HttpResult response = request("GET", endpoint, "", true);
   if (response.status != 200) {
     return false;
@@ -2346,46 +2375,26 @@ bool ServerSync::checkFirmwareManifest() {
   if (deserializeJson(document, response.body, response.body_size)) {
     return false;
   }
-  if (!document["available"].is<bool>() ||
-      (!document["protocol_version"].isNull() &&
-       (!document["protocol_version"].is<const char *>() ||
-        std::string(document["protocol_version"].as<const char *>()) !=
-            version::PROTOCOL))) {
-    PM_LOG_ERROR("OTA", "REMOTE_MANIFEST_INVALID",
-                 "error=PM-OTA-003 category=contract_shape_invalid");
-    return false;
-  }
-  if (!document["available"].as<bool>()) {
+  if (document["available"].is<bool>() &&
+      !document["available"].as<bool>() &&
+      document.as<JsonObjectConst>().size() == 2U &&
+      document["protocol_version"].is<const char *>() &&
+      std::string(document["protocol_version"].as<const char *>()) ==
+          version::PROTOCOL) {
     available_firmware_version_.clear();
     PM_LOG_INFO("OTA", "REMOTE_MANIFEST_CURRENT", "update_available=false");
     return true;
   }
-  if (!document["version"].is<const char *>() ||
-      std::string(document["version"].as<const char *>()).empty() ||
-      !document["channel"].is<const char *>() ||
-      !document["hardware_target"].is<const char *>() ||
-      std::string(document["hardware_target"].as<const char *>()) !=
-          version::HARDWARE_TARGET ||
-      !document["protocol_min"].is<const char *>() ||
-      !document["protocol_max"].is<const char *>() ||
-      !document["size_bytes"].is<std::uint32_t>() ||
-      document["size_bytes"].as<std::uint32_t>() == 0U ||
-      document["size_bytes"].as<std::uint32_t>() > 0x600000U ||
-      !document["sha256"].is<const char *>() ||
-      !lowercaseHex(document["sha256"].as<const char *>(), 64U) ||
-      !document["signature"].is<const char *>() ||
-      !document["signing_key_id"].is<const char *>() ||
-      std::string(document["signing_key_id"].as<const char *>()).empty() ||
-      !document["release_notes"].is<const char *>() ||
-      !document["download_path"].is<const char *>() ||
-      std::string(document["download_path"].as<const char *>())
-              .rfind("/api/v1/device-firmware/", 0) != 0) {
+  std::string manifest_json(response.body, response.body_size);
+  ota_v2::Manifest manifest;
+  std::string manifest_error;
+  if (!ota_v2::parseManifest(manifest_json, manifest, manifest_error)) {
     PM_LOG_ERROR("OTA", "REMOTE_MANIFEST_INVALID",
-                 "error=PM-OTA-003 category=signed_fields_missing_or_invalid "
-                 "fail_closed=true");
+                 "error=PM-OTA-003 category=%s fail_closed=true",
+                 manifest_error.c_str());
     return false;
   }
-  available_firmware_version_ = document["version"].as<const char *>();
+  available_firmware_version_ = manifest.version;
   PM_LOG_INFO("OTA", "REMOTE_MANIFEST_AVAILABLE",
               "update_available=%s target_version=%s",
               available_firmware_version_.empty() ? "false" : "true",
@@ -2393,23 +2402,6 @@ bool ServerSync::checkFirmwareManifest() {
                   ? "none"
                   : available_firmware_version_.c_str());
   const RuntimeConfig active_config = config_.config();
-  const std::string signing_key_id =
-      document["signing_key_id"].as<const char *>();
-  if (config_.otaPublicKey().empty()) {
-    PM_LOG_ERROR("OTA", "REMOTE_UPDATE_DISABLED",
-                 "error=PM-OTA-005 reason=public_key_unavailable "
-                 "provisioning=authenticated_local_only");
-    return false;
-  }
-  if (!active_config.ota_signing_key_id.empty() &&
-      active_config.ota_signing_key_id != signing_key_id) {
-    PM_LOG_ERROR("OTA", "REMOTE_UPDATE_DISABLED",
-                 "error=PM-OTA-005 reason=key_id_mismatch expected=%s "
-                 "received=%s",
-                 active_config.ota_signing_key_id.c_str(),
-                 signing_key_id.c_str());
-    return false;
-  }
   if (maintenance_queue_ == nullptr) {
     PM_LOG_ERROR("OTA", "REMOTE_UPDATE_QUEUE_FAILED",
                  "error=PM-OTA-010 reason=queue_unavailable");
@@ -2429,8 +2421,9 @@ bool ServerSync::checkFirmwareManifest() {
     return false;
   }
   PM_LOG_INFO("OTA", "REMOTE_UPDATE_QUEUED",
-              "target_version=%s key_id=%s source=central_manifest",
-              available_firmware_version_.c_str(), signing_key_id.c_str());
+              "target_version=%s authentication=existing_device_hmac "
+              "source=central_manifest",
+              available_firmware_version_.c_str());
   return true;
 }
 
@@ -2765,6 +2758,20 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   // stack. It must never become a latching admission gate. The checkpoint
   // above records and warns on the measured margin without disabling future
   // heartbeats.
+  if (!high_memory_lease.transitionToTlsActive()) {
+    result.error = "high_memory_context_transition_failed";
+    result.tls_category = "LOCAL_RESOURCE_DEFERRED";
+    result.local_resource_deferred = true;
+    last_operation_locally_deferred_ = true;
+    PM_LOG_ERROR("MEMORY", "HIGH_MEMORY_CONTEXT_FAILED",
+                 "error=PM-TLS-006 request_id=%lu expected=tls_preparing "
+                 "next=tls_active",
+                 static_cast<unsigned long>(request_id));
+    return result;
+  }
+  // The lease was declared before these transport objects, so reverse-order
+  // destruction runs TransportCleanup, HTTPClient, and ResolvedTlsClient
+  // before release records the post-TLS grace timestamp.
   ResolvedTlsClient client;
   if (fragmentation_deferred_) {
     ++metrics_.fragmentation_recoveries;
@@ -3038,7 +3045,13 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
   document["device_id"] = transport_device_id_;
   document["boot_id"] = transport_boot_id_;
   document["firmware_version"] = version::FIRMWARE;
-  document["firmware_build_hash"] = version::GIT_COMMIT;
+  document["firmware_build_hash"] = OtaService::runningBuildHash();
+  JsonObject ota = document["ota"].to<JsonObject>();
+  ota["supported"] = true;
+  ota["protocol_version"] = ota_v2::kProtocolVersion;
+  ota["authentication_mode"] = ota_v2::kAuthenticationMode;
+  ota["rollback_supported"] = true;
+  ota["partition_size_bytes"] = OtaService::updatePartitionSize();
   document["uptime_seconds"] = clock_.monotonicMs() / 1000U;
   document["reboot_reason"] = resetReasonName();
   document["current_ip"] = network.ip_address.data();

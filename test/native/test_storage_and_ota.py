@@ -22,7 +22,11 @@ def case_directory(name: str) -> Path:
     return path
 
 
-from repair_sd_index import rebuild  # noqa: E402
+from firmware_image import FirmwareMetadata  # noqa: E402
+from generate_release import (  # noqa: E402
+    create_staging_directory,
+    existing_trust_metadata,
+)
 from release_integrity import (  # noqa: E402
     FLASH_IMAGE_OFFSETS,
     PROVENANCE_FILENAME,
@@ -35,7 +39,7 @@ from release_integrity import (  # noqa: E402
     validate_release_bundle,
     write_json_atomic,
 )
-from generate_release import create_staging_directory  # noqa: E402
+from repair_sd_index import rebuild  # noqa: E402
 from sd_format import decode, encode  # noqa: E402
 from sign_firmware import canonical  # noqa: E402
 
@@ -115,6 +119,8 @@ class StorageAndOtaTests(unittest.TestCase):
                 release / "flash-layout.json", flash_layout_document(release)
             )
             validate_release_bundle(root, release)
+            (release / "ota.bin").unlink()
+            validate_release_bundle(root, release)
             (source / "main.cpp").write_text("int main() { return 1; }\n")
             with self.assertRaisesRegex(ReleaseIntegrityError, "stale"):
                 validate_release_bundle(root, release)
@@ -136,6 +142,25 @@ class StorageAndOtaTests(unittest.TestCase):
                 )
         finally:
             shutil.rmtree(root)
+
+    def test_default_release_metadata_uses_existing_trust_only(self) -> None:
+        firmware = FirmwareMetadata(
+            version="1.0.11",
+            project_name="power-monitor-sensor",
+            build_time="20:00:00",
+            build_date="Aug  2 2026",
+            build_hash="cd" * 32,
+            chip_id=9,
+            size_bytes=1_234_567,
+            sha256="ab" * 32,
+            checksum_offset=1_234_500,
+        )
+        metadata = existing_trust_metadata(firmware, "stable", "Existing-trust release")
+        self.assertEqual(metadata["ota_authentication_mode"], "existing_device_hmac")
+        self.assertEqual(metadata["ota_protocol_version"], 2)
+        self.assertEqual(metadata["sha256"], firmware.sha256)
+        self.assertEqual(metadata["build_hash"], firmware.build_hash)
+        self.assertNotIn("signing_key_id", metadata)
 
     def test_pmr1_round_trip_crc_and_corrupt_tail(self) -> None:
         record = {

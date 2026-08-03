@@ -1,5 +1,23 @@
 export type HealthState = "connected" | "offline" | "unauthenticated";
 
+export type MemoryState =
+  | "normal"
+  | "pressure_warning"
+  | "fragmented"
+  | "low_total_memory"
+  | "recovering";
+
+export type MemorySeverity = "normal" | "warning" | "critical";
+
+export type MemoryOperationContext =
+  | "idle"
+  | "tls_preparing"
+  | "tls_active"
+  | "ota_active"
+  | "heavy_local_ui"
+  | "diagnostics_active"
+  | "storage_maintenance";
+
 export type ServerFreshnessState =
   | "never_connected"
   | "live"
@@ -57,6 +75,10 @@ export interface UiStatus {
     storage: "writable" | "degraded";
     meter: "healthy" | "degraded";
     low_memory: boolean;
+    memory_state?: MemoryState;
+    memory_severity?: MemorySeverity;
+    tls_ready?: boolean;
+    operation_context?: MemoryOperationContext;
   };
   sync: {
     last_success_utc_ms: number | null;
@@ -64,6 +86,24 @@ export interface UiStatus {
     acknowledged_sequence: number;
     backlog: number;
     last_safe_error: string;
+  };
+  ota?: {
+    protocol_version: number;
+    authentication_mode: string;
+    state: string;
+    deployment_id: string;
+    target_version: string;
+    target_sha256: string;
+    bytes_received: number;
+    image_size: number;
+    progress_percent: number;
+    running_partition: string;
+    target_partition: string;
+    in_progress: boolean;
+    pending_reboot: boolean;
+    rollback_supported: boolean;
+    last_result: string;
+    rollback_detected: boolean;
   };
 }
 
@@ -89,6 +129,16 @@ export interface UiDiagnostics {
     free_psram_bytes: number;
     largest_psram_block_bytes: number;
     heap_integrity_ok: boolean;
+    memory_state: MemoryState;
+    severity: MemorySeverity;
+    tls_ready: boolean;
+    operation_context: MemoryOperationContext;
+    high_memory_owner: MemoryOperationContext;
+    tls_transient_minimum_free_internal_bytes: number;
+    ota_transient_minimum_free_internal_bytes: number;
+    fragmentation_entries: number;
+    low_total_entries: number;
+    recoveries: number;
   };
   tasks: {
     server_sync_stack_bytes: number;
@@ -219,8 +269,6 @@ export interface SetupPayload {
   server_url: string;
   server_ca_pem: string;
   server_fingerprint: string;
-  ota_signing_public_key_pem: string;
-  ota_signing_key_id: string;
   enrollment_token: string;
   admin_password: string;
   connection_mode: "push";

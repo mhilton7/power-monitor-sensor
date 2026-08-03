@@ -31,8 +31,10 @@ namespace {
 // settings exercise PEM validation plus atomic serialize/verify paths and need
 // more headroom than password hashing alone.
 constexpr std::uint32_t kMinimumLightUiInternalHeapBytes = 40U * 1024U;
-constexpr std::uint32_t kMinimumHeavyUiInternalHeapBytes = 72U * 1024U;
-constexpr std::uint32_t kMinimumHeavyUiLargestBlockBytes = 28U * 1024U;
+constexpr std::uint32_t kMinimumHeavyUiInternalHeapBytes =
+    kMemoryNormalFreeInternalBytes;
+constexpr std::uint32_t kMinimumHeavyUiLargestBlockBytes =
+    kMemoryNormalLargestInternalBlockBytes;
 
 constexpr char kStatusCapacityProblem[] =
     "{\"type\":\"https://powermonitor.local/problems/status_capacity_"
@@ -56,7 +58,7 @@ void sendStaticStatusProblem(AsyncWebServerRequest *request,
     return;
   }
   response->addHeader("Cache-Control", "no-store");
-  response->addHeader("Retry-After", "2");
+  response->addHeader("Retry-After", "5");
   response->addHeader("X-Content-Type-Options", "nosniff");
   request->send(response);
 }
@@ -367,12 +369,24 @@ void HttpApi::passwordJobTask() {
     std::string detail;
     std::string response_json;
     int failure_status = 422;
+    const bool high_memory_required =
+        job->kind != PasswordJobKind::SyncAcknowledgement;
+    const bool high_memory_acquired =
+        queue_wait_ms <= 30'000U && high_memory_required &&
+        diagnostics_.acquireHighMemoryOperation(
+            MemoryOperationContext::HeavyLocalUi, pdMS_TO_TICKS(5000));
     if (queue_wait_ms > 30'000U) {
       code = "password_job_queue_timeout";
       failure_status = 503;
       detail =
           "The operation expired in the bounded worker queue before it could "
           "start.";
+    } else if (high_memory_required && !high_memory_acquired) {
+      diagnostics_.recordHeavyUiDeferral();
+      code = "local_resource_deferred";
+      failure_status = 503;
+      detail = "The primary synchronization or measurement path needs the "
+               "available memory. Retry shortly.";
     } else if (job->kind == PasswordJobKind::Login) {
       failure_status = 401;
       JsonDocument document;
@@ -508,6 +522,9 @@ void HttpApi::passwordJobTask() {
           }
         }
       }
+    }
+    if (high_memory_acquired) {
+      diagnostics_.releaseHighMemoryOperation();
     }
     const std::uint64_t duration = clock_.monotonicMs() - started;
     if (job->kind == PasswordJobKind::Login) {
@@ -1105,6 +1122,8 @@ void HttpApi::registerReadRoutes() {
         snapshot.backlog = backlog;
         snapshot.heap = heap_before;
         snapshot.memory = diagnostics_.memoryPressureMetrics();
+        snapshot.operation_context = diagnostics_.memoryOperationContext();
+        snapshot.ota = ota_.compactStatus();
         snapshot.freshness_policy.expected_heartbeat_seconds =
             std::max<std::uint32_t>(1U,
                                     status_config.heartbeat_interval_seconds);
@@ -1121,7 +1140,7 @@ void HttpApi::registerReadRoutes() {
                 ? sync.last_error.data()
                 : sync.last_local_deferral_reason.data();
         snapshot.truncated = status_config.truncated || network.truncated ||
-                             sync.truncated ||
+                             sync.truncated || snapshot.ota.truncated ||
                              !copyCompactText(snapshot.last_safe_error,
                                               safe_error);
         if (!clock_.formatUtcIso8601(snapshot.server_now.data(),
@@ -1175,6 +1194,9 @@ void HttpApi::registerReadRoutes() {
         if (!authorize(request, "", false))
           return;
         diagnostics_.recordUiRequest(UiRequestKind::Diagnostics);
+        if (!beginHeavyLocalOperation(
+                request, MemoryOperationContext::DiagnosticsActive))
+          return;
         const StorageHealth storage = storage_.health();
         const SyncMetrics sync = diagnostics_.syncMetrics();
         const HttpMetrics http = diagnostics_.httpMetrics();
@@ -1197,11 +1219,24 @@ void HttpApi::registerReadRoutes() {
         memory["heap_integrity_ok"] = heap.integrity_ok;
         const MemoryPressureMetrics pressure =
             diagnostics_.memoryPressureMetrics();
+        memory["memory_state"] = memoryPressureStateName(pressure.state);
+        memory["severity"] = memoryPressureSeverityName(pressure.state);
+        memory["tls_ready"] = memoryTlsReady(
+            heap.free_internal_bytes, heap.largest_internal_block_bytes,
+            heap.integrity_ok);
+        memory["operation_context"] = memoryOperationContextName(
+            diagnostics_.memoryOperationContext());
+        memory["high_memory_owner"] = memoryOperationContextName(
+            diagnostics_.memoryOperationContext());
         memory["pressure_state"] = memoryPressureStateName(pressure.state);
         memory["pressure_state_since_ms"] = pressure.state_since_ms;
         memory["pressure_entry_count"] = pressure.entry_count;
         memory["pressure_recovery_count"] = pressure.recovery_count;
         memory["pressure_transition_count"] = pressure.transition_count;
+        memory["fragmentation_entries"] =
+            pressure.fragmentation_entry_count;
+        memory["low_total_entries"] = pressure.entry_count;
+        memory["recoveries"] = pressure.recovery_count;
         memory["cumulative_pressure_ms"] = pressure.cumulative_pressure_ms;
         memory["longest_pressure_episode_ms"] =
             pressure.longest_pressure_episode_ms;
@@ -1209,6 +1244,10 @@ void HttpApi::registerReadRoutes() {
             pressure.lowest_free_internal_bytes;
         memory["lowest_largest_internal_block_bytes"] =
             pressure.lowest_largest_internal_block_bytes;
+        memory["tls_transient_minimum_free_internal_bytes"] =
+            pressure.tls_transient_minimum_free_internal_bytes;
+        memory["ota_transient_minimum_free_internal_bytes"] =
+            pressure.ota_transient_minimum_free_internal_bytes;
         JsonObject tasks = document["tasks"].to<JsonObject>();
         tasks["server_sync_stack_bytes"] = sync.stack_allocated_bytes;
         tasks["server_sync_high_water_bytes"] = sync.stack_high_water_bytes;
@@ -1394,12 +1433,16 @@ void HttpApi::registerReadRoutes() {
         }
         std::string body;
         serializeJson(document, body);
+        endHeavyLocalOperation();
         sendJson(request, 200, body);
       });
   server_.on(
       "/api/v1/diagnostics/disconnect-flight-recorder", HTTP_GET,
       [this](AsyncWebServerRequest *request) {
         if (!authorize(request, "", false))
+          return;
+        if (!beginHeavyLocalOperation(
+                request, MemoryOperationContext::DiagnosticsActive))
           return;
         const WifiDisconnectSnapshot disconnects =
             network_.wifiDisconnectEvents();
@@ -1476,6 +1519,7 @@ void HttpApi::registerReadRoutes() {
         authentication["local_sessions_capacity"] = sessions.capacity;
         std::string body;
         serializeJson(document, body);
+        endHeavyLocalOperation();
         AsyncWebServerResponse *response = request->beginResponse(
             200, "application/json", body.c_str());
         response->addHeader(
@@ -1490,7 +1534,8 @@ void HttpApi::registerReadRoutes() {
              [this](AsyncWebServerRequest *request) {
                if (!authorize(request, "", false))
                  return;
-               if (!beginHeavyLocalOperation(request))
+               if (!beginHeavyLocalOperation(
+                       request, MemoryOperationContext::DiagnosticsActive))
                  return;
                const std::string body =
                    diag::SerialLogger::instance().recentErrorsJson();
@@ -1582,6 +1627,12 @@ void HttpApi::registerReadRoutes() {
     capabilities["micro_sd_authoritative"] = true;
     capabilities["connection_modes"] = "push";
     capabilities["signed_ota"] = true;
+    JsonObject ota = capabilities["ota"].to<JsonObject>();
+    ota["supported"] = true;
+    ota["protocol_version"] = ota_v2::kProtocolVersion;
+    ota["authentication_mode"] = ota_v2::kAuthenticationMode;
+    ota["rollback_supported"] = true;
+    ota["partition_size_bytes"] = OtaService::updatePartitionSize();
     capabilities["monitoring_only"] = true;
     std::string body;
     serializeJson(document, body);
@@ -1629,7 +1680,8 @@ void HttpApi::registerReadRoutes() {
       "/api/v1/readings", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!authorize(request, "", false))
           return;
-        if (!beginHeavyLocalOperation(request))
+        if (!beginHeavyLocalOperation(request,
+                                      MemoryOperationContext::HeavyLocalUi))
           return;
         endHeavyLocalOperation();
         if (clock_.monotonicMs() < history_allowed_at_ms_) {
@@ -1655,7 +1707,8 @@ void HttpApi::registerReadRoutes() {
       "/api/v1/events", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!authorize(request, "", false))
           return;
-        if (!beginHeavyLocalOperation(request))
+        if (!beginHeavyLocalOperation(request,
+                                      MemoryOperationContext::HeavyLocalUi))
           return;
         endHeavyLocalOperation();
         if (clock_.monotonicMs() < history_allowed_at_ms_) {
@@ -1788,13 +1841,19 @@ void HttpApi::registerReadRoutes() {
                if (!authorize(request, "", false))
                  return;
                diagnostics_.recordUiRequest(UiRequestKind::Setup);
-               sendJson(request, 200, config_.redactedJson());
+               if (!beginHeavyLocalOperation(
+                       request, MemoryOperationContext::HeavyLocalUi))
+                 return;
+               const std::string body = config_.redactedJson();
+               endHeavyLocalOperation();
+               sendJson(request, 200, body);
              });
   server_.on(
       "/api/v1/metrics", HTTP_GET, [this](AsyncWebServerRequest *request) {
         if (!authorize(request, "", false))
           return;
-        if (!beginHeavyLocalOperation(request))
+        if (!beginHeavyLocalOperation(
+                request, MemoryOperationContext::DiagnosticsActive))
           return;
         const std::string body =
             diagnostics_.metricsJson(storage_.health(), meter_.metrics());
@@ -1807,12 +1866,25 @@ void HttpApi::registerReadRoutes() {
                  return;
                const OtaStatus status = ota_.status();
                JsonDocument document;
-               document["schema_version"] = 1;
+               document["schema_version"] = 2;
+               document["protocol_version"] = status.protocol_version;
+               document["authentication_mode"] = status.authentication_mode;
+               document["state"] = ota_v2::stateName(status.state);
+               document["deployment_id"] = status.deployment_id;
+               document["release_id"] = status.release_id;
+               document["attempt"] = status.attempt;
                document["in_progress"] = status.in_progress;
                document["pending_reboot"] = status.pending_reboot;
+               document["rollback_supported"] = status.rollback_supported;
+               document["rollback_detected"] = status.rollback_detected;
                document["bytes_received"] = status.bytes_received;
                document["image_size"] = status.image_size;
+               document["progress_percent"] = status.progress_percent;
                document["target_version"] = status.target_version;
+               document["target_sha256"] = status.target_sha256;
+               document["target_build_hash"] = status.target_build_hash;
+               document["running_partition"] = status.running_partition;
+               document["target_partition"] = status.target_partition;
                document["last_result"] = status.last_result;
                document["last_error"] = status.last_error;
                std::string body;
@@ -1823,7 +1895,8 @@ void HttpApi::registerReadRoutes() {
              [this](AsyncWebServerRequest *request) {
                if (!authorize(request, "", false))
                  return;
-               if (!beginHeavyLocalOperation(request))
+               if (!beginHeavyLocalOperation(
+                       request, MemoryOperationContext::DiagnosticsActive))
                  return;
                const SessionManager::Metrics session_metrics =
                    sessions_.metrics(clock_.monotonicMs());
@@ -2683,7 +2756,8 @@ void HttpApi::sendLocalSessionProblem(AsyncWebServerRequest *request,
   request->send(response);
 }
 
-bool HttpApi::beginHeavyLocalOperation(AsyncWebServerRequest *request) {
+bool HttpApi::beginHeavyLocalOperation(AsyncWebServerRequest *request,
+                                       const MemoryOperationContext context) {
   const SyncMetrics sync = diagnostics_.syncMetrics();
   const HeapSnapshot heap = heap_telemetry_.snapshot();
   const std::uint32_t free_internal = heap.free_internal_bytes;
@@ -2694,7 +2768,7 @@ bool HttpApi::beginHeavyLocalOperation(AsyncWebServerRequest *request) {
                               kMinimumHeavyUiLargestBlockBytes;
   if (sync.sync_in_progress || sync.primary_storage_pending ||
       sync.durable_reading_backlog || low_memory ||
-      !diagnostics_.acquireHighMemoryOperation(0)) {
+      !diagnostics_.acquireHighMemoryOperation(context, 0)) {
     diagnostics_.recordHeavyUiDeferral();
     const char body[] =
         "{\"type\":\"https://powermonitor.local/problems/local_resource_"
@@ -2705,20 +2779,21 @@ bool HttpApi::beginHeavyLocalOperation(AsyncWebServerRequest *request) {
     AsyncWebServerResponse *response = request->beginResponse(
         503, "application/problem+json", body);
     response->addHeader("Cache-Control", "no-store");
-    response->addHeader("Retry-After", "2");
+    response->addHeader("Retry-After", "5");
     response->addHeader("Connection", "close", false);
     diagnostics_.recordHttpStatus(503);
     request->send(response);
     PM_LOG_WARN(
         "WEB", "HEAVY_REQUEST_DEFERRED",
         "route=%s sync_active=%s storage_pending=%s backlog=%s "
-        "low_memory=%s free_internal=%lu largest_internal=%lu",
+        "low_memory=%s free_internal=%lu largest_internal=%lu context=%s",
         request->url().c_str(), sync.sync_in_progress ? "true" : "false",
         sync.primary_storage_pending ? "true" : "false",
         sync.durable_reading_backlog ? "true" : "false",
         low_memory ? "true" : "false",
         static_cast<unsigned long>(free_internal),
-        static_cast<unsigned long>(largest_internal));
+        static_cast<unsigned long>(largest_internal),
+        memoryOperationContextName(context));
     if (diag::SerialLogger::instance().allow("flight_heavy_ui_deferred",
                                              30'000U)) {
       const std::string detail =

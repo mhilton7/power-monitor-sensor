@@ -122,8 +122,11 @@ CompactUiSerializationResult serializeCompactUiStatus(
                       std::min(snapshot.heap.free_internal_bytes,
                                snapshot.heap.largest_internal_block_bytes)) /
                       static_cast<double>(snapshot.heap.free_internal_bytes);
-  const bool low_memory =
-      snapshot.memory.state != MemoryPressureState::Normal;
+  const bool low_memory = memoryPressureIsLowMemory(snapshot.memory.state);
+  const bool tls_ready = memoryTlsReady(
+      snapshot.heap.free_internal_bytes,
+      snapshot.heap.largest_internal_block_bytes,
+      snapshot.heap.integrity_ok);
 
   bool ok = writer.literal("{\"schema_version\":1,\"server_now\":") &&
             writer.string(text(snapshot.server_now)) &&
@@ -174,11 +177,17 @@ CompactUiSerializationResult serializeCompactUiStatus(
             writer.literal(",\"storage\":") &&
             writer.string(snapshot.storage_writable ? "writable" : "degraded") &&
             writer.literal(",\"meter\":") &&
-            writer.string(snapshot.meter_healthy ? "healthy" : "degraded") &&
-            writer.literal(",\"low_memory\":") && writer.boolean(low_memory) &&
-            writer.literal(",\"memory_state\":") &&
-            writer.string(memoryPressureStateName(snapshot.memory.state)) &&
-            writer.literal("},\"sync\":{\"last_success_utc_ms\":") &&
+             writer.string(snapshot.meter_healthy ? "healthy" : "degraded") &&
+             writer.literal(",\"low_memory\":") && writer.boolean(low_memory) &&
+             writer.literal(",\"memory_state\":") &&
+             writer.string(memoryPressureStateName(snapshot.memory.state)) &&
+             writer.literal(",\"memory_severity\":") &&
+             writer.string(memoryPressureSeverityName(snapshot.memory.state)) &&
+             writer.literal(",\"tls_ready\":") && writer.boolean(tls_ready) &&
+             writer.literal(",\"operation_context\":") &&
+             writer.string(
+                 memoryOperationContextName(snapshot.operation_context)) &&
+             writer.literal("},\"sync\":{\"last_success_utc_ms\":") &&
             nullableUnsigned(writer,
                              snapshot.last_heartbeat_success_utc_ms != 0U,
                              snapshot.last_heartbeat_success_utc_ms) &&
@@ -213,9 +222,15 @@ CompactUiSerializationResult serializeCompactUiStatus(
             writer.string(text(snapshot.last_attempt_result)) &&
             writer.literal(",\"last_safe_error\":") &&
             writer.string(text(snapshot.last_safe_error)) &&
-            writer.literal("},\"memory\":{\"state\":") &&
-            writer.string(memoryPressureStateName(snapshot.memory.state)) &&
-            writer.literal(",\"free_internal_bytes\":") &&
+             writer.literal("},\"memory\":{\"state\":") &&
+             writer.string(memoryPressureStateName(snapshot.memory.state)) &&
+             writer.literal(",\"severity\":") &&
+             writer.string(memoryPressureSeverityName(snapshot.memory.state)) &&
+             writer.literal(",\"tls_ready\":") && writer.boolean(tls_ready) &&
+             writer.literal(",\"operation_context\":") &&
+             writer.string(
+                 memoryOperationContextName(snapshot.operation_context)) &&
+             writer.literal(",\"free_internal_bytes\":") &&
             writer.unsignedValue(snapshot.heap.free_internal_bytes) &&
             writer.literal(",\"largest_internal_block_bytes\":") &&
             writer.unsignedValue(snapshot.heap.largest_internal_block_bytes) &&
@@ -226,7 +241,40 @@ CompactUiSerializationResult serializeCompactUiStatus(
             writer.literal(",\"fragmentation_recovery_count\":") &&
             writer.unsignedValue(snapshot.memory.fragmentation_recovery_count) &&
             writer.literal(",\"truncated\":") &&
-            writer.boolean(snapshot.truncated) && writer.literal("}}") &&
+            writer.boolean(snapshot.truncated) &&
+            writer.literal("},\"ota\":{\"protocol_version\":") &&
+            writer.unsignedValue(snapshot.ota.protocol_version) &&
+            writer.literal(",\"authentication_mode\":") &&
+            writer.string(text(snapshot.ota.authentication_mode)) &&
+            writer.literal(",\"state\":") &&
+            writer.string(text(snapshot.ota.state)) &&
+            writer.literal(",\"deployment_id\":") &&
+            writer.string(text(snapshot.ota.deployment_id)) &&
+            writer.literal(",\"target_version\":") &&
+            writer.string(text(snapshot.ota.target_version)) &&
+            writer.literal(",\"target_sha256\":") &&
+            writer.string(text(snapshot.ota.target_sha256)) &&
+            writer.literal(",\"bytes_received\":") &&
+            writer.unsignedValue(snapshot.ota.bytes_received) &&
+            writer.literal(",\"image_size\":") &&
+            writer.unsignedValue(snapshot.ota.image_size) &&
+            writer.literal(",\"progress_percent\":") &&
+            writer.unsignedValue(snapshot.ota.progress_percent) &&
+            writer.literal(",\"running_partition\":") &&
+            writer.string(text(snapshot.ota.running_partition)) &&
+            writer.literal(",\"target_partition\":") &&
+            writer.string(text(snapshot.ota.target_partition)) &&
+            writer.literal(",\"in_progress\":") &&
+            writer.boolean(snapshot.ota.in_progress) &&
+            writer.literal(",\"pending_reboot\":") &&
+            writer.boolean(snapshot.ota.pending_reboot) &&
+            writer.literal(",\"rollback_supported\":") &&
+            writer.boolean(snapshot.ota.rollback_supported) &&
+            writer.literal(",\"last_result\":") &&
+            writer.string(text(snapshot.ota.last_result)) &&
+            writer.literal(",\"rollback_detected\":") &&
+            writer.boolean(snapshot.ota.rollback_detected) &&
+            writer.literal("}}") &&
             writer.ok();
   return {writer.size(), ok};
 }

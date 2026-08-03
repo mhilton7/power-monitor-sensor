@@ -10,6 +10,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mbedtls/md.h>
+#include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
 
 namespace pm::crypto {
@@ -148,15 +149,78 @@ std::string hmacSha256Hex(const std::uint8_t *key, const std::size_t key_length,
 
 Key32 hkdfSha256(const std::uint8_t *secret, const std::size_t secret_length,
                  const std::string &info) {
-  // RFC 5869 with an omitted salt (HashLen zero octets). A single expansion
-  // block is sufficient because the caller requests exactly SHA-256 length.
   Key32 zero_salt{};
-  const Key32 pseudorandom_key =
-      hmacSha256(zero_salt.data(), zero_salt.size(), secret, secret_length);
+  return hkdfSha256(secret, secret_length, zero_salt.data(), zero_salt.size(),
+                    info);
+}
+
+Key32 hkdfSha256(const std::uint8_t *secret, const std::size_t secret_length,
+                 const std::uint8_t *salt, const std::size_t salt_length,
+                 const std::string &info) {
+  // RFC 5869 extract-and-expand. One expansion block is sufficient because
+  // every Power Monitor directional key is exactly SHA-256 length.
+  Key32 pseudorandom_key =
+      hmacSha256(salt, salt_length, secret, secret_length);
   std::vector<std::uint8_t> expansion(info.begin(), info.end());
   expansion.push_back(1U);
-  return hmacSha256(pseudorandom_key.data(), pseudorandom_key.size(),
-                    expansion.data(), expansion.size());
+  const Key32 output =
+      hmacSha256(pseudorandom_key.data(), pseudorandom_key.size(),
+                 expansion.data(), expansion.size());
+  pseudorandom_key.fill(0U);
+  std::fill(expansion.begin(), expansion.end(), std::uint8_t{0});
+  return output;
+}
+
+std::string base64UrlEncode(const std::uint8_t *data,
+                            const std::size_t length) {
+  if (data == nullptr && length != 0U)
+    return {};
+  const std::size_t padded_capacity = ((length + 2U) / 3U) * 4U + 1U;
+  std::vector<std::uint8_t> encoded(padded_capacity, 0U);
+  std::size_t written = 0;
+  if (mbedtls_base64_encode(encoded.data(), encoded.size(), &written, data,
+                            length) != 0) {
+    std::fill(encoded.begin(), encoded.end(), std::uint8_t{0});
+    return {};
+  }
+  std::string output(reinterpret_cast<const char *>(encoded.data()), written);
+  std::replace(output.begin(), output.end(), '+', '-');
+  std::replace(output.begin(), output.end(), '/', '_');
+  while (!output.empty() && output.back() == '=')
+    output.pop_back();
+  std::fill(encoded.begin(), encoded.end(), std::uint8_t{0});
+  return output;
+}
+
+bool base64UrlDecode(const std::string &encoded,
+                     std::vector<std::uint8_t> &output) {
+  output.clear();
+  if (encoded.empty() || encoded.find('=') != std::string::npos ||
+      !std::all_of(encoded.begin(), encoded.end(), [](const char value) {
+        return (value >= 'a' && value <= 'z') ||
+               (value >= 'A' && value <= 'Z') ||
+               (value >= '0' && value <= '9') || value == '-' || value == '_';
+      })) {
+    return false;
+  }
+  std::string padded = encoded;
+  std::replace(padded.begin(), padded.end(), '-', '+');
+  std::replace(padded.begin(), padded.end(), '_', '/');
+  while ((padded.size() & 3U) != 0U)
+    padded.push_back('=');
+  output.resize((padded.size() / 4U) * 3U);
+  std::size_t written = 0;
+  const int decoded = mbedtls_base64_decode(
+      output.data(), output.size(), &written,
+      reinterpret_cast<const std::uint8_t *>(padded.data()), padded.size());
+  std::fill(padded.begin(), padded.end(), '\0');
+  if (decoded != 0) {
+    std::fill(output.begin(), output.end(), std::uint8_t{0});
+    output.clear();
+    return false;
+  }
+  output.resize(written);
+  return true;
 }
 
 bool constantTimeEqual(const std::string &left, const std::string &right) {
