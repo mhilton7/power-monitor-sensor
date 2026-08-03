@@ -504,6 +504,26 @@ CompactSensorStatusConfig ConfigService::compactSensorStatusConfig() const {
   return output;
 }
 
+CompactDeviceIdentity ConfigService::compactIdentity() const {
+  RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
+  CompactDeviceIdentity output;
+  if (!lock) {
+    return output;
+  }
+  const int device_written =
+      std::snprintf(output.device_id.data(), output.device_id.size(), "%s",
+                    identity_.device_id.c_str());
+  const int boot_written =
+      std::snprintf(output.boot_id.data(), output.boot_id.size(), "%s",
+                    identity_.boot_id.c_str());
+  output.enrolled = identity_.enrolled;
+  output.truncated =
+      device_written < 0 || boot_written < 0 ||
+      static_cast<std::size_t>(device_written) >= output.device_id.size() ||
+      static_cast<std::size_t>(boot_written) >= output.boot_id.size();
+  return output;
+}
+
 NetworkRuntimeConfig ConfigService::networkRuntimeConfig() const {
   RecursiveMutexGuard lock(state_mutex_, kStateReadTimeout);
   if (!lock) {

@@ -50,6 +50,10 @@ private:
   void reportTasks() const;
   void captureTaskDiagnostics() const;
   void reportMemory() const;
+  void persistMemoryPressureEvent(MemoryPressureState previous,
+                                  MemoryPressureState current,
+                                  std::uint32_t free_internal,
+                                  std::uint32_t largest_internal);
   void executeMaintenance(const MaintenanceMessage &message);
   bool createTasks();
 
@@ -81,6 +85,13 @@ private:
   std::atomic<std::uint64_t> sync_progress_{0};
   EspHeapTelemetry heap_telemetry_{};
   MemoryPressurePolicy memory_pressure_;
+  struct PendingMemoryPressureEvent {
+    MemoryPressureState previous{MemoryPressureState::Normal};
+    MemoryPressureState current{MemoryPressureState::Normal};
+    std::uint32_t free_internal{0U};
+    std::uint32_t largest_internal{0U};
+    bool active{false};
+  } pending_memory_pressure_event_{};
   std::uint64_t sample_dropped_{0};
   std::uint64_t action_dropped_{0};
   std::uint64_t last_persisted_wifi_transition_{0};

@@ -1,6 +1,6 @@
 # Existing-trust central-server OTA
 
-Firmware 1.0.11 implements `pm-ota-manifest/2`, a device-authenticated HMAC OTA
+Firmware 1.0.12 implements `pm-ota-manifest/2`, a device-authenticated HMAC OTA
 flow that reuses trust already established during enrollment. The ordinary
 administrator workflow is one file: select `firmware.bin` in the central Power
 Monitor dashboard, review the server's parsed metadata, and install it on an
@@ -125,7 +125,7 @@ python -m esptool --chip esp32s3 --port COM5 write_flash 0x20000 firmware.bin
 Use the actual port and generated filename. Never add `erase_flash` and never
 flash a merged image for this migration. Writing only the application offset
 preserves NVS, Wi-Fi, enrollment, CA trust, microSD data, and sequence state; it
-does not require re-enrollment. After reboot, verify firmware 1.0.11 (or the
+does not require re-enrollment. After reboot, verify firmware 1.0.12 (or the
 actual generated version), an authenticated heartbeat, OTA protocol 2,
 `existing_device_hmac`, and the expected partition size. Future releases can
 then be installed from the central dashboard.

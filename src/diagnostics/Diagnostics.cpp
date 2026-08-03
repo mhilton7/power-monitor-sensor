@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESP.h>
 #include <esp_ota_ops.h>
+#include <esp_heap_caps.h>
 #include <esp_partition.h>
 #include <esp_system.h>
 #include <esp_timer.h>
@@ -38,6 +40,26 @@ std::string runningFirmwareSha256() {
 }
 
 } // namespace
+
+const char *tlsLifecycleStageName(const TlsLifecycleStage stage) {
+  switch (stage) {
+  case TlsLifecycleStage::BeforeClientConstruction:
+    return "before_client_construction";
+  case TlsLifecycleStage::AfterTlsConfiguration:
+    return "after_tls_configuration";
+  case TlsLifecycleStage::AfterHttpBegin:
+    return "after_http_begin";
+  case TlsLifecycleStage::AfterRequest:
+    return "after_request";
+  case TlsLifecycleStage::AfterHttpEnd:
+    return "after_http_end";
+  case TlsLifecycleStage::AfterClientDestruction:
+    return "after_client_destruction";
+  case TlsLifecycleStage::AfterHighMemoryLeaseRelease:
+    return "after_high_memory_lease_release";
+  }
+  return "unknown";
+}
 
 Diagnostics::Diagnostics() {
   mutex_ = xSemaphoreCreateMutex();
@@ -124,12 +146,35 @@ CompactSyncMetrics Diagnostics::compactSyncMetrics() const {
   if (!lock()) {
     return output;
   }
+  output.heartbeat_requests_sent = sync_.heartbeat_requests_sent;
+  output.heartbeat_successes = sync_.heartbeat_successes;
+  output.heartbeat_failures = sync_.heartbeat_failures;
+  output.batch_successes = sync_.batch_successes;
+  output.batch_failures = sync_.batch_failures;
+  output.transactions_started = sync_.transactions_started;
+  output.transactions_completed = sync_.transactions_completed;
+  output.transactions_failed = sync_.transactions_failed;
+  output.local_resource_deferrals = sync_.local_resource_deferrals;
+  output.fragmentation_deferrals = sync_.fragmentation_deferrals;
+  output.fragmentation_recoveries = sync_.fragmentation_recoveries;
+  output.tls_requests_admitted = sync_.tls_requests_admitted;
+  output.tls_requests_rejected_heap = sync_.tls_requests_rejected_heap;
   output.last_heartbeat_utc_ms = sync_.last_heartbeat_utc_ms;
+  output.last_sync_utc_ms = sync_.last_sync_utc_ms;
   output.last_heartbeat_attempt_monotonic_ms =
       sync_.last_heartbeat_attempt_monotonic_ms;
   output.last_heartbeat_success_monotonic_ms =
       sync_.last_heartbeat_success_monotonic_ms;
+  output.active_request_id = sync_.active_request_id;
+  output.stack_high_water_bytes = sync_.stack_high_water_bytes;
+  output.stack_margin_percent = sync_.stack_margin_percent;
+  output.largest_internal_before_tls = sync_.largest_internal_before_tls;
+  output.largest_internal_after_tls = sync_.largest_internal_after_tls;
+  output.largest_internal_after_cleanup = sync_.largest_internal_after_cleanup;
   output.consecutive_local_deferrals = sync_.consecutive_local_deferrals;
+  output.sync_in_progress = sync_.sync_in_progress;
+  output.sync_pending = sync_.sync_pending;
+  output.durable_reading_backlog = sync_.durable_reading_backlog;
   const auto copy = [&output](auto &target, const std::string &source) {
     const int written = std::snprintf(target.data(), target.size(), "%s",
                                       source.c_str());
@@ -207,6 +252,62 @@ MemoryOperationContext Diagnostics::memoryOperationContext() const {
 
 std::uint64_t Diagnostics::lastMemoryOperationCompletedMs() const {
   return high_memory_completed_ms_.load(std::memory_order_acquire);
+}
+
+void Diagnostics::recordTlsLifecycleCheckpoint(
+    const std::uint32_t request_id, const char *const endpoint,
+    const std::size_t endpoint_size,
+    const TlsLifecycleStage stage) const {
+  if (!lock(pdMS_TO_TICKS(25))) {
+    return;
+  }
+  TlsLifecycleCheckpoint &checkpoint =
+      tls_lifecycle_checkpoints_[tls_lifecycle_checkpoint_next_];
+  checkpoint = {};
+  checkpoint.request_id = request_id;
+  checkpoint.monotonic_ms =
+      static_cast<std::uint64_t>(esp_timer_get_time()) / 1000U;
+  checkpoint.free_internal_heap_bytes = static_cast<std::uint32_t>(
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  checkpoint.largest_internal_block_bytes = static_cast<std::uint32_t>(
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  checkpoint.context = memoryOperationContext();
+  checkpoint.stage = stage;
+  const std::size_t endpoint_length =
+      endpoint == nullptr
+          ? 0U
+          : std::min(endpoint_size, checkpoint.endpoint.size() - 1U);
+  if (endpoint_length != 0U && endpoint != nullptr) {
+    std::memcpy(checkpoint.endpoint.data(), endpoint, endpoint_length);
+  }
+  checkpoint.endpoint[endpoint_length] = '\0';
+  tls_lifecycle_checkpoint_next_ =
+      (tls_lifecycle_checkpoint_next_ + 1U) %
+      tls_lifecycle_checkpoints_.size();
+  tls_lifecycle_checkpoint_count_ =
+      std::min(tls_lifecycle_checkpoint_count_ + 1U,
+               tls_lifecycle_checkpoints_.size());
+  ++tls_lifecycle_checkpoint_total_;
+  unlock();
+}
+
+TlsLifecycleCheckpointSnapshot Diagnostics::tlsLifecycleCheckpoints() const {
+  TlsLifecycleCheckpointSnapshot snapshot;
+  if (!lock()) {
+    return snapshot;
+  }
+  snapshot.count = tls_lifecycle_checkpoint_count_;
+  snapshot.total = tls_lifecycle_checkpoint_total_;
+  const std::size_t first =
+      (tls_lifecycle_checkpoint_next_ + tls_lifecycle_checkpoints_.size() -
+       tls_lifecycle_checkpoint_count_) %
+      tls_lifecycle_checkpoints_.size();
+  for (std::size_t index = 0U; index < snapshot.count; ++index) {
+    snapshot.entries[index] = tls_lifecycle_checkpoints_[
+        (first + index) % tls_lifecycle_checkpoints_.size()];
+  }
+  unlock();
+  return snapshot;
 }
 
 void Diagnostics::recordHttpStatus(const int status,

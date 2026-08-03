@@ -6,18 +6,26 @@
 #include <string>
 
 #include "diagnostics/Diagnostics.h"
+#include "storage/BoundedStorageMessagePool.h"
 #include "storage/SdStorage.h"
 
 namespace pm {
 
 class StorageCoordinator {
 public:
+  static constexpr std::uint16_t kRecordPoolCapacity = 120U;
+  static constexpr std::uint16_t kEventPoolCapacity = 16U;
+
+  struct PoolMetrics {
+    BoundedStoragePoolMetrics records{};
+    BoundedStoragePoolMetrics events{};
+  };
+
   StorageCoordinator(SdStorage &storage, Diagnostics &diagnostics);
   bool begin();
   bool enqueueRecord(const IntervalRecord &record);
-  bool enqueueEvent(const std::string &code, const std::string &severity,
-                    const std::string &detail, std::uint64_t utc_ms,
-                    const std::string &boot_id);
+  bool enqueueEvent(StringView code, StringView severity, StringView detail,
+                    std::uint64_t utc_ms, StringView boot_id);
   bool queueRetention(std::uint64_t server_ack_sequence,
                       bool acknowledgement_verified,
                       std::uint64_t event_ack_sequence,
@@ -38,6 +46,7 @@ public:
   void taskLoop();
   std::uint32_t depth() const;
   std::uint64_t dropped() const;
+  PoolMetrics poolMetrics() const;
 
 private:
   enum class Type : std::uint8_t {
@@ -50,13 +59,6 @@ private:
     Retention,
     PrepareRemoval,
     ReconcileSequence,
-  };
-  struct EventData {
-    std::string code;
-    std::string severity;
-    std::string detail;
-    std::string boot_id;
-    std::uint64_t utc_ms{0};
   };
   struct HistoryData {
     std::string id;
@@ -82,6 +84,7 @@ private:
   struct Message {
     Type type;
     void *payload;
+    std::uint16_t pool_slot{kInvalidStoragePoolSlot};
   };
 
   bool remountStorage();
@@ -105,6 +108,10 @@ private:
   std::atomic<bool> prepare_removal_queued_{false};
   std::atomic<bool> sequence_reconciliation_queued_{false};
   std::atomic<std::uint64_t> required_sequence_floor_{0};
+  BoundedStoragePool<FixedIntervalRecord>::Slot *record_slots_{nullptr};
+  BoundedStoragePool<FixedEventData>::Slot *event_slots_{nullptr};
+  BoundedStoragePool<FixedIntervalRecord> record_pool_{};
+  BoundedStoragePool<FixedEventData> event_pool_{};
 };
 
 } // namespace pm

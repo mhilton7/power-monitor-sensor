@@ -988,6 +988,9 @@ class ProtocolContractTests(unittest.TestCase):
             'server_.on("/api/v1/info"', local_health_start
         )
         local_health_source = local_api_source[local_health_start:local_health_end]
+        local_health_serializer = (
+            ROOT / "include/api/LocalHealthStatus.h"
+        ).read_text(encoding="utf-8")
         self.assertNotIn("authorize(request", local_health_source)
         self.assertNotIn("readPage(", local_health_source)
         self.assertNotIn("requestImmediateSync", local_health_source)
@@ -998,7 +1001,7 @@ class ProtocolContractTests(unittest.TestCase):
             '"free_internal_heap_bytes"',
             '"largest_internal_block_bytes"',
         ):
-            self.assertIn(field, local_health_source)
+            self.assertIn(field, local_health_source + local_health_serializer)
 
         ota_source = (ROOT / "src/ota/OtaService.cpp").read_text(encoding="utf-8")
         for marker in (

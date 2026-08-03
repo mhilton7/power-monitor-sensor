@@ -42,8 +42,14 @@ public:
             MemoryOperationContext::OtaActive, pdMS_TO_TICKS(5000))) {}
 
   ~OtaMemoryLease() {
-    if (acquired_)
+    if (acquired_) {
       diagnostics_.releaseHighMemoryOperation();
+      static constexpr char kOtaOperation[] =
+          "/api/v1/device-firmware/ota-operation";
+      diagnostics_.recordTlsLifecycleCheckpoint(
+          0U, kOtaOperation, sizeof(kOtaOperation) - 1U,
+          TlsLifecycleStage::AfterHighMemoryLeaseRelease);
+    }
   }
 
   explicit operator bool() const { return acquired_; }
@@ -51,6 +57,49 @@ public:
 private:
   Diagnostics &diagnostics_;
   bool acquired_{false};
+};
+
+class OtaTransportLifecycle final {
+public:
+  OtaTransportLifecycle(Diagnostics &diagnostics, const std::string &endpoint)
+      : diagnostics_(diagnostics), endpoint_(endpoint) {
+    record(TlsLifecycleStage::BeforeClientConstruction);
+  }
+
+  ~OtaTransportLifecycle() {
+    record(TlsLifecycleStage::AfterClientDestruction);
+  }
+
+  void record(const TlsLifecycleStage stage) const {
+    diagnostics_.recordTlsLifecycleCheckpoint(
+        0U, endpoint_.data(), endpoint_.size(), stage);
+  }
+
+private:
+  Diagnostics &diagnostics_;
+  const std::string &endpoint_;
+};
+
+class OtaHttpCleanup final {
+public:
+  OtaHttpCleanup(HTTPClient &http, OtaTransportLifecycle &lifecycle)
+      : http_(http), lifecycle_(lifecycle) {}
+
+  ~OtaHttpCleanup() { end(); }
+
+  void end() {
+    if (ended_) {
+      return;
+    }
+    http_.end();
+    ended_ = true;
+    lifecycle_.record(TlsLifecycleStage::AfterHttpEnd);
+  }
+
+private:
+  HTTPClient &http_;
+  OtaTransportLifecycle &lifecycle_;
+  bool ended_{false};
 };
 
 bool parseHttpsTarget(const std::string &url, std::string &host,
@@ -777,33 +826,35 @@ bool OtaService::fetchText(const std::string &url, std::string &body,
     error = "ota_dns_resolution_failed";
     return false;
   }
+  OtaTransportLifecycle lifecycle(diagnostics_, target);
   ResolvedTlsClient client;
   if (!configureTls(client, active_config.server_ca_pem)) {
     error = "tls_ca_not_configured";
     return false;
   }
+  lifecycle.record(TlsLifecycleStage::AfterTlsConfiguration);
   client.setResolvedEndpoint(address, hostname, port);
   HTTPClient http;
+  OtaHttpCleanup cleanup(http, lifecycle);
   http.setConnectTimeout(5000);
   http.setTimeout(10000);
   if (!http.begin(client, url.c_str()) ||
       !addDeviceAuthentication(http, "GET", target, {}, error)) {
-    http.end();
     return false;
   }
+  lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
   const int http_status = http.GET();
+  lifecycle.record(TlsLifecycleStage::AfterRequest);
   const int content_length = http.getSize();
   if (http_status != 200 || content_length < 0 ||
       content_length > static_cast<int>(maximum_bytes)) {
     error = http_status == 200 ? "ota_manifest_length_invalid"
                                : "ota_manifest_download_failed";
-    http.end();
     return false;
   }
   WiFiClient *stream = http.getStreamPtr();
   if (stream == nullptr) {
     error = "ota_manifest_stream_unavailable";
-    http.end();
     return false;
   }
   body.clear();
@@ -815,7 +866,6 @@ bool OtaService::fetchText(const std::string &url, std::string &body,
     if (available <= 0) {
       if (!http.connected() || millis() - last_progress_ms > 10'000U) {
         error = "ota_manifest_stream_interrupted";
-        http.end();
         return false;
       }
       vTaskDelay(pdMS_TO_TICKS(2));
@@ -829,14 +879,13 @@ bool OtaService::fetchText(const std::string &url, std::string &body,
     const int count = stream->readBytes(buffer.data(), wanted);
     if (count <= 0) {
       error = "ota_manifest_stream_interrupted";
-      http.end();
       return false;
     }
     body.append(reinterpret_cast<const char *>(buffer.data()),
                 static_cast<std::size_t>(count));
     last_progress_ms = millis();
   }
-  http.end();
+  cleanup.end();
   return body.size() == static_cast<std::size_t>(content_length);
 }
 
@@ -870,32 +919,34 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     error = "ota_dns_resolution_failed";
     return false;
   }
+  OtaTransportLifecycle lifecycle(diagnostics_, target);
   ResolvedTlsClient client;
   if (!configureTls(client, active_config.server_ca_pem)) {
     error = "tls_ca_not_configured";
     return false;
   }
+  lifecycle.record(TlsLifecycleStage::AfterTlsConfiguration);
   client.setResolvedEndpoint(address, hostname, port);
   HTTPClient http;
+  OtaHttpCleanup cleanup(http, lifecycle);
   http.setConnectTimeout(5000);
   http.setTimeout(15000);
   if (!http.begin(client, image_url.c_str()) ||
       !addDeviceAuthentication(http, "GET", target, {}, error)) {
-    http.end();
     return false;
   }
+  lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
   const int http_status = http.GET();
+  lifecycle.record(TlsLifecycleStage::AfterRequest);
   const int content_length = http.getSize();
   if (http_status != 200 ||
       content_length != static_cast<int>(manifest.size_bytes)) {
     error = "ota_image_size_or_status_invalid";
-    http.end();
     return false;
   }
   WiFiClient *stream = http.getStreamPtr();
   if (stream == nullptr) {
     error = "ota_image_stream_unavailable";
-    http.end();
     return false;
   }
   setState(ota_v2::State::Downloading, "downloading", {}, true);
@@ -908,7 +959,6 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     if (available <= 0) {
       if (!http.connected() || millis() - last_progress_ms > 15'000U) {
         error = "ota_image_stream_interrupted";
-        http.end();
         return false;
       }
       vTaskDelay(pdMS_TO_TICKS(2));
@@ -921,19 +971,16 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
                                         wanted);
     if (count <= 0) {
       error = "ota_image_stream_interrupted";
-      http.end();
       return false;
     }
     metadata_received += static_cast<std::size_t>(count);
     last_progress_ms = millis();
   }
   if (!validateImageMetadata(metadata, manifest, error)) {
-    http.end();
     return false;
   }
   if (!Update.begin(manifest.size_bytes, U_FLASH)) {
     error = "ota_partition_unavailable";
-    http.end();
     return false;
   }
 
@@ -971,7 +1018,6 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
     error = ota_v2::streamFailureCode(stream_tracker.failure());
     failUpdate();
     mbedtls_sha256_free(&hash);
-    http.end();
     return false;
   }
   mbedtls_sha256_update_ret(&hash, metadata.data(), metadata.size());
@@ -989,7 +1035,6 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
         error = ota_v2::streamFailureCode(stream_tracker.failure());
         failUpdate();
         mbedtls_sha256_free(&hash);
-        http.end();
         return false;
       }
       vTaskDelay(pdMS_TO_TICKS(2));
@@ -1011,7 +1056,6 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
                          : ota_v2::streamFailureCode(stream_tracker.failure());
       failUpdate();
       mbedtls_sha256_free(&hash);
-      http.end();
       return false;
     }
     mbedtls_sha256_update_ret(&hash, buffer.data(),
@@ -1032,7 +1076,7 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
   crypto::Key32 digest{};
   mbedtls_sha256_finish_ret(&hash, digest.data());
   mbedtls_sha256_free(&hash);
-  http.end();
+  cleanup.end();
   setState(ota_v2::State::BinaryVerifying, "binary_verifying", {}, true);
   const std::string received_hash =
       crypto::hexEncode(digest.data(), digest.size());
@@ -1082,25 +1126,29 @@ bool OtaService::postReport(const char *report_state, std::string &error) {
     error = "ota_report_dns_failed";
     return false;
   }
+  OtaTransportLifecycle lifecycle(diagnostics_, endpoint);
   ResolvedTlsClient client;
   if (!configureTls(client, active_config.server_ca_pem)) {
     error = "tls_ca_not_configured";
     return false;
   }
+  lifecycle.record(TlsLifecycleStage::AfterTlsConfiguration);
   client.setResolvedEndpoint(address, hostname, port);
   HTTPClient http;
+  OtaHttpCleanup cleanup(http, lifecycle);
   http.setConnectTimeout(5000);
   http.setTimeout(10000);
   if (!http.begin(client, url.c_str()) ||
       !addDeviceAuthentication(http, "POST", endpoint, body, error)) {
-    http.end();
     return false;
   }
+  lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
   http.addHeader("Content-Type", "application/json");
   const int response = http.POST(
       reinterpret_cast<std::uint8_t *>(const_cast<char *>(body.data())),
       body.size());
-  http.end();
+  lifecycle.record(TlsLifecycleStage::AfterRequest);
+  cleanup.end();
   if (response != 200 && response != 204) {
     error = "ota_report_rejected";
     return false;

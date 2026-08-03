@@ -37,6 +37,13 @@ The handler does not construct a dynamic ArduinoJson document, copy the full
 runtime configuration, serialize full storage health, scan history, or contact
 the central server.
 
+The unauthenticated local liveness probe at `GET /api/local/health` uses a
+separate one-slot, 3,072-byte bounded response pool and compact schema-2
+serializer. It exposes only non-secret operational counters needed for live
+memory qualification. Overlapping probe requests receive a typed 503 instead
+of an unbounded fallback. The probe never returns credentials, enrollment
+secrets, HMAC material, certificate PEM, cookies, or request bodies.
+
 ## Server freshness
 
 The browser renders server connection state from the last accepted heartbeat,

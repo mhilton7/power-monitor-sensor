@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STATUS_ROUTE = "/api/v1/ui/status"
+LOCAL_HEALTH_ROUTE = "/api/local/health"
 
 
 @dataclass(frozen=True)
@@ -37,8 +38,17 @@ def _mask_comments(source: str) -> str:
         following = source[index + 1] if index + 1 < len(source) else ""
         if state == "code":
             if char in {'"', "'"}:
-                state = "string"
-                quote = char
+                # C++ digit separators (for example 30'000U) are not character
+                # literals and must not hide every following brace.
+                numeric_separator = (
+                    char == "'"
+                    and index > 0
+                    and source[index - 1].isalnum()
+                    and following.isalnum()
+                )
+                if not numeric_separator:
+                    state = "string"
+                    quote = char
             elif char == "/" and following == "/":
                 output[index] = output[index + 1] = " "
                 state = "line_comment"
@@ -80,8 +90,15 @@ def _matching_brace(source: str, opening: int) -> int:
         following = source[index + 1] if index + 1 < len(source) else ""
         if state == "code":
             if char in {'"', "'"}:
-                state = "string"
-                quote = char
+                numeric_separator = (
+                    char == "'"
+                    and index > 0
+                    and source[index - 1].isalnum()
+                    and following.isalnum()
+                )
+                if not numeric_separator:
+                    state = "string"
+                    quote = char
             elif char == "/" and following == "/":
                 state = "line_comment"
                 index += 1
@@ -109,11 +126,11 @@ def _matching_brace(source: str, opening: int) -> int:
     raise ValueError("unterminated C++ handler body")
 
 
-def status_handler(source: str) -> str:
+def route_handler(source: str, route: str) -> str:
     masked = _mask_comments(source)
-    route_offset = masked.find(f'"{STATUS_ROUTE}"')
+    route_offset = masked.find(f'"{route}"')
     if route_offset < 0:
-        raise ValueError(f"route {STATUS_ROUTE} was not found")
+        raise ValueError(f"route {route} was not found")
     lambda_offset = masked.find("[this]", route_offset)
     if lambda_offset < 0:
         raise ValueError("compact status route has no [this] handler")
@@ -122,6 +139,10 @@ def status_handler(source: str) -> str:
         raise ValueError("compact status route handler has no body")
     closing = _matching_brace(masked, opening)
     return masked[opening : closing + 1]
+
+
+def status_handler(source: str) -> str:
+    return route_handler(source, STATUS_ROUTE)
 
 
 def named_function(source: str, qualified_name: str) -> str:
@@ -134,6 +155,20 @@ def named_function(source: str, qualified_name: str) -> str:
     opening = masked.find("{", signature.end())
     if opening < 0:
         raise ValueError(f"function {qualified_name} has no body")
+    closing = _matching_brace(masked, opening)
+    return masked[opening : closing + 1]
+
+
+def named_type(source: str, name: str) -> str:
+    """Return one C++ class/struct body with comments masked."""
+
+    masked = _mask_comments(source)
+    declaration = re.search(rf"\b(?:class|struct)\s+{re.escape(name)}\b", masked)
+    if declaration is None:
+        raise ValueError(f"type {name} was not found")
+    opening = masked.find("{", declaration.end())
+    if opening < 0:
+        raise ValueError(f"type {name} has no body")
     closing = _matching_brace(masked, opening)
     return masked[opening : closing + 1]
 
@@ -191,6 +226,59 @@ def inspect_status_handler(source: str) -> list[Violation]:
                 Violation(
                     "bounded-status-required",
                     f"compact status handler does not use the {detail}",
+                )
+            )
+    return violations
+
+
+def inspect_local_health_handler(source: str) -> list[Violation]:
+    try:
+        handler = route_handler(source, LOCAL_HEALTH_ROUTE)
+    except ValueError as error:
+        return [Violation("local-health-route-shape", str(error))]
+
+    violations: list[Violation] = []
+    for name in (
+        "JsonDocument",
+        "JsonObject",
+        "JsonArray",
+        "NetworkStatus",
+        "StorageHealth",
+        "SyncMetrics",
+        "DeviceIdentity",
+        "std::string",
+        "std::vector",
+    ):
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", handler):
+            violations.append(
+                Violation(
+                    "bounded-local-health-types",
+                    f"local health uses prohibited dynamic/full type {name}",
+                )
+            )
+    for pattern, detail in (
+        (r"\bserializeJson\s*\(", "general-purpose JSON serialization"),
+        (r"\bnetwork_\s*\.\s*status\s*\(", "full NetworkStatus snapshot"),
+        (r"\bstorage_\s*\.\s*health\s*\(", "full StorageHealth snapshot"),
+        (r"\bdiagnostics_\s*\.\s*syncMetrics\s*\(", "string-bearing sync snapshot"),
+        (r"\bconfig_\s*\.\s*identity\s*\(", "string-bearing identity snapshot"),
+    ):
+        if re.search(pattern, handler):
+            violations.append(Violation("bounded-local-health-calls", detail))
+    compact = re.sub(r"\s+", "", handler)
+    for required, detail in (
+        ("local_health_response_pool_.acquire()", "bounded body-pool lease"),
+        ("network_.compactStatus()", "compact network snapshot"),
+        ("storage_.heartbeatHealth()", "fixed storage snapshot"),
+        ("diagnostics_.compactSyncMetrics()", "fixed sync snapshot"),
+        ("config_.compactIdentity()", "fixed identity snapshot"),
+        ("serializeLocalHealth", "bounded local-health serializer"),
+    ):
+        if required not in compact:
+            violations.append(
+                Violation(
+                    "bounded-local-health-required",
+                    f"local health lacks the {detail}",
                 )
             )
     return violations
@@ -267,16 +355,11 @@ def inspect_status_dependencies(source: str) -> list[Violation]:
                 "same-origin validation concatenates dynamic String values",
             )
         )
+    pooled_response = named_type(source, "PooledUiStatusResponse")
     for required, detail in (
         (
             "static_assert(sizeof(PooledUiStatusResponse) <= 512U",
             "compile-time response-object size bound",
-        ),
-        ("~PooledUiStatusResponse()", "response lifecycle destructor"),
-        ("lease_.release()", "disconnect/error response-slot release"),
-        (
-            "recordUiStatusResponseObjectRelease()",
-            "response-object release diagnostic",
         ),
         ("heap_after_response", "post-response-allocation heap measurement"),
         (
@@ -285,6 +368,21 @@ def inspect_status_dependencies(source: str) -> list[Violation]:
         ),
     ):
         if required not in source:
+            violations.append(
+                Violation(
+                    "bounded-status-response",
+                    f"compact response path lacks the {detail}",
+                )
+            )
+    for required, detail in (
+        ("~PooledUiStatusResponse()", "response lifecycle destructor"),
+        ("lease_.release()", "disconnect/error response-slot release"),
+        (
+            "recordUiStatusResponseObjectRelease()",
+            "response-object release diagnostic",
+        ),
+    ):
+        if required not in pooled_response:
             violations.append(
                 Violation(
                     "bounded-status-response",
@@ -301,7 +399,17 @@ def inspect_support_types(root: Path) -> list[Violation]:
     cookie_header = root / "include" / "api" / "BoundedCookie.h"
     http_header = root / "src" / "api" / "HttpApi.h"
     auth_header = root / "src" / "security" / "AuthService.h"
-    for path in (compact_header, pool_header, cookie_header, http_header, auth_header):
+    local_health_header = root / "include" / "api" / "LocalHealthStatus.h"
+    storage_pool_header = root / "include" / "storage" / "BoundedStorageMessagePool.h"
+    for path in (
+        compact_header,
+        pool_header,
+        cookie_header,
+        http_header,
+        auth_header,
+        local_health_header,
+        storage_pool_header,
+    ):
         if not path.is_file():
             violations.append(Violation("bounded-status-support", f"missing {path}"))
             return violations
@@ -350,6 +458,30 @@ def inspect_support_types(root: Path) -> list[Violation]:
                 "session validation does not consume allocation-free string views",
             )
         )
+    local_health = _mask_comments(local_health_header.read_text(encoding="utf-8"))
+    storage_pool_source = storage_pool_header.read_text(encoding="utf-8")
+    storage_pool = "\n".join(
+        (
+            named_type(storage_pool_source, "FixedIntervalRecord"),
+            named_type(storage_pool_source, "FixedEventData"),
+        )
+    )
+    for body, label in (
+        (local_health, "LocalHealthSnapshot"),
+        (storage_pool, "bounded storage queue payloads"),
+    ):
+        for dynamic_type, pattern in (
+            ("std::string", r"\bstd::string\b(?!_view)"),
+            ("std::vector", r"\bstd::vector\b"),
+            ("JsonDocument", r"\bJsonDocument\b"),
+        ):
+            if re.search(pattern, body):
+                violations.append(
+                    Violation(
+                        "bounded-hot-path-support",
+                        f"{label} owns prohibited dynamic type {dynamic_type}",
+                    )
+                )
     http = _mask_comments(http_header.read_text(encoding="utf-8"))
     constants = {
         name: int(value)
@@ -495,6 +627,22 @@ def inspect_server_sync_hot_paths(root: Path) -> list[Violation]:
                 "heartbeat storage snapshot is not fixed-capacity",
             )
         )
+    for marker in (
+        "BeforeClientConstruction",
+        "AfterTlsConfiguration",
+        "AfterHttpBegin",
+        "AfterRequest",
+        "AfterHttpEnd",
+        "AfterClientDestruction",
+        "AfterHighMemoryLeaseRelease",
+    ):
+        if marker not in source:
+            violations.append(
+                Violation(
+                    "tls-lifecycle-checkpoints",
+                    f"server-sync lifecycle is missing {marker}",
+                )
+            )
     return violations
 
 
@@ -505,6 +653,7 @@ def check(root: Path) -> list[Violation]:
     contents = source.read_text(encoding="utf-8")
     return (
         inspect_status_handler(contents)
+        + inspect_local_health_handler(contents)
         + inspect_status_dependencies(contents)
         + inspect_support_types(root)
         + inspect_server_sync_hot_paths(root)

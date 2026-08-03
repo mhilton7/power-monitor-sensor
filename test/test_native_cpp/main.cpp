@@ -5,11 +5,13 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "api/BoundedCookie.h"
 #include "api/BoundedJsonWriter.h"
 #include "api/CompactUiStatus.h"
+#include "api/LocalHealthStatus.h"
 #include "api/StatusResponsePool.h"
 #include "config/AtomicConfigStore.h"
 #include "config/ConfigRecovery.h"
@@ -33,6 +35,7 @@
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
 #include "storage/RecordFormat.h"
+#include "storage/BoundedStorageMessagePool.h"
 #include "storage/StoragePolicy.h"
 #include "storage/SyncCoverage.h"
 
@@ -1095,21 +1098,17 @@ void testMemoryPressurePolicy() {
             pm::memoryPressureIsLowMemory(update.current),
         "three genuinely low idle samples enter low-total memory");
   update = low_policy.update(60U * 1024U, 30U * 1024U, 4'000U);
-  check(update.current == pm::MemoryPressureState::LowTotalMemory,
-        "an intermediate 60-KiB sample cannot clear low-total memory");
+  check(update.current == pm::MemoryPressureState::Recovering,
+        "an intermediate 60-KiB sample clears the critical low-total label");
   low_policy.update(85'744U, 32U * 1024U, 5'000U);
   low_policy.update(85'744U, 32U * 1024U, 6'000U);
   update = low_policy.update(85'744U, 32U * 1024U, 7'000U);
-  check(update.current == pm::MemoryPressureState::Recovering &&
-            !pm::memoryPressureIsLowMemory(update.current),
-        "three safe post-cleanup samples move low-total memory to recovering");
-  low_policy.update(85'744U, 32U * 1024U, 8'000U);
-  low_policy.update(85'744U, 32U * 1024U, 9'000U);
-  update = low_policy.update(85'744U, 32U * 1024U, 10'000U);
   check(update.current == pm::MemoryPressureState::Normal &&
-            low_policy.metrics(10'000U).entry_count == 1U &&
-            low_policy.metrics(10'000U).recovery_count == 1U,
-        "sustained safe evidence completes low-memory recovery");
+            !pm::memoryPressureIsLowMemory(update.current),
+        "three safe post-cleanup samples complete the recovering state");
+  check(low_policy.metrics(7'000U).entry_count == 1U &&
+            low_policy.metrics(7'000U).recovery_count == 1U,
+        "sustained safe evidence records one completed low-memory recovery");
 
   pm::MemoryPressurePolicy grace_policy;
   grace_policy.update(72'348U, 33'780U, 0U);
@@ -1135,15 +1134,43 @@ void testMemoryPressurePolicy() {
   pm::MemoryPressurePolicy emergency_policy;
   update = emergency_policy.update(28U * 1024U, 12U * 1024U, 1'000U,
                                    pm::MemoryOperationContext::TlsActive);
+  check(update.current == pm::MemoryPressureState::Normal && !update.changed &&
+            emergency_policy.metrics(1'000U)
+                    .tls_transient_minimum_free_internal_bytes ==
+                28U * 1024U,
+        "a 28-KiB TLS transient is measured without becoming persistent low memory");
+  update = emergency_policy.update(28U * 1024U, 12U * 1024U, 5'000U,
+                                   pm::MemoryOperationContext::Idle, true,
+                                   1'000U);
   check(update.current == pm::MemoryPressureState::LowTotalMemory &&
             update.changed,
-        "the 28-KiB emergency floor fails immediately even during TLS");
+        "the same 28-KiB sample is immediately critical after TLS cleanup grace");
   pm::MemoryPressurePolicy integrity_policy;
   update = integrity_policy.update(80U * 1024U, 40U * 1024U, 1'000U,
                                    pm::MemoryOperationContext::OtaActive,
                                    false);
   check(update.current == pm::MemoryPressureState::LowTotalMemory,
         "heap-integrity failure is immediately critical during OTA");
+
+  pm::MemoryPressurePolicy allocation_failure_policy;
+  update = allocation_failure_policy.update(
+      80U * 1024U, 40U * 1024U, 1'000U,
+      pm::MemoryOperationContext::TlsActive, true, 0U, true);
+  check(update.current == pm::MemoryPressureState::LowTotalMemory,
+        "an explicit critical-allocation failure remains immediate during TLS");
+
+  pm::MemoryPressurePolicy relabel_policy;
+  relabel_policy.update(28U * 1024U, 12U * 1024U, 1'000U);
+  update = relabel_policy.update(72U * 1024U, 24U * 1024U, 2'000U);
+  check(update.current == pm::MemoryPressureState::Fragmented &&
+            !pm::memoryPressureIsLowMemory(update.current),
+        "low total relabels as fragmentation when total memory recovers first");
+
+  pm::MemoryPressurePolicy partial_recovery_policy;
+  partial_recovery_policy.update(28U * 1024U, 12U * 1024U, 1'000U);
+  update = partial_recovery_policy.update(60U * 1024U, 32U * 1024U, 2'000U);
+  check(update.current == pm::MemoryPressureState::Recovering,
+        "low total exposes partial recovery above 56 KiB without waiting for normal");
 
   pm::MemoryPressurePolicy warning_policy;
   update = warning_policy.update(60U * 1024U, 30U * 1024U, 1'000U);
@@ -1179,6 +1206,61 @@ void testMemoryPressurePolicy() {
                 pm::MemoryOperationContext::TlsPreparing),
         "high-memory context permits only preparing-to-active TLS transition "
         "and records grace only after real TLS or OTA activity");
+}
+
+void testBoundedStorageMessagePools() {
+  static_assert(std::is_trivially_destructible<pm::FixedIntervalRecord>::value,
+                "fixed record slots must not own hidden dynamic storage");
+  static_assert(std::is_trivially_destructible<pm::FixedEventData>::value,
+                "fixed event slots must not own hidden dynamic storage");
+  std::array<pm::BoundedStorageSlot<pm::FixedIntervalRecord>, 2U>
+      record_slots{};
+  pm::BoundedStoragePool<pm::FixedIntervalRecord> records(
+      record_slots.data(), static_cast<std::uint16_t>(record_slots.size()));
+  pm::IntervalRecord source;
+  source.device_id = "12345678-1234-1234-1234-123456789abc";
+  source.friendly_name = "Outdoor-AC";
+  source.boot_id = "boot-1";
+  source.energy_method = "integrated";
+  source.firmware_version = "1.0.12";
+  source.avg_active_power_w = 42.5F;
+  source.interval_energy_wh = 10.625;
+  const std::uint16_t first = records.acquire();
+  const std::uint16_t second = records.acquire();
+  const std::uint16_t exhausted = records.acquire();
+  check(first != pm::kInvalidStoragePoolSlot &&
+            second != pm::kInvalidStoragePoolSlot &&
+            exhausted == pm::kInvalidStoragePoolSlot &&
+            records.metrics().active == 2U &&
+            records.metrics().peak_active == 2U &&
+            records.metrics().exhaustions == 1U,
+        "the record pool is bounded and reports active, peak, and exhaustion counts");
+  pm::FixedIntervalRecord *const fixed = records.get(first);
+  pm::IntervalRecord restored;
+  const bool assigned = fixed != nullptr && fixed->assign(source);
+  if (assigned)
+    fixed->materialize(restored);
+  check(assigned && restored.device_id == source.device_id &&
+            restored.friendly_name == source.friendly_name &&
+            restored.avg_active_power_w == source.avg_active_power_w &&
+            restored.interval_energy_wh == source.interval_energy_wh,
+        "the fixed record slot round-trips all recurring storage fields");
+  records.release(first);
+  records.release(second);
+  check(records.metrics().active == 0U,
+        "record slots return to the bounded pool without delete");
+
+  std::array<pm::BoundedStorageSlot<pm::FixedEventData>, 1U> event_slots{};
+  pm::BoundedStoragePool<pm::FixedEventData> events(
+      event_slots.data(), static_cast<std::uint16_t>(event_slots.size()));
+  const std::uint16_t event_index = events.acquire();
+  pm::FixedEventData *const event = events.get(event_index);
+  check(event != nullptr &&
+            event->assign("EVT_MEMORY_PRESSURE_CHANGED", "warning",
+                          "idle-confirmed", 1234U, "boot-1") &&
+            std::string(event->detail.data()) == "idle-confirmed",
+        "event queue payloads use fixed-capacity text without hidden strings");
+  events.release(event_index);
 }
 
 void testOperationAwareMemorySoaks() {
@@ -1526,6 +1608,69 @@ void testBoundedStatusPrimitives() {
               transport.url.data() == url_storage,
           "canonical and URL transport scratch retains fixed storage");
   }
+}
+
+void testBoundedLocalHealthSerialization() {
+  pm::LocalHealthSnapshot snapshot;
+  snapshot.protocol = "pm-protocol/1.0.0";
+  snapshot.firmware_version = "1.0.12";
+  snapshot.git_commit = "0123456789abcdef";
+  snapshot.build_timestamp = "2026-08-03T12:00:00Z";
+  snapshot.high_memory_context = "tls_active";
+  snapshot.memory_state = "normal";
+  snapshot.memory_severity = "normal";
+  pm::copyCompactText(snapshot.boot_id, "boot-live-probe");
+  pm::copyCompactText(snapshot.last_heartbeat_result, "success");
+  pm::copyCompactText(snapshot.last_local_deferral_reason, "");
+  pm::copyCompactText(snapshot.last_sync_error, "");
+  snapshot.heartbeat_successes = 42U;
+  snapshot.reading_batch_successes = 8U;
+  snapshot.server_ack_sequence = 4'708U;
+  snapshot.newest_syncable_sequence = 4'709U;
+  snapshot.durable_backlog_count = 1U;
+  snapshot.free_internal_heap_bytes = 28'016U;
+  snapshot.largest_internal_block_bytes = 13'044U;
+  snapshot.tls_transient_minimum_free_internal_bytes = 19'684U;
+  snapshot.record_pool_capacity = 120U;
+  snapshot.record_pool_active = 1U;
+  snapshot.record_pool_peak_active = 3U;
+  snapshot.event_pool_capacity = 16U;
+  snapshot.wifi_connected = true;
+  snapshot.storage_present = true;
+  snapshot.storage_mounted = true;
+  snapshot.storage_writable = true;
+  snapshot.storage_index_healthy = true;
+  snapshot.meter_healthy = true;
+  snapshot.sync_in_progress = true;
+  snapshot.durable_reading_backlog = true;
+  snapshot.heap_integrity_ok = true;
+
+  pm::StatusResponsePool<1U, 3072U> pool;
+  auto lease = pool.acquire();
+  const pm::LocalHealthSerializationResult result =
+      pm::serializeLocalHealth(snapshot, lease.data(), lease.capacity());
+  check(result.success && lease.setSize(result.bytes) &&
+            result.bytes < lease.capacity() &&
+            std::string(lease.data()).find(
+                "\"schema_version\":2") != std::string::npos &&
+            std::string(lease.data()).find(
+                "\"high_memory_context\":\"tls_active\"") !=
+                std::string::npos &&
+            std::string(lease.data()).find(
+                "\"record_pool_capacity\":120") !=
+                std::string::npos &&
+            std::string(lease.data()).find(
+                "\"free_internal_heap_bytes\":28016") !=
+                std::string::npos,
+        "local health is serialized from a fixed snapshot into a bounded "
+        "response slot without a JsonDocument or dynamic body");
+
+  std::array<char, 128U> too_small{};
+  const pm::LocalHealthSerializationResult overflow =
+      pm::serializeLocalHealth(snapshot, too_small.data(), too_small.size());
+  check(!overflow.success && too_small.back() == '\0',
+        "local health fails closed and remains terminated when its fixed "
+        "capacity is insufficient");
 }
 
 void testCompactStatusSerializationAndFreshness() {
@@ -2682,8 +2827,10 @@ int main() {
   testProtocolCanonicalization();
   testAuthenticationPolicy();
   testMemoryPressurePolicy();
+  testBoundedStorageMessagePools();
   testOperationAwareMemorySoaks();
   testBoundedStatusPrimitives();
+  testBoundedLocalHealthSerialization();
   testCompactStatusSerializationAndFreshness();
   testBoundedStatusAuthorizationAndResponsePath();
   testDebugAllocationScopes();

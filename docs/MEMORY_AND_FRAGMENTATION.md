@@ -53,6 +53,14 @@ transport-failure counters. It does not enter external exponential backoff.
 The local retry path is bounded and resumes after optional allocations are
 released and adjacent free blocks coalesce.
 
+Firmware 1.0.12 evaluates an authorized TLS/OTA operation before applying idle
+low-total or fragmentation classifications. Heap-integrity failure and a true
+critical floor remain immediate faults. A normal admitted TLS dip is recorded
+as a transient minimum, then the allocator is evaluated after transport
+destruction, high-memory lease release, and the post-operation grace period.
+Persistent memory-event storage is deferred until that idle evaluation agrees;
+it cannot allocate a string-bearing event while TLS owns the heap.
+
 ## Recurring allocation map
 
 Before this correction, every compact Status request could own all of these at
@@ -87,6 +95,9 @@ The corrected ownership model is bounded:
 | Canonical target | 1 KiB reserved string | Long-lived internal heap | Reserved once; recurring path cannot grow it |
 | Build metadata and embedded UI | Compile-time data | Flash/PROGMEM | Firmware lifetime |
 | TLS working memory | mbedTLS-managed internal heap | Internal heap | One admitted transaction |
+| Local-health body | 1 x 3,072 bytes | Long-lived internal heap | One bounded lease; overlap returns typed 503 |
+| Durable interval messages | 120 compact slots | Long-lived PSRAM | Slot returned after storage task consumes or rejects it |
+| Durable event messages | 16 compact slots | Long-lived PSRAM | Slot returned after storage task consumes or rejects it |
 
 PSRAM placement is limited to byte payloads whose consumers accept external
 8-bit memory. TLS library state, DMA-sensitive objects, synchronization
@@ -132,6 +143,19 @@ cleanup, and pool pressure. Those are deterministic ownership tests, not a
 claim that a physical AsyncTCP disconnect or allocator trace was observed.
 Browser tests cover actual Chromium/Firefox/WebKit cancellation behavior
 against the mock sensor server, not a physical ESP32 network stack.
+
+`GET /api/local/health` is independently bounded because it is polled during
+physical memory qualification. It uses compact network, storage, identity,
+sync, pressure, queue, pool, and heap snapshots and serializes schema 2 directly
+into one fixed 3,072-byte response slot. It does not use ArduinoJson, a dynamic
+response string, a history scan, or a central-server request. The single slot
+avoids reserving a larger idle internal-DRAM pool; concurrent probes receive a
+bounded 503 and must retry at their configured interval.
+
+The last 32 TLS/OTA lifecycle checkpoints are also fixed-capacity. They sample
+before client construction, after TLS setup, after HTTP begin/request/end,
+after the transport destructors, and after the high-memory lease release. This
+separates expected active TLS minima from a failed idle coalescence.
 
 ## Test/debug allocation scopes
 

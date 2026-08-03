@@ -4,6 +4,7 @@
 .test-tmp/
 logs/
 test-results/
+artifacts/live-memory-validation/
 __pycache__/
 *.pyc
 web/node_modules/

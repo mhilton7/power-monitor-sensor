@@ -167,10 +167,14 @@ public:
     recordMinimum(lowest_largest_internal_block_bytes_, largest_internal);
 
     const MemoryPressureState previous = state_;
-    const bool emergency = !integrity_ok || critical_allocation_failed ||
-                           free_internal <
-                               kMemoryEmergencyFreeInternalBytes;
-    if (emergency) {
+    // Heap-integrity failures and an explicitly reported critical allocation
+    // failure are hard faults in every context. A low byte count by itself is
+    // not: mbedTLS and the OTA writer deliberately consume internal DRAM while
+    // their high-memory lease is active. Classifying that expected transient
+    // before those objects are destroyed used to latch LowTotalMemory and
+    // enqueue another allocation-heavy event at the worst possible moment.
+    const bool hard_fault = !integrity_ok || critical_allocation_failed;
+    if (hard_fault) {
       updateFragmentationEpisode(false, free_internal, now_ms);
       transition(MemoryPressureState::LowTotalMemory, now_ms);
       return {previous, state_, previous != state_};
@@ -199,6 +203,15 @@ public:
       return {previous, state_, false};
     }
 
+    // Outside an expected high-memory operation the emergency floor is an
+    // immediate low-total condition. It is intentionally evaluated only after
+    // the context and post-operation grace checks above.
+    if (free_internal < kMemoryEmergencyFreeInternalBytes) {
+      updateFragmentationEpisode(false, free_internal, now_ms);
+      transition(MemoryPressureState::LowTotalMemory, now_ms);
+      return {previous, state_, previous != state_};
+    }
+
     const bool fragmented =
         free_internal >= kMemoryFragmentationFreeInternalBytes &&
         largest_internal < kMemoryNormalLargestInternalBlockBytes;
@@ -219,9 +232,10 @@ public:
         transition(MemoryPressureState::PressureWarning, now_ms);
       }
     } else if (fragmented) {
-      if (state_ != MemoryPressureState::LowTotalMemory) {
-        transition(MemoryPressureState::Fragmented, now_ms);
-      }
+      // Current evidence wins over the old label. In particular, recovered
+      // total free memory with a sub-32-KiB largest block is fragmentation,
+      // not a permanently latched low-total state.
+      transition(MemoryPressureState::Fragmented, now_ms);
     } else if (safe) {
       switch (state_) {
       case MemoryPressureState::Normal:
@@ -243,8 +257,14 @@ public:
         }
         break;
       }
-    } else if (state_ != MemoryPressureState::LowTotalMemory) {
-      transition(MemoryPressureState::PressureWarning, now_ms);
+    } else {
+      // A former low-total episode has recovered above the sustained-low
+      // threshold, but has not yet reached the fully safe TLS-ready baseline.
+      // Expose that progress instead of keeping the critical label latched.
+      transition(state_ == MemoryPressureState::LowTotalMemory
+                     ? MemoryPressureState::Recovering
+                     : MemoryPressureState::PressureWarning,
+                 now_ms);
     }
 
     return {previous, state_, previous != state_};

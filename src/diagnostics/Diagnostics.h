@@ -74,10 +74,33 @@ struct SyncMetrics {
 };
 
 struct CompactSyncMetrics {
+  std::uint64_t heartbeat_requests_sent{0U};
+  std::uint64_t heartbeat_successes{0U};
+  std::uint64_t heartbeat_failures{0U};
+  std::uint64_t batch_successes{0U};
+  std::uint64_t batch_failures{0U};
+  std::uint64_t transactions_started{0U};
+  std::uint64_t transactions_completed{0U};
+  std::uint64_t transactions_failed{0U};
+  std::uint64_t local_resource_deferrals{0U};
+  std::uint64_t fragmentation_deferrals{0U};
+  std::uint64_t fragmentation_recoveries{0U};
+  std::uint64_t tls_requests_admitted{0U};
+  std::uint64_t tls_requests_rejected_heap{0U};
   std::uint64_t last_heartbeat_utc_ms{0U};
+  std::uint64_t last_sync_utc_ms{0U};
   std::uint64_t last_heartbeat_attempt_monotonic_ms{0U};
   std::uint64_t last_heartbeat_success_monotonic_ms{0U};
+  std::uint32_t active_request_id{0U};
+  std::uint32_t stack_high_water_bytes{0U};
+  std::uint32_t stack_margin_percent{0U};
+  std::uint32_t largest_internal_before_tls{0U};
+  std::uint32_t largest_internal_after_tls{0U};
+  std::uint32_t largest_internal_after_cleanup{0U};
   std::uint32_t consecutive_local_deferrals{0U};
+  bool sync_in_progress{false};
+  bool sync_pending{false};
+  bool durable_reading_backlog{false};
   std::array<char, 33> last_heartbeat_result{};
   std::array<char, 65> last_local_deferral_reason{};
   std::array<char, 65> last_error{};
@@ -153,6 +176,37 @@ struct QueueMetrics {
   std::uint64_t action_dropped{0};
 };
 
+enum class TlsLifecycleStage : std::uint8_t {
+  BeforeClientConstruction,
+  AfterTlsConfiguration,
+  AfterHttpBegin,
+  AfterRequest,
+  AfterHttpEnd,
+  AfterClientDestruction,
+  AfterHighMemoryLeaseRelease,
+};
+
+const char *tlsLifecycleStageName(TlsLifecycleStage stage);
+
+struct TlsLifecycleCheckpoint {
+  std::uint32_t request_id{0U};
+  std::uint64_t monotonic_ms{0U};
+  std::uint32_t free_internal_heap_bytes{0U};
+  std::uint32_t largest_internal_block_bytes{0U};
+  MemoryOperationContext context{MemoryOperationContext::Idle};
+  TlsLifecycleStage stage{TlsLifecycleStage::BeforeClientConstruction};
+  std::array<char, 65U> endpoint{};
+};
+
+inline constexpr std::size_t kTlsLifecycleCheckpointCapacity = 32U;
+
+struct TlsLifecycleCheckpointSnapshot {
+  std::array<TlsLifecycleCheckpoint, kTlsLifecycleCheckpointCapacity>
+      entries{};
+  std::size_t count{0U};
+  std::uint64_t total{0U};
+};
+
 struct LocalSessionDiagnostics {
   std::uint32_t capacity{0};
   std::uint32_t active{0};
@@ -208,6 +262,11 @@ public:
   void releaseHighMemoryOperation() const;
   MemoryOperationContext memoryOperationContext() const;
   std::uint64_t lastMemoryOperationCompletedMs() const;
+  void recordTlsLifecycleCheckpoint(std::uint32_t request_id,
+                                    const char *endpoint,
+                                    std::size_t endpoint_length,
+                                    TlsLifecycleStage stage) const;
+  TlsLifecycleCheckpointSnapshot tlsLifecycleCheckpoints() const;
   void recordHttpStatus(int status, bool rejected_signature = false,
                         bool rate_limited = false);
   void recordBrowserSessionRejection();
@@ -259,6 +318,12 @@ private:
   mutable std::atomic<std::uint8_t> high_memory_context_{
       static_cast<std::uint8_t>(MemoryOperationContext::Idle)};
   mutable std::atomic<std::uint64_t> high_memory_completed_ms_{0U};
+  mutable std::array<TlsLifecycleCheckpoint,
+                     kTlsLifecycleCheckpointCapacity>
+      tls_lifecycle_checkpoints_{};
+  mutable std::size_t tls_lifecycle_checkpoint_next_{0U};
+  mutable std::size_t tls_lifecycle_checkpoint_count_{0U};
+  mutable std::uint64_t tls_lifecycle_checkpoint_total_{0U};
   MeasurementSnapshot latest_;
   bool has_latest_{false};
   std::uint64_t committed_sequence_{0};

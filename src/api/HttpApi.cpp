@@ -107,6 +107,42 @@ private:
 static_assert(sizeof(PooledUiStatusResponse) <= 512U,
               "compact Status response object exceeded its small exception");
 
+class PooledLocalHealthResponse final : public AsyncAbstractResponse {
+public:
+  explicit PooledLocalHealthResponse(LocalHealthResponsePool::Lease lease)
+      : lease_(std::move(lease)) {
+    _code = 200;
+    _contentType = "application/json";
+    _contentLength = lease_.size();
+    _sendContentLength = true;
+    addHeader("Cache-Control", "no-store");
+    addHeader("X-Content-Type-Options", "nosniff");
+  }
+
+  ~PooledLocalHealthResponse() override { lease_.release(); }
+
+  bool _sourceValid() const override {
+    return static_cast<bool>(lease_) && lease_.size() == _contentLength;
+  }
+
+  std::size_t _fillBuffer(std::uint8_t *buffer,
+                          const std::size_t maximum) override {
+    if (!lease_ || _sentLength >= lease_.size()) {
+      return 0U;
+    }
+    const std::size_t remaining = lease_.size() - _sentLength;
+    const std::size_t length = std::min(remaining, maximum);
+    std::memcpy(buffer, lease_.data() + _sentLength, length);
+    return length;
+  }
+
+private:
+  LocalHealthResponsePool::Lease lease_;
+};
+
+static_assert(sizeof(PooledLocalHealthResponse) <= 256U,
+              "local health response object must stay allocation-light");
+
 struct DeferredHttpResult {
   int status{200};
   std::string content_type{"application/json"};
@@ -1319,6 +1355,30 @@ void HttpApi::registerReadRoutes() {
                 ? storage.newest_syncable_sequence - acknowledgement
                 : 0U;
         sync_json["last_safe_error"] = sync.last_error;
+        const TlsLifecycleCheckpointSnapshot tls_lifecycle =
+            diagnostics_.tlsLifecycleCheckpoints();
+        JsonObject tls_lifecycle_json =
+            document["tls_lifecycle"].to<JsonObject>();
+        tls_lifecycle_json["capacity"] = kTlsLifecycleCheckpointCapacity;
+        tls_lifecycle_json["count"] = tls_lifecycle.count;
+        tls_lifecycle_json["total"] = tls_lifecycle.total;
+        JsonArray tls_checkpoint_rows =
+            tls_lifecycle_json["checkpoints"].to<JsonArray>();
+        for (std::size_t index = 0U; index < tls_lifecycle.count; ++index) {
+          const TlsLifecycleCheckpoint &checkpoint =
+              tls_lifecycle.entries[index];
+          JsonObject row = tls_checkpoint_rows.add<JsonObject>();
+          row["request_id"] = checkpoint.request_id;
+          row["endpoint"] = checkpoint.endpoint.data();
+          row["stage"] = tlsLifecycleStageName(checkpoint.stage);
+          row["monotonic_ms"] = checkpoint.monotonic_ms;
+          row["free_internal_heap_bytes"] =
+              checkpoint.free_internal_heap_bytes;
+          row["largest_internal_block_bytes"] =
+              checkpoint.largest_internal_block_bytes;
+          row["operation_context"] =
+              memoryOperationContextName(checkpoint.context);
+        }
         JsonObject local_http = document["local_http"].to<JsonObject>();
         local_http["ui_status_requests"] = http.ui_status_requests;
         local_http["ui_status_responses"] = http.ui_status_responses;
@@ -1331,6 +1391,14 @@ void HttpApi::registerReadRoutes() {
             status_response_pool_.exhaustions();
         local_http["ui_status_response_maximum_bytes"] =
             status_response_pool_.responseCapacity();
+        local_http["local_health_pool_capacity"] =
+            local_health_response_pool_.capacity();
+        local_http["local_health_pool_active"] =
+            local_health_response_pool_.active();
+        local_http["local_health_pool_exhaustions"] =
+            local_health_response_pool_.exhaustions();
+        local_http["local_health_response_maximum_bytes"] =
+            local_health_response_pool_.responseCapacity();
         local_http["ui_status_dynamic_allocation_failures"] =
             http.ui_status_dynamic_allocation_failures;
         local_http["ui_status_response_object_allocations"] =
@@ -1486,6 +1554,29 @@ void HttpApi::registerReadRoutes() {
         synchronization["batch_failures"] = sync.batch_failures;
         synchronization["tls_requests_rejected_heap"] =
             sync.tls_requests_rejected_heap;
+        const TlsLifecycleCheckpointSnapshot tls_lifecycle =
+            diagnostics_.tlsLifecycleCheckpoints();
+        JsonObject tls_lifecycle_json =
+            document["tls_lifecycle"].to<JsonObject>();
+        tls_lifecycle_json["count"] = tls_lifecycle.count;
+        tls_lifecycle_json["total"] = tls_lifecycle.total;
+        JsonArray tls_checkpoint_rows =
+            tls_lifecycle_json["checkpoints"].to<JsonArray>();
+        for (std::size_t index = 0U; index < tls_lifecycle.count; ++index) {
+          const TlsLifecycleCheckpoint &checkpoint =
+              tls_lifecycle.entries[index];
+          JsonObject row = tls_checkpoint_rows.add<JsonObject>();
+          row["request_id"] = checkpoint.request_id;
+          row["endpoint"] = checkpoint.endpoint.data();
+          row["stage"] = tlsLifecycleStageName(checkpoint.stage);
+          row["monotonic_ms"] = checkpoint.monotonic_ms;
+          row["free_internal_heap_bytes"] =
+              checkpoint.free_internal_heap_bytes;
+          row["largest_internal_block_bytes"] =
+              checkpoint.largest_internal_block_bytes;
+          row["operation_context"] =
+              memoryOperationContextName(checkpoint.context);
+        }
         JsonObject authentication = document["authentication"].to<JsonObject>();
         authentication["server_signature_rejections"] =
             http.rejected_signatures;
@@ -1555,50 +1646,141 @@ void HttpApi::registerReadRoutes() {
         // This deliberately avoids authentication, server traffic, history
         // reads, and long worker waits. It is a local liveness probe that must
         // remain useful while DNS, TLS, or the central server is unavailable.
-        const NetworkStatus network = network_.status();
-        const StorageHealth storage = storage_.health();
+        // Every snapshot and JSON body below is fixed-capacity. The previous
+        // JsonDocument plus full string-bearing model copies fragmented the
+        // same internal heap needed by the next TLS handshake.
+        LocalHealthResponsePool::Lease response_slot =
+            local_health_response_pool_.acquire();
+        if (!response_slot) {
+          sendStaticStatusProblem(request, kStatusCapacityProblem,
+                                  sizeof(kStatusCapacityProblem) - 1U);
+          return;
+        }
+        const CompactNetworkStatus network = network_.compactStatus();
+        const HeartbeatStorageHealth storage = storage_.heartbeatHealth();
         const MeterMetrics meter = meter_.metrics();
-        const SyncMetrics sync = diagnostics_.syncMetrics();
-        JsonDocument document;
-        document["schema_version"] = 1;
-        document["protocol"] = version::PROTOCOL;
-        document["uptime_seconds"] = clock_.monotonicMs() / 1000U;
-        document["wifi_connected"] = network.station_connected;
-        document["time_trusted"] = clock_.synchronized();
-        document["storage_writable"] = storage.writable;
-        document["meter_healthy"] = meter.last_error == MeterError::None;
-        document["sync_in_progress"] = sync.sync_in_progress;
-        document["sync_pending"] = sync.sync_pending;
-        document["heartbeat_successes"] = sync.heartbeat_successes;
-        document["heartbeat_failures"] = sync.heartbeat_failures;
-        document["reading_batch_successes"] = sync.batch_successes;
-        document["reading_batch_failures"] = sync.batch_failures;
-        document["last_sync_utc_ms"] = sync.last_sync_utc_ms;
-        document["server_ack_sequence"] = config_.serverAckSequence();
-        document["oldest_stored_sequence"] = storage.oldest_sequence;
-        document["oldest_syncable_sequence"] =
-            storage.oldest_syncable_sequence;
-        document["newest_stored_sequence"] = storage.newest_sequence;
-        document["newest_syncable_sequence"] =
-            storage.newest_syncable_sequence;
-        document["durable_backlog_count"] =
-            storage.newest_syncable_sequence >= config_.serverAckSequence()
-                ? storage.newest_syncable_sequence -
-                      config_.serverAckSequence()
-                : 0;
-        document["durable_reading_backlog"] =
-            sync.durable_reading_backlog;
-        document["last_sync_error"] = sync.last_error;
-        document["stack_high_water_bytes"] = sync.stack_high_water_bytes;
-        document["stack_margin_percent"] = sync.stack_margin_percent;
+        const CompactSyncMetrics sync = diagnostics_.compactSyncMetrics();
+        const MemoryPressureMetrics pressure =
+            diagnostics_.memoryPressureMetrics();
+        const CompactDeviceIdentity identity = config_.compactIdentity();
+        const QueueMetrics queues = diagnostics_.queueMetrics();
+        const StorageCoordinator::PoolMetrics pools =
+            coordinator_.poolMetrics();
         const HeapSnapshot heap = heap_telemetry_.snapshot();
-        document["free_heap_bytes"] = heap.free_total_bytes;
-        document["free_internal_heap_bytes"] = heap.free_internal_bytes;
-        document["largest_internal_block_bytes"] =
+
+        LocalHealthSnapshot snapshot;
+        snapshot.protocol = version::PROTOCOL;
+        snapshot.firmware_version = version::FIRMWARE;
+        snapshot.git_commit = version::GIT_COMMIT;
+        snapshot.build_timestamp = version::BUILD_TIMESTAMP;
+        snapshot.high_memory_context = memoryOperationContextName(
+            diagnostics_.memoryOperationContext());
+        snapshot.memory_state = memoryPressureStateName(pressure.state);
+        snapshot.memory_severity = memoryPressureSeverityName(pressure.state);
+        snapshot.boot_id = identity.boot_id;
+        snapshot.last_heartbeat_result = sync.last_heartbeat_result;
+        snapshot.last_local_deferral_reason =
+            sync.last_local_deferral_reason;
+        snapshot.last_sync_error = sync.last_error;
+        snapshot.uptime_seconds = clock_.monotonicMs() / 1000U;
+        snapshot.heartbeat_requests_sent = sync.heartbeat_requests_sent;
+        snapshot.heartbeat_successes = sync.heartbeat_successes;
+        snapshot.heartbeat_failures = sync.heartbeat_failures;
+        snapshot.reading_batch_successes = sync.batch_successes;
+        snapshot.reading_batch_failures = sync.batch_failures;
+        snapshot.transactions_started = sync.transactions_started;
+        snapshot.transactions_completed = sync.transactions_completed;
+        snapshot.transactions_failed = sync.transactions_failed;
+        snapshot.local_resource_deferrals = sync.local_resource_deferrals;
+        snapshot.fragmentation_deferrals = sync.fragmentation_deferrals;
+        snapshot.fragmentation_recoveries = sync.fragmentation_recoveries;
+        snapshot.tls_requests_admitted = sync.tls_requests_admitted;
+        snapshot.tls_requests_rejected_heap =
+            sync.tls_requests_rejected_heap;
+        snapshot.last_heartbeat_utc_ms = sync.last_heartbeat_utc_ms;
+        snapshot.last_heartbeat_attempt_monotonic_ms =
+            sync.last_heartbeat_attempt_monotonic_ms;
+        snapshot.last_heartbeat_success_monotonic_ms =
+            sync.last_heartbeat_success_monotonic_ms;
+        snapshot.last_sync_utc_ms = sync.last_sync_utc_ms;
+        snapshot.server_ack_sequence = config_.serverAckSequence();
+        snapshot.oldest_stored_sequence = storage.oldest_sequence;
+        snapshot.oldest_syncable_sequence =
+            storage.oldest_syncable_sequence;
+        snapshot.newest_stored_sequence = storage.newest_sequence;
+        snapshot.newest_syncable_sequence =
+            storage.newest_syncable_sequence;
+        snapshot.durable_backlog_count =
+            storage.newest_syncable_sequence >= snapshot.server_ack_sequence
+                ? storage.newest_syncable_sequence -
+                      snapshot.server_ack_sequence
+                : 0U;
+        snapshot.storage_dropped = queues.storage_dropped;
+        snapshot.action_dropped = queues.action_dropped;
+        snapshot.record_pool_exhaustions = pools.records.exhaustions;
+        snapshot.event_pool_exhaustions = pools.events.exhaustions;
+        snapshot.cumulative_pressure_ms = pressure.cumulative_pressure_ms;
+        snapshot.longest_pressure_episode_ms =
+            pressure.longest_pressure_episode_ms;
+        snapshot.free_heap_bytes = heap.free_total_bytes;
+        snapshot.minimum_free_heap_bytes = heap.minimum_free_total_bytes;
+        snapshot.free_internal_heap_bytes = heap.free_internal_bytes;
+        snapshot.minimum_free_internal_heap_bytes =
+            heap.minimum_free_internal_bytes;
+        snapshot.largest_internal_block_bytes =
             heap.largest_internal_block_bytes;
-        std::string body;
-        serializeJson(document, body);
-        sendJson(request, 200, body);
+        snapshot.lowest_free_internal_bytes =
+            pressure.lowest_free_internal_bytes;
+        snapshot.lowest_largest_internal_block_bytes =
+            pressure.lowest_largest_internal_block_bytes;
+        snapshot.tls_transient_minimum_free_internal_bytes =
+            pressure.tls_transient_minimum_free_internal_bytes;
+        snapshot.ota_transient_minimum_free_internal_bytes =
+            pressure.ota_transient_minimum_free_internal_bytes;
+        snapshot.stack_high_water_bytes = sync.stack_high_water_bytes;
+        snapshot.stack_margin_percent = sync.stack_margin_percent;
+        snapshot.storage_queue_depth = queues.storage_depth;
+        snapshot.action_queue_depth = queues.action_depth;
+        snapshot.record_pool_capacity = pools.records.capacity;
+        snapshot.record_pool_active = pools.records.active;
+        snapshot.record_pool_peak_active = pools.records.peak_active;
+        snapshot.event_pool_capacity = pools.events.capacity;
+        snapshot.event_pool_active = pools.events.active;
+        snapshot.event_pool_peak_active = pools.events.peak_active;
+        snapshot.wifi_connected = network.station_connected;
+        snapshot.time_trusted = clock_.synchronized();
+        snapshot.storage_present = storage.present;
+        snapshot.storage_mounted = storage.mounted;
+        snapshot.storage_writable = storage.writable;
+        snapshot.storage_index_healthy = storage.index_healthy;
+        snapshot.meter_healthy = meter.last_error == MeterError::None;
+        snapshot.sync_in_progress = sync.sync_in_progress;
+        snapshot.sync_pending = sync.sync_pending;
+        snapshot.durable_reading_backlog = sync.durable_reading_backlog;
+        snapshot.tls_ready = pressure.tls_ready;
+        snapshot.heap_integrity_ok = heap.integrity_ok;
+
+        const LocalHealthSerializationResult serialized =
+            serializeLocalHealth(snapshot, response_slot.data(),
+                                 response_slot.capacity());
+        if (!serialized.success ||
+            !response_slot.setSize(serialized.bytes)) {
+          response_slot.release();
+          sendStaticStatusProblem(request, kStatusSerializationProblem,
+                                  sizeof(kStatusSerializationProblem) - 1U);
+          return;
+        }
+        auto *response = new (std::nothrow)
+            PooledLocalHealthResponse(std::move(response_slot));
+        if (response == nullptr) {
+          response_slot.release();
+          diagnostics_.recordLocalResponseAllocationFailure();
+          sendStaticStatusProblem(request, kStatusCapacityProblem,
+                                  sizeof(kStatusCapacityProblem) - 1U);
+          return;
+        }
+        diagnostics_.recordHttpStatus(200);
+        request->send(response);
         if (diag::SerialLogger::instance().allow("webui_health", 30'000U)) {
           PM_LOG_INFO("WEB", "WEBUI_HEALTH",
                       "status=200 sync_in_progress=%s heap_free=%lu",

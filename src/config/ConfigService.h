@@ -96,6 +96,13 @@ struct DeviceIdentity {
   bool enrolled{false};
 };
 
+struct CompactDeviceIdentity {
+  std::array<char, 40U> device_id{};
+  std::array<char, 65U> boot_id{};
+  bool enrolled{false};
+  bool truncated{false};
+};
+
 struct ConfigValidation {
   bool valid{false};
   std::string code;
@@ -192,6 +199,7 @@ public:
   ServerTransportConfig serverTransportConfig() const;
   SensorStatusConfig sensorStatusConfig() const;
   CompactSensorStatusConfig compactSensorStatusConfig() const;
+  CompactDeviceIdentity compactIdentity() const;
   NetworkRuntimeConfig networkRuntimeConfig() const;
   MeasurementRuntimeConfig measurementRuntimeConfig() const;
   ServerSyncRuntimeConfig serverSyncRuntimeConfig() const;

@@ -657,28 +657,54 @@ void Application::healthTask() {
           static_cast<unsigned long>(largest_internal),
           memoryOperationContextName(operation_context),
           constrained ? "true" : "false");
-      const MemoryPressureMetrics memory = memory_pressure_.metrics(now);
-      char detail[384]{};
-      std::snprintf(
-          detail, sizeof(detail),
-          "previous=%s current=%s entries=%lu recoveries=%lu "
-          "free_internal=%lu largest_internal=%lu sync_in_progress=%s",
-          memoryPressureStateName(pressure.previous),
-          memoryPressureStateName(pressure.current),
-          static_cast<unsigned long>(memory.entry_count),
-          static_cast<unsigned long>(memory.recovery_count),
-          static_cast<unsigned long>(free_internal),
-          static_cast<unsigned long>(largest_internal),
-          diagnostics_.syncMetrics().sync_in_progress ? "true" : "false");
-      storage_coordinator_.enqueueEvent(
-          pressure.current == MemoryPressureState::Normal
-              ? "EVT_MEMORY_PRESSURE_RECOVERED"
-              : "EVT_MEMORY_PRESSURE_CHANGED",
-          pressure.current == MemoryPressureState::LowTotalMemory ||
-                  pressure.current == MemoryPressureState::Fragmented
-              ? "warning"
-              : "info",
-          detail, clock_.utcMs(), config_.identity().boot_id);
+      const std::uint64_t completed_ms =
+          diagnostics_.lastMemoryOperationCompletedMs();
+      const bool post_operation_grace =
+          completed_ms != 0U && now >= completed_ms &&
+          now - completed_ms < kMemoryPostOperationGraceMs;
+      if (operation_context != MemoryOperationContext::Idle ||
+          post_operation_grace) {
+        pending_memory_pressure_event_ = {
+            pressure.previous, pressure.current, free_internal,
+            largest_internal, true};
+        PM_LOG_INFO(
+            "MEMORY", "MEMORY_EVENT_DEFERRED",
+            "previous=%s current=%s operation_context=%s grace=%s "
+            "persistence=post_operation_idle_reevaluation",
+            memoryPressureStateName(pressure.previous),
+            memoryPressureStateName(pressure.current),
+            memoryOperationContextName(operation_context),
+            post_operation_grace ? "true" : "false");
+      } else {
+        persistMemoryPressureEvent(pressure.previous, pressure.current,
+                                   free_internal, largest_internal);
+      }
+    }
+    const std::uint64_t completed_ms =
+        diagnostics_.lastMemoryOperationCompletedMs();
+    const bool memory_event_grace_complete =
+        completed_ms == 0U ||
+        (now >= completed_ms &&
+         now - completed_ms >= kMemoryPostOperationGraceMs);
+    if (pending_memory_pressure_event_.active &&
+        diagnostics_.memoryOperationContext() == MemoryOperationContext::Idle &&
+        memory_event_grace_complete) {
+      // Persist only when the post-cleanup idle classifier still agrees with
+      // the deferred state. A TLS-only byte dip is evidence, not an event.
+      if (memory_pressure_.state() == pending_memory_pressure_event_.current) {
+        persistMemoryPressureEvent(
+            pending_memory_pressure_event_.previous,
+            pending_memory_pressure_event_.current,
+            pending_memory_pressure_event_.free_internal,
+            pending_memory_pressure_event_.largest_internal);
+      } else {
+        PM_LOG_INFO(
+            "MEMORY", "MEMORY_EVENT_TRANSIENT_DISCARDED",
+            "deferred_state=%s idle_state=%s reason=post_tls_recovered",
+            memoryPressureStateName(pending_memory_pressure_event_.current),
+            memoryPressureStateName(memory_pressure_.state()));
+      }
+      pending_memory_pressure_event_.active = false;
     }
     const WifiDisconnectSnapshot wifi_events =
         network_.wifiDisconnectEvents();
@@ -1353,6 +1379,34 @@ void Application::captureTaskDiagnostics() const {
     };
   }
   diagnostics_.setTaskMetrics(snapshot);
+}
+
+void Application::persistMemoryPressureEvent(
+    const MemoryPressureState previous, const MemoryPressureState current,
+    const std::uint32_t free_internal,
+    const std::uint32_t largest_internal) {
+  const MemoryPressureMetrics memory = memory_pressure_.metrics(millis());
+  const CompactSyncMetrics sync = diagnostics_.compactSyncMetrics();
+  char detail[384]{};
+  std::snprintf(
+      detail, sizeof(detail),
+      "previous=%s current=%s entries=%lu recoveries=%lu free_internal=%lu "
+      "largest_internal=%lu sync_in_progress=%s persistence=idle_confirmed",
+      memoryPressureStateName(previous), memoryPressureStateName(current),
+      static_cast<unsigned long>(memory.entry_count),
+      static_cast<unsigned long>(memory.recovery_count),
+      static_cast<unsigned long>(free_internal),
+      static_cast<unsigned long>(largest_internal),
+      sync.sync_in_progress ? "true" : "false");
+  storage_coordinator_.enqueueEvent(
+      current == MemoryPressureState::Normal
+          ? "EVT_MEMORY_PRESSURE_RECOVERED"
+          : "EVT_MEMORY_PRESSURE_CHANGED",
+      current == MemoryPressureState::LowTotalMemory ||
+              current == MemoryPressureState::Fragmented
+          ? "warning"
+          : "info",
+      detail, clock_.utcMs(), config_.identity().boot_id);
 }
 
 void Application::reportMemory() const {

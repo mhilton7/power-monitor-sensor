@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <new>
 
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 
 #include "app/TaskConfig.h"
@@ -47,17 +48,42 @@ StorageCoordinator::StorageCoordinator(SdStorage &storage,
     : storage_(storage), diagnostics_(diagnostics) {}
 
 bool StorageCoordinator::begin() {
+  record_slots_ = static_cast<BoundedStoragePool<FixedIntervalRecord>::Slot *>(
+      heap_caps_calloc(kRecordPoolCapacity,
+                       sizeof(BoundedStoragePool<FixedIntervalRecord>::Slot),
+                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  event_slots_ = static_cast<BoundedStoragePool<FixedEventData>::Slot *>(
+      heap_caps_calloc(kEventPoolCapacity,
+                       sizeof(BoundedStoragePool<FixedEventData>::Slot),
+                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (record_slots_ != nullptr) {
+    for (std::uint16_t index = 0U; index < kRecordPoolCapacity; ++index) {
+      new (&record_slots_[index])
+          BoundedStoragePool<FixedIntervalRecord>::Slot{};
+    }
+    record_pool_.reset(record_slots_, kRecordPoolCapacity);
+  }
+  if (event_slots_ != nullptr) {
+    for (std::uint16_t index = 0U; index < kEventPoolCapacity; ++index) {
+      new (&event_slots_[index]) BoundedStoragePool<FixedEventData>::Slot{};
+    }
+    event_pool_.reset(event_slots_, kEventPoolCapacity);
+  }
   write_queue_ =
       xQueueCreate(build::OFFLINE_RECORD_QUEUE_DEPTH, sizeof(Message));
   control_queue_ = xQueueCreate(8, sizeof(Message));
   history_mutex_ = xSemaphoreCreateMutex();
-  const bool ready = write_queue_ != nullptr && control_queue_ != nullptr &&
+  const bool ready = record_slots_ != nullptr && event_slots_ != nullptr &&
+                     write_queue_ != nullptr && control_queue_ != nullptr &&
                      history_mutex_ != nullptr;
   PM_LOG_INFO("STORAGE", "COORDINATOR_INIT",
               "result=%s write_queue_capacity=%u control_queue_capacity=8 "
-              "ownership=microSD",
+              "record_pool_capacity=%u event_pool_capacity=%u "
+              "pool_storage=psram ownership=microSD",
               ready ? "success" : "failed",
-              static_cast<unsigned>(build::OFFLINE_RECORD_QUEUE_DEPTH));
+              static_cast<unsigned>(build::OFFLINE_RECORD_QUEUE_DEPTH),
+              static_cast<unsigned>(kRecordPoolCapacity),
+              static_cast<unsigned>(kEventPoolCapacity));
   return ready;
 }
 
@@ -86,18 +112,22 @@ bool StorageCoordinator::queueSequenceReconciliation(
 }
 
 bool StorageCoordinator::enqueueRecord(const IntervalRecord &record) {
-  auto *copy = new (std::nothrow) IntervalRecord(record);
-  if (copy == nullptr) {
+  const std::uint16_t slot_index = record_pool_.acquire();
+  FixedIntervalRecord *const slot = record_pool_.get(slot_index);
+  if (slot == nullptr || !slot->assign(record)) {
+    record_pool_.release(slot_index);
     dropped_.fetch_add(1, std::memory_order_relaxed);
     recordDroppedInterval(record);
     PM_LOG_ERROR("QUEUE", "STORAGE_ALLOC_FAILED",
-                 "error=PM-QUEUE-002 type=record dropped=%llu",
+                 "error=PM-QUEUE-002 type=record reason=%s dropped=%llu",
+                 slot == nullptr ? "bounded_pool_exhausted"
+                                 : "bounded_field_capacity_exceeded",
                  static_cast<unsigned long long>(dropped()));
     return false;
   }
-  const Message message{Type::Record, copy};
+  const Message message{Type::Record, nullptr, slot_index};
   if (xQueueSend(write_queue_, &message, 0) != pdTRUE) {
-    delete copy;
+    record_pool_.release(slot_index);
     dropped_.fetch_add(1, std::memory_order_relaxed);
     recordDroppedInterval(record);
     if (diag::SerialLogger::instance().allow("storage_queue_full", 10'000U)) {
@@ -139,23 +169,27 @@ void StorageCoordinator::recordDroppedInterval(const IntervalRecord &record) {
           last_dropped_interval_utc_ms_.load(std::memory_order_relaxed)));
 }
 
-bool StorageCoordinator::enqueueEvent(const std::string &code,
-                                      const std::string &severity,
-                                      const std::string &detail,
+bool StorageCoordinator::enqueueEvent(const StringView code,
+                                      const StringView severity,
+                                      const StringView detail,
                                       const std::uint64_t utc_ms,
-                                      const std::string &boot_id) {
-  auto *event =
-      new (std::nothrow) EventData{code, severity, detail, boot_id, utc_ms};
-  if (event == nullptr) {
+                                      const StringView boot_id) {
+  const std::uint16_t slot_index = event_pool_.acquire();
+  FixedEventData *const event = event_pool_.get(slot_index);
+  if (event == nullptr ||
+      !event->assign(code, severity, detail, utc_ms, boot_id)) {
+    event_pool_.release(slot_index);
     dropped_.fetch_add(1, std::memory_order_relaxed);
     PM_LOG_ERROR("QUEUE", "STORAGE_ALLOC_FAILED",
-                 "error=PM-QUEUE-002 type=event dropped=%llu",
+                 "error=PM-QUEUE-002 type=event reason=%s dropped=%llu",
+                 event == nullptr ? "bounded_pool_exhausted"
+                                  : "bounded_field_capacity_exceeded",
                  static_cast<unsigned long long>(dropped()));
     return false;
   }
-  const Message message{Type::Event, event};
+  const Message message{Type::Event, nullptr, slot_index};
   if (xQueueSend(write_queue_, &message, 0) != pdTRUE) {
-    delete event;
+    event_pool_.release(slot_index);
     dropped_.fetch_add(1, std::memory_order_relaxed);
     if (diag::SerialLogger::instance().allow("event_queue_full", 10'000U)) {
       PM_LOG_ERROR(
@@ -388,6 +422,12 @@ void StorageCoordinator::taskLoop() {
       xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
       static_cast<unsigned>(task_config::kStorageStackBytes));
   Message message{};
+  IntervalRecord pending_record_storage;
+  pending_record_storage.device_id.reserve(39U);
+  pending_record_storage.friendly_name.reserve(64U);
+  pending_record_storage.boot_id.reserve(64U);
+  pending_record_storage.energy_method.reserve(32U);
+  pending_record_storage.firmware_version.reserve(32U);
   IntervalRecord *pending_record = nullptr;
   std::uint64_t pending_gap_count = 0;
   std::uint64_t pending_gap_first_utc_ms = 0;
@@ -578,7 +618,6 @@ void StorageCoordinator::taskLoop() {
             static_cast<double>(pending_record->avg_active_power_w),
             pending_record->interval_energy_wh,
             pending_record->time_trusted ? "true" : "false");
-        delete pending_record;
         pending_record = nullptr;
         next_record_retry_ms = 0;
       } else {
@@ -612,13 +651,29 @@ void StorageCoordinator::taskLoop() {
     }
     switch (message.type) {
     case Type::Record:
-      pending_record = static_cast<IntervalRecord *>(message.payload);
+      if (FixedIntervalRecord *const record =
+              record_pool_.get(message.pool_slot)) {
+        record->materialize(pending_record_storage);
+        record_pool_.release(message.pool_slot);
+        pending_record = &pending_record_storage;
+      } else {
+        PM_LOG_ERROR("QUEUE", "STORAGE_POOL_SLOT_INVALID",
+                     "error=PM-QUEUE-004 type=record slot=%u",
+                     static_cast<unsigned>(message.pool_slot));
+      }
       break;
     case Type::Event: {
-      auto *event = static_cast<EventData *>(message.payload);
-      storage_.appendEvent(event->code, event->severity, event->detail,
-                           event->utc_ms, event->boot_id);
-      delete event;
+      FixedEventData *const event = event_pool_.get(message.pool_slot);
+      if (event != nullptr) {
+        storage_.appendEvent(event->code.data(), event->severity.data(),
+                             event->detail.data(), event->utc_ms,
+                             event->boot_id.data());
+        event_pool_.release(message.pool_slot);
+      } else {
+        PM_LOG_ERROR("QUEUE", "STORAGE_POOL_SLOT_INVALID",
+                     "error=PM-QUEUE-004 type=event slot=%u",
+                     static_cast<unsigned>(message.pool_slot));
+      }
       break;
     }
     case Type::History:
@@ -664,6 +719,10 @@ std::uint32_t StorageCoordinator::depth() const {
 
 std::uint64_t StorageCoordinator::dropped() const {
   return dropped_.load(std::memory_order_relaxed);
+}
+
+StorageCoordinator::PoolMetrics StorageCoordinator::poolMetrics() const {
+  return {record_pool_.metrics(), event_pool_.metrics()};
 }
 
 } // namespace pm

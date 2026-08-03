@@ -140,8 +140,11 @@ void recordSyncTaskCheckpoint(SyncMetrics &metrics, Diagnostics &diagnostics,
 class TransportCleanup final {
 public:
   TransportCleanup(HTTPClient &http, WiFiClientSecure &client,
-                   const std::uint32_t request_id)
-      : http_(http), client_(client), request_id_(request_id) {}
+                   Diagnostics &diagnostics,
+                   const std::uint32_t request_id,
+                   const StringView endpoint)
+      : http_(http), client_(client), diagnostics_(diagnostics),
+        request_id_(request_id), endpoint_(endpoint) {}
 
   void markHttpBegun() { http_begun_ = true; }
 
@@ -153,6 +156,9 @@ public:
     } else {
       client_.stop();
     }
+    diagnostics_.recordTlsLifecycleCheckpoint(
+        request_id_, endpoint_.data(), endpoint_.size(),
+        TlsLifecycleStage::AfterHttpEnd);
     PM_LOG_DEBUG("SYNC", "SYNC_CLEANUP_COMPLETE",
                  "request_id=%lu http_ended=%s tls_stopped=true",
                  static_cast<unsigned long>(request_id_),
@@ -162,7 +168,9 @@ public:
 private:
   HTTPClient &http_;
   WiFiClientSecure &client_;
+  Diagnostics &diagnostics_;
   std::uint32_t request_id_;
+  StringView endpoint_;
   bool http_begun_{false};
 };
 
@@ -293,18 +301,31 @@ private:
 class HighMemoryLease final {
 public:
   explicit HighMemoryLease(Diagnostics &diagnostics,
+                           const std::uint32_t request_id,
+                           const StringView endpoint,
                            const TickType_t timeout = pdMS_TO_TICKS(5000))
       : diagnostics_(diagnostics),
+        request_id_(request_id), endpoint_(endpoint),
         acquired_(diagnostics_.acquireHighMemoryOperation(
             MemoryOperationContext::TlsPreparing, timeout)) {}
 
   ~HighMemoryLease() {
     if (acquired_) {
+      if (client_constructed_) {
+        diagnostics_.recordTlsLifecycleCheckpoint(
+            request_id_, endpoint_.data(), endpoint_.size(),
+            TlsLifecycleStage::AfterClientDestruction);
+      }
       diagnostics_.releaseHighMemoryOperation();
+      diagnostics_.recordTlsLifecycleCheckpoint(
+          request_id_, endpoint_.data(), endpoint_.size(),
+          TlsLifecycleStage::AfterHighMemoryLeaseRelease);
     }
   }
 
   explicit operator bool() const { return acquired_; }
+
+  void markClientConstructed() { client_constructed_ = true; }
 
   bool transitionToTlsActive() {
     if (!acquired_) {
@@ -321,8 +342,11 @@ public:
 
 private:
   Diagnostics &diagnostics_;
+  std::uint32_t request_id_{0U};
+  StringView endpoint_{};
   bool acquired_{false};
   bool tls_active_{false};
+  bool client_constructed_{false};
 };
 
 bool readBoundedResponseBody(HTTPClient &http, ClockService &clock,
@@ -2505,7 +2529,8 @@ ServerSync::HttpResult ServerSync::request(const char *method,
       endpoint == "/api/v1/device-heartbeats"
           ? pdMS_TO_TICKS(kHeartbeatStorageWaitMs)
           : pdMS_TO_TICKS(5000);
-  HighMemoryLease high_memory_lease(diagnostics_, high_memory_wait);
+  HighMemoryLease high_memory_lease(diagnostics_, request_id, endpoint,
+                                    high_memory_wait);
   if (!high_memory_lease) {
     result.error = "high_memory_operation_busy";
     result.tls_category = "LOCAL_RESOURCE_DEFERRED";
@@ -2772,7 +2797,11 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   // The lease was declared before these transport objects, so reverse-order
   // destruction runs TransportCleanup, HTTPClient, and ResolvedTlsClient
   // before release records the post-TLS grace timestamp.
+  diagnostics_.recordTlsLifecycleCheckpoint(
+      request_id, endpoint.data(), endpoint.size(),
+      TlsLifecycleStage::BeforeClientConstruction);
   ResolvedTlsClient client;
+  high_memory_lease.markClientConstructed();
   if (fragmentation_deferred_) {
     ++metrics_.fragmentation_recoveries;
     fragmentation_deferred_ = false;
@@ -2783,8 +2812,12 @@ ServerSync::HttpResult ServerSync::request(const char *method,
   client.setHandshakeTimeout(kTlsHandshakeTimeoutSeconds);
   client.setTimeout(kTcpConnectTimeoutMs / 1000U);
   client.setCACert(active_config.server_ca_pem.c_str());
+  diagnostics_.recordTlsLifecycleCheckpoint(
+      request_id, endpoint.data(), endpoint.size(),
+      TlsLifecycleStage::AfterTlsConfiguration);
   HTTPClient http;
-  TransportCleanup transport(http, client, request_id);
+  TransportCleanup transport(http, client, diagnostics_, request_id,
+                             endpoint);
   http.setConnectTimeout(kTcpConnectTimeoutMs);
   http.setTimeout(kHttpResponseTimeoutMs);
   http.setReuse(false);
@@ -2799,6 +2832,9 @@ ServerSync::HttpResult ServerSync::request(const char *method,
     return result;
   }
   transport.markHttpBegun();
+  diagnostics_.recordTlsLifecycleCheckpoint(
+      request_id, endpoint.data(), endpoint.size(),
+      TlsLifecycleStage::AfterHttpBegin);
   static constexpr char retry_after_header[] = "Retry-After";
   const char *response_headers[] = {retry_after_header};
   http.collectHeaders(response_headers, 1U);
@@ -2909,6 +2945,9 @@ ServerSync::HttpResult ServerSync::request(const char *method,
         method,
         reinterpret_cast<std::uint8_t *>(const_cast<char *>(body)), body_size);
   }
+  diagnostics_.recordTlsLifecycleCheckpoint(
+      request_id, endpoint.data(), endpoint.size(),
+      TlsLifecycleStage::AfterRequest);
   if (result.status > 0) {
     endpoint_address_cache_.recordTransportSuccess();
     PM_LOG_INFO(

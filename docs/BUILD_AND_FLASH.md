@@ -55,10 +55,10 @@ If upload cannot connect, hold BOOT, tap RESET/EN, then release BOOT after the R
 ## Release verification
 
 Build the next unused semantic version first, then generate the reproducible
-existing-trust bundle. For firmware 1.0.11:
+existing-trust bundle. For firmware 1.0.12:
 
 ```sh
-python tools/generate_release.py --skip-build --version 1.0.11 --channel stable
+python tools/generate_release.py --skip-build --version 1.0.12 --channel stable
 ```
 
 The command fails if build provenance is missing or stale, required images
@@ -71,7 +71,7 @@ review `firmware-metadata.json`, `flash-layout.json`,
 For the ordinary central-server path, upload only:
 
 ```text
-release/1.0.11/firmware.bin
+release/1.0.12/firmware.bin
 ```
 
 The server independently streams and parses the application, calculates its

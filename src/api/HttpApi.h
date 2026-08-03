@@ -9,6 +9,7 @@
 
 #include "api/BoundedCookie.h"
 #include "api/CompactUiStatus.h"
+#include "api/LocalHealthStatus.h"
 #include "api/StatusResponsePool.h"
 #include "app/Maintenance.h"
 #include "config/ConfigService.h"
@@ -28,6 +29,13 @@ inline constexpr std::size_t kUiStatusResponseSlots = 2U;
 inline constexpr std::size_t kUiStatusResponseCapacity = 2048U;
 using UiStatusResponsePool =
     StatusResponsePool<kUiStatusResponseSlots, kUiStatusResponseCapacity>;
+// The unauthenticated liveness probe is intentionally single-flight. Keeping
+// one fixed body slot avoids reserving another 8 KiB of scarce internal DRAM;
+// overlapping probes receive a bounded 503 and retry.
+inline constexpr std::size_t kLocalHealthResponseSlots = 1U;
+inline constexpr std::size_t kLocalHealthResponseCapacity = 3072U;
+using LocalHealthResponsePool = StatusResponsePool<
+    kLocalHealthResponseSlots, kLocalHealthResponseCapacity>;
 
 class HttpApi {
 public:
@@ -161,6 +169,7 @@ private:
   TaskHandle_t password_job_task_{nullptr};
   std::array<PasswordJobResult, kPasswordResultCapacity> password_results_{};
   UiStatusResponsePool status_response_pool_{};
+  LocalHealthResponsePool local_health_response_pool_{};
   EspHeapTelemetry heap_telemetry_{};
   AsyncWebServer server_{80};
   RequestAuthenticator authenticator_;
