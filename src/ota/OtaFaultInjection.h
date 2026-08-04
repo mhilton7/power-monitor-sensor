@@ -18,6 +18,16 @@ enum class Point : std::int8_t {
   BeforeUpdateEnd = 5,
   AfterUpdateEnd = 6,
   BeforeReboot = 7,
+  BeforeRecoveryPersist = 8,
+  AfterRecoveryPersist = 9,
+  BeforeRecoveryReadback = 10,
+  RecoveryReadbackMismatch = 11,
+  AfterBootPartitionSelect = 12,
+  BeforePostBootValidation = 13,
+  BeforeMarkValid = 14,
+  MarkValidFailure = 15,
+  BeforeRollbackMark = 16,
+  RollbackMarkFailure = 17,
 };
 
 constexpr std::int8_t kConfiguredPoint = PM_OTA_FAULT_STAGE;
@@ -41,6 +51,23 @@ inline constexpr const char *failureCode(const Point point) {
   case Point::BeforeUpdateEnd: return "ota_fault_before_update_end";
   case Point::AfterUpdateEnd: return "ota_fault_after_update_end";
   case Point::BeforeReboot: return "ota_fault_before_reboot";
+  case Point::BeforeRecoveryPersist:
+    return "ota_fault_before_recovery_persist";
+  case Point::AfterRecoveryPersist:
+    return "ota_fault_after_recovery_persist";
+  case Point::BeforeRecoveryReadback:
+    return "ota_fault_before_recovery_readback";
+  case Point::RecoveryReadbackMismatch:
+    return "ota_fault_recovery_readback_mismatch";
+  case Point::AfterBootPartitionSelect:
+    return "ota_fault_after_boot_partition_select";
+  case Point::BeforePostBootValidation:
+    return "ota_fault_before_post_boot_validation";
+  case Point::BeforeMarkValid: return "ota_fault_before_mark_valid";
+  case Point::MarkValidFailure: return "ota_fault_mark_valid_failure";
+  case Point::BeforeRollbackMark: return "ota_fault_before_rollback_mark";
+  case Point::RollbackMarkFailure:
+    return "ota_fault_rollback_mark_failure";
   }
   return "ota_fault_unknown";
 }

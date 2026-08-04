@@ -33,13 +33,19 @@ enum class Stage : std::uint8_t {
   HttpTransportDestroyed,
   UpdateEndBeginning,
   UpdateEndCompleted,
+  BootPartitionVerification,
   BootPartitionSelected,
   RecoveryRecordPersisted,
+  RecoveryReadbackVerified,
+  BootPartitionRestored,
   PartitionWritten,
   RebootMilestoneReported,
   RebootScheduled,
   PostBootImageDetected,
+  PostBootValidationRetryable,
   PostBootValidated,
+  RollbackMarkRequested,
+  RollbackMarkFailed,
   RollbackDetected,
   FailurePersisted,
   Failed,
@@ -58,6 +64,7 @@ struct Snapshot {
   std::uint32_t boot_count{0U};
   std::uint32_t reset_reason_code{0U};
   std::uint32_t attempt{0U};
+  std::uint64_t evidence_sequence{0U};
   bool update_open{false};
   bool reboot_expected{false};
   std::array<char, 65U> boot_id{};
@@ -77,7 +84,10 @@ struct Snapshot {
 void beginBoot(const char *boot_id, const char *firmware_version,
                const char *build_hash, std::uint32_t boot_count,
                std::uint32_t reset_reason_code);
-void bindDeployment(const char *deployment_id, std::uint32_t attempt);
+void bindDeployment(const char *deployment_id, std::uint32_t attempt,
+                    std::uint64_t evidence_sequence = 0U);
+void setEvidenceSequence(std::uint64_t evidence_sequence);
+std::uint64_t currentEvidenceSequence();
 void record(Stage stage, std::uint32_t bytes_received = 0U,
             std::uint32_t image_size = 0U, bool update_open = false,
             bool reboot_expected = false,

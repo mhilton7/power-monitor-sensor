@@ -571,6 +571,12 @@ std::string Diagnostics::healthJson(const ConfigService &config,
   storage_json["present"] = storage.present;
   storage_json["mounted"] = storage.mounted;
   storage_json["writable"] = storage.writable;
+  storage_json["index_healthy"] = storage.index_healthy;
+  storage_json["reading_index_healthy"] = storage.index_healthy;
+  storage_json["event_log_healthy"] = storage.event_log_healthy;
+  storage_json["event_log_integrity_status"] =
+      storage.event_log_integrity_status;
+  storage_json["last_error"] = storage.last_error;
   storage_json["sequence_floor_ready"] = storage.sequence_floor_ready;
   storage_json["sequence_reconciliation_in_progress"] =
       storage.sequence_reconciliation_in_progress;

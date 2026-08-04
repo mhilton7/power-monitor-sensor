@@ -1,54 +1,188 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://powermonitor.local/schemas/pm-protocol/1.0.0/heartbeat.schema.json",
-  "title": "Power Monitor heartbeat",
+  "$id": "https://power-monitor.local/schemas/pm-protocol/1.0.0/heartbeat.schema.json",
+  "title": "Power Monitor device heartbeat",
   "type": "object",
   "additionalProperties": true,
   "required": [
-    "schema_version", "protocol", "device_id", "boot_id",
-    "firmware_version", "build_hash", "uptime_seconds", "wifi", "time",
-    "meter", "storage", "sync", "resources"
+    "protocol_version",
+    "schema_version",
+    "device_id",
+    "boot_id",
+    "firmware_version",
+    "firmware_build_hash",
+    "uptime_seconds",
+    "reboot_reason",
+    "connection_mode",
+    "pzem",
+    "sd",
+    "oldest_stored_sequence",
+    "newest_stored_sequence",
+    "server_ack_sequence",
+    "backlog_estimate",
+    "configuration_version",
+    "time",
+    "resources",
+    "queue"
   ],
   "properties": {
-    "schema_version": {"const": 1},
-    "protocol": {"const": "pm-protocol/1.0.0"},
+    "protocol_version": {"const": "pm-protocol/1.0.0"},
+    "schema_version": {"const": "heartbeat/1.0.0"},
     "device_id": {"type": "string", "format": "uuid"},
     "boot_id": {"type": "string", "format": "uuid"},
     "firmware_version": {"type": "string"},
-    "build_hash": {"type": "string"},
+    "firmware_build_hash": {"type": "string"},
+    "ota": {"$ref": "#/$defs/ota_capability"},
     "uptime_seconds": {"type": "integer", "minimum": 0},
     "reboot_reason": {"type": "string"},
-    "wifi": {
-      "type": "object",
-      "required": ["connected", "ip_address", "hostname", "rssi_dbm"],
-      "properties": {
-        "connected": {"type": "boolean"},
-        "ip_address": {"type": "string"},
-        "hostname": {"type": "string"},
-        "rssi_dbm": {"type": "integer"}
-      }
+    "current_ip": {"type": ["string", "null"]},
+    "hostname": {"type": ["string", "null"]},
+    "rssi_dbm": {"type": ["integer", "null"], "minimum": -127, "maximum": 0},
+    "connection_mode": {
+      "enum": ["pull", "push", "hybrid"],
+      "description": "v1 preserves all values; current sensor firmware emits push and fails closed for pull or hybrid configuration."
     },
-    "time": {
-      "type": "object",
-      "required": ["synchronized", "utc"],
-      "properties": {
-        "synchronized": {"type": "boolean"},
-        "utc": {"type": "string", "format": "date-time"}
-      }
+    "latest": {
+      "oneOf": [
+        {"$ref": "#/$defs/live_measurement"},
+        {"type": "null"}
+      ]
     },
-    "meter": {"type": "object", "required": ["connected", "consecutive_errors"]},
-    "storage": {
-      "type": "object",
-      "required": ["present", "mounted", "writable", "oldest_sequence", "newest_sequence"]
+    "pzem": {"$ref": "#/$defs/subsystem_health"},
+    "sd": {"$ref": "#/$defs/storage_health"},
+    "oldest_stored_sequence": {"type": "integer", "minimum": 0},
+    "oldest_syncable_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Oldest retained durable interval with trustworthy UTC bounds that can be synchronized."
     },
-    "sync": {
-      "type": "object",
-      "required": ["server_ack_sequence", "backlog_estimate", "mode"]
-    },
+    "newest_syncable_sequence": {"type": "integer", "minimum": 0},
+    "newest_stored_sequence": {"type": "integer", "minimum": 0},
+    "server_ack_sequence": {"type": "integer", "minimum": 0},
+    "server_maximum_seen_sequence": {"type": "integer", "minimum": 0},
+    "backlog_estimate": {"type": "integer", "minimum": 0},
+    "configuration_version": {"type": "integer", "minimum": 0},
+    "time": {"$ref": "#/$defs/time_health"},
     "resources": {
       "type": "object",
-      "required": ["free_heap_bytes", "minimum_free_heap_bytes", "queue_depths"]
+      "description": "Runtime resource evidence. ota_recovery.evidence_sequence is an optional unsigned, per-deployment-attempt monotonic OTA evidence counter emitted by current firmware.",
+      "properties": {
+        "ota_recovery": {"$ref": "#/$defs/ota_recovery"}
+      },
+      "additionalProperties": true
+    },
+    "queue": {"type": "object"}
+  },
+  "$defs": {
+    "ota_capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported",
+        "protocol_version",
+        "authentication_mode",
+        "rollback_supported",
+        "partition_size_bytes"
+      ],
+      "properties": {
+        "supported": {"const": true},
+        "protocol_version": {"const": 2},
+        "authentication_mode": {"const": "existing_device_hmac"},
+        "rollback_supported": {"type": "boolean"},
+        "partition_size_bytes": {"type": "integer", "minimum": 1, "maximum": 6291456}
+      }
+    },
+    "subsystem_health": {
+      "type": "object",
+      "required": ["ok", "status"],
+      "properties": {
+        "ok": {"type": "boolean"},
+        "status": {"type": "string"},
+        "error_count": {"type": "integer", "minimum": 0},
+        "details": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "ota_recovery": {
+      "type": "object",
+      "properties": {
+        "deployment_id": {"type": "string", "format": "uuid"},
+        "attempt": {"type": "integer", "minimum": 1},
+        "evidence_sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Latest durably persisted OTA evidence sequence for the active deployment attempt."
+        }
+      },
+      "dependentRequired": {
+        "evidence_sequence": ["deployment_id", "attempt"],
+        "deployment_id": ["attempt", "evidence_sequence"],
+        "attempt": ["deployment_id", "evidence_sequence"]
+      },
+      "additionalProperties": true
+    },
+    "storage_health": {
+      "type": "object",
+      "required": ["ok", "status"],
+      "properties": {
+        "ok": {"type": "boolean"},
+        "status": {"type": "string"},
+        "error_count": {"type": "integer", "minimum": 0},
+        "details": {"$ref": "#/$defs/storage_health_details"}
+      },
+      "additionalProperties": true
+    },
+    "storage_health_details": {
+      "type": "object",
+      "properties": {
+        "history_integrity_verified": {"type": ["boolean", "null"]},
+        "reading_index_integrity_verified": {"type": ["boolean", "null"]},
+        "event_log_integrity_verified": {"type": ["boolean", "null"]},
+        "event_log_integrity_status": {
+          "type": ["string", "null"],
+          "enum": [
+            "verified",
+            "not_scanned",
+            "unavailable",
+            "event_record_corruption_detected",
+            "event_log_open_failed",
+            null
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "time_health": {
+      "type": "object",
+      "required": ["trusted", "source"],
+      "properties": {
+        "trusted": {"type": "boolean"},
+        "source": {"type": "string"},
+        "offset_ms": {"type": ["integer", "null"]},
+        "last_sync_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "live_measurement": {
+      "type": "object",
+      "required": [
+        "measured_at",
+        "voltage_v",
+        "current_a",
+        "power_w",
+        "power_factor",
+        "frequency_hz",
+        "energy_wh"
+      ],
+      "properties": {
+        "measured_at": {"type": "string", "format": "date-time"},
+        "voltage_v": {"type": "number", "minimum": 0, "maximum": 400},
+        "current_a": {"type": "number", "minimum": 0, "maximum": 5000},
+        "power_w": {"type": "number", "minimum": 0},
+        "power_factor": {"type": "number", "minimum": 0, "maximum": 1},
+        "frequency_hz": {"type": "number", "minimum": 40, "maximum": 70},
+        "energy_wh": {"type": "number", "minimum": 0}
+      }
     }
   }
 }
-

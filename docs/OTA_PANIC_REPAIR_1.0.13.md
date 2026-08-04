@@ -31,6 +31,13 @@ The ledger records workflow lock, per-transaction lease, manifest response/parse
 
 Failure state is persisted before a fresh bounded report transaction. Every open Update handle is aborted on stream failure, every SHA context is freed, exact Content-Length is required, partial writes fail, extra bytes fail, the complete image hash and protocol marker are verified, and the boot target is not selected until finalization succeeds.
 
+The later Phase 4 hardening closes the remaining boot-selection and recovery
+ambiguities: recovery writes are atomically read back and compared field by
+field, the selected partition is verified against the manifest and intended
+inactive slot, failures restore the running slot without a blind restart, and
+post-boot validation uses typed local/external health. See
+`OTA_PHASE4_FAIL_CLOSED.md` for the current controlling behavior.
+
 ## Validation status
 
 Starting sensor commit: `5c98b6939764de74ff70f17ba119593ae781b610`.

@@ -5,6 +5,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -26,6 +27,7 @@ from firmware_image import FirmwareMetadata  # noqa: E402
 from generate_release import (  # noqa: E402
     create_staging_directory,
     existing_trust_metadata,
+    release_generated_utc,
 )
 from release_integrity import (  # noqa: E402
     FLASH_IMAGE_OFFSETS,
@@ -45,6 +47,10 @@ from sign_firmware import canonical  # noqa: E402
 
 
 class StorageAndOtaTests(unittest.TestCase):
+    def test_release_generation_timestamp_honors_source_date_epoch(self) -> None:
+        with patch.dict("os.environ", {"SOURCE_DATE_EPOCH": "1785824225"}):
+            self.assertEqual(release_generated_utc(), "2026-08-04T06:17:05+00:00")
+
     def test_release_source_fingerprint_ignores_web_dependency_outputs(self) -> None:
         root = case_directory("release-fingerprint-generated-outputs")
         try:

@@ -1,6 +1,90 @@
 {
-  "schema_version": 1,
-  "protocol": "pm-protocol/9.9.9",
-  "device_id": "6db47e3d-b16c-4746-8f21-64310f9e9252"
+  "protocol_version": "pm-protocol/9.9.9",
+  "schema_version": "heartbeat/1.0.0",
+  "device_id": "6db47e3d-b16c-4746-8f21-64310f9e9252",
+  "boot_id": "44f16f01-46c9-4ea4-9bf7-f194269dd048",
+  "firmware_version": "1.0.16",
+  "firmware_build_hash": "abababababababababababababababababababababababababababababababab",
+  "ota": {
+    "supported": true,
+    "protocol_version": 2,
+    "authentication_mode": "existing_device_hmac",
+    "rollback_supported": true,
+    "partition_size_bytes": 6291456
+  },
+  "uptime_seconds": 483921,
+  "reboot_reason": "power_on",
+  "current_ip": "192.168.1.41",
+  "hostname": "power-monitor-a1b2c3.local",
+  "rssi_dbm": -57,
+  "connection_mode": "push",
+  "latest": {
+    "measured_at": "2026-07-20T18:42:15Z",
+    "voltage_v": 120.4,
+    "current_a": 0.01,
+    "power_w": 1.0,
+    "power_factor": 0.83,
+    "frequency_hz": 60.0,
+    "energy_wh": 42183.2
+  },
+  "pzem": {
+    "ok": true,
+    "status": "healthy",
+    "error_count": 0,
+    "details": {"last_error": "none"}
+  },
+  "sd": {
+    "ok": true,
+    "status": "normal",
+    "error_count": 0,
+    "details": {
+      "present": true,
+      "mounted": true,
+      "writable": true,
+      "reading_index_integrity_verified": true,
+      "event_log_integrity_verified": true,
+      "sequence_floor_ready": true,
+      "oldest_record_sequence": 1,
+      "newest_record_sequence": 583913
+    }
+  },
+  "oldest_stored_sequence": 1,
+  "oldest_syncable_sequence": 1,
+  "newest_syncable_sequence": 583913,
+  "newest_stored_sequence": 583913,
+  "server_ack_sequence": 583900,
+  "server_maximum_seen_sequence": 583900,
+  "backlog_estimate": 13,
+  "configuration_version": 7,
+  "time": {
+    "trusted": true,
+    "source": "sntp",
+    "offset_ms": 0,
+    "last_sync_at": "2026-07-20T18:42:10Z"
+  },
+  "resources": {
+    "free_heap_bytes": 64984,
+    "minimum_free_heap_bytes": 54260,
+    "ota_recovery": {
+      "deployment_id": "123e4567-e89b-12d3-a456-426614174001",
+      "attempt": 1,
+      "evidence_sequence": 9,
+      "stage": "validated",
+      "bytes_received": 1456789,
+      "image_size": 1456789
+    },
+    "synchronization": {
+      "last_heartbeat_result": "ok",
+      "last_local_deferral_reason": "",
+      "consecutive_local_deferrals": 0,
+      "heartbeat_buffer_reuses": 200,
+      "response_buffer_reuses": 200
+    }
+  },
+  "queue": {
+    "storage": 0,
+    "actions": 0,
+    "storage_dropped": 0,
+    "actions_dropped": 0
+  }
 }
-

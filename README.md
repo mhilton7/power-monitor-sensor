@@ -30,7 +30,7 @@ See [docs/BUILD_AND_FLASH.md](docs/BUILD_AND_FLASH.md),
 [docs/OTA.md](docs/OTA.md), [docs/FIRST_RUN.md](docs/FIRST_RUN.md),
 [docs/SERVER_CA_CERTIFICATE.md](docs/SERVER_CA_CERTIFICATE.md),
 [docs/SEQUENCE_RECONCILIATION.md](docs/SEQUENCE_RECONCILIATION.md), and
-[docs/API.md](docs/API.md). The source is firmware `1.0.12` and protocol
+[docs/API.md](docs/API.md). The source is firmware `1.0.16` and protocol
 `pm-protocol/1.0.0`. Ordinary server-managed OTA needs only the verified
 `firmware.bin`: it reuses the configured HTTPS CA/hostname trust and derives a
 device-specific manifest HMAC key from the existing enrollment secret. It does

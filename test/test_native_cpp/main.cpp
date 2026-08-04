@@ -1,6 +1,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -8,6 +9,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "RandomizedReliability.h"
 #include "api/BoundedCookie.h"
 #include "api/BoundedJsonWriter.h"
 #include "api/CompactUiStatus.h"
@@ -29,14 +31,14 @@
 #include "network/ReadingWireFormat.h"
 #include "network/ServerSyncPolicy.h"
 #include "network/ServerSyncScratch.h"
-#include "ota/OtaManifestV2.h"
 #include "ota/OtaFaultInjection.h"
+#include "ota/OtaManifestV2.h"
 #include "ota/OtaUpdatePolicy.h"
 #include "security/AuthPolicy.h"
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
-#include "storage/RecordFormat.h"
 #include "storage/BoundedStorageMessagePool.h"
+#include "storage/RecordFormat.h"
 #include "storage/StoragePolicy.h"
 #include "storage/SyncCoverage.h"
 
@@ -123,24 +125,25 @@ void testEnergyAndRecord() {
   using pm::sync_policy::AcknowledgementDisposition;
   check(pm::sync_policy::classifyAcknowledgement(5, 5, 8) ==
             AcknowledgementDisposition::AdvanceSequenceFloor,
-        "authenticated server cursor can safely advance a regressed sequence floor");
+        "authenticated server cursor can safely advance a regressed sequence "
+        "floor");
   check(pm::sync_policy::classifyAcknowledgement(2207, 92, 2207) ==
             AcknowledgementDisposition::AdvanceSequenceFloor,
-        "persisted acknowledgement ahead of reset storage still advances the sequence floor");
+        "persisted acknowledgement ahead of reset storage still advances the "
+        "sequence floor");
   check(pm::sync_policy::classifyAcknowledgement(5, 8, 5) ==
             AcknowledgementDisposition::Current,
-        "matching acknowledgement remains current when retained history is not behind it");
+        "matching acknowledgement remains current when retained history is not "
+        "behind it");
   check(pm::sync_policy::classifyAcknowledgement(5, 8, 7) ==
             AcknowledgementDisposition::Advance,
         "acknowledgement advances within retained history");
   check(pm::sync_policy::classifyAcknowledgement(5, 8, 4) ==
             AcknowledgementDisposition::Invalid,
         "acknowledgement cannot regress");
-  check(pm::sync_policy::requiredSequenceFloor(0, 0, 785, 790, 790) ==
-            790,
+  check(pm::sync_policy::requiredSequenceFloor(0, 0, 785, 790, 790) == 790,
         "blank replacement card resumes above the server maximum-seen cursor");
-  check(pm::sync_policy::requiredSequenceFloor(812, 810, 785, 790, 790) ==
-            812,
+  check(pm::sync_policy::requiredSequenceFloor(812, 810, 785, 790, 790) == 812,
         "retained local records cannot be replaced by an older remote cursor");
   check(pm::sync_policy::sequenceCursorContractValid(785, 785, 790, 791),
         "server cursor accepts a maximum-seen value beyond contiguous ack");
@@ -263,8 +266,7 @@ void testReadingWireFormat() {
   check(meter_gap, "null wire measurements carry a meter-gap quality flag");
 
   JsonDocument oversized_output;
-  JsonArray oversized_readings =
-      oversized_output["readings"].to<JsonArray>();
+  JsonArray oversized_readings = oversized_output["readings"].to<JsonArray>();
   const std::string oversized_record(
       pm::reading_wire::kMaximumEncodedRecordBytes + 1U, ' ');
   check(!pm::reading_wire::append(oversized_readings, oversized_record) &&
@@ -475,13 +477,13 @@ void testServerSyncPolicy() {
   check(pm::sync_policy::tlsMemoryReserveAvailable(
             pm::sync_policy::kMinimumInternalHeapBytes,
             pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
-              pm::sync_policy::tlsMemoryReserveAvailable(92'696U, 39'924U) &&
-              pm::sync_policy::tlsMemoryReserveAvailable(88'424U, 33'780U) &&
-              pm::sync_policy::tlsMemoryReserveAvailable(81'508U, 52'212U) &&
-              pm::sync_policy::tlsMemoryReserveAvailable(72'348U, 58'356U) &&
-              !pm::sync_policy::tlsMemoryReserveAvailable(
-                 pm::sync_policy::kMinimumInternalHeapBytes - 1U,
-                 pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
+            pm::sync_policy::tlsMemoryReserveAvailable(92'696U, 39'924U) &&
+            pm::sync_policy::tlsMemoryReserveAvailable(88'424U, 33'780U) &&
+            pm::sync_policy::tlsMemoryReserveAvailable(81'508U, 52'212U) &&
+            pm::sync_policy::tlsMemoryReserveAvailable(72'348U, 58'356U) &&
+            !pm::sync_policy::tlsMemoryReserveAvailable(
+                pm::sync_policy::kMinimumInternalHeapBytes - 1U,
+                pm::sync_policy::kMinimumLargestInternalBlockBytes) &&
             !pm::sync_policy::tlsMemoryReserveAvailable(
                 pm::sync_policy::kMinimumInternalHeapBytes,
                 pm::sync_policy::kMinimumLargestInternalBlockBytes - 1U),
@@ -497,20 +499,19 @@ void testServerSyncPolicy() {
         "HTTP response allocation is bounded and rejects chunked JSON");
   check(pm::sync_policy::responseBodyFitsBuffer(-1, 24U * 1024U) &&
             pm::sync_policy::responseBodyFitsBuffer(0, 24U * 1024U) &&
-            pm::sync_policy::responseBodyFitsBuffer(24U * 1024U,
-                                                    24U * 1024U) &&
+            pm::sync_policy::responseBodyFitsBuffer(24U * 1024U, 24U * 1024U) &&
             !pm::sync_policy::responseBodyFitsBuffer(24U * 1024U + 1U,
                                                      24U * 1024U),
         "204 responses without Content-Length never cast the negative "
         "sentinel to an unsigned buffer size");
-  check(pm::sync_policy::maximumResponseBytes(
-            "/api/v1/device-heartbeats") == 8U * 1024U &&
+  check(pm::sync_policy::maximumResponseBytes("/api/v1/device-heartbeats") ==
+                8U * 1024U &&
             pm::sync_policy::maximumResponseBytes(
                 "/api/v1/device-readings/batch") == 12U * 1024U &&
             pm::sync_policy::maximumRequestBytes(
                 "/api/v1/device-events/batch") == 20U * 1024U &&
-            !pm::sync_policy::responseLengthAllowed(
-                "/api/v1/device-heartbeats", 8193, 200),
+            !pm::sync_policy::responseLengthAllowed("/api/v1/device-heartbeats",
+                                                    8193, 200),
         "central endpoints enforce measured request and response caps");
   check(pm::sync_policy::responseAllocationAvailable(
             pm::sync_policy::kMinimumPostResponseInternalHeapBytes + 4096U,
@@ -535,19 +536,19 @@ void testServerSyncPolicy() {
             pm::sync_policy::classifyHttpStatus(-1) ==
                 HttpDisposition::TransportFailure,
         "server sync retry policy classifies HTTP and transport outcomes");
-  check(pm::sync_policy::shouldReleaseReadingBackoff(
-            true, 10U, 11U, false, 0U) &&
-            !pm::sync_policy::shouldReleaseReadingBackoff(
-                true, 10U, 11U, true, 10U) &&
-            pm::sync_policy::shouldReleaseReadingBackoff(
-                true, 11U, 12U, true, 10U) &&
-            !pm::sync_policy::shouldReleaseReadingBackoff(
-                false, 10U, 11U, false, 0U) &&
-            !pm::sync_policy::shouldReleaseReadingBackoff(
-                true, 11U, 11U, false, 0U) &&
-            !pm::sync_policy::shouldReleaseReadingBackoff(
-                true, 12U, 11U, false, 0U),
-        "server synchronize-now releases reading backoff once per cursor");
+  check(
+      pm::sync_policy::shouldReleaseReadingBackoff(true, 10U, 11U, false, 0U) &&
+          !pm::sync_policy::shouldReleaseReadingBackoff(true, 10U, 11U, true,
+                                                        10U) &&
+          pm::sync_policy::shouldReleaseReadingBackoff(true, 11U, 12U, true,
+                                                       10U) &&
+          !pm::sync_policy::shouldReleaseReadingBackoff(false, 10U, 11U, false,
+                                                        0U) &&
+          !pm::sync_policy::shouldReleaseReadingBackoff(true, 11U, 11U, false,
+                                                        0U) &&
+          !pm::sync_policy::shouldReleaseReadingBackoff(true, 12U, 11U, false,
+                                                        0U),
+      "server synchronize-now releases reading backoff once per cursor");
   check(!pm::sync_policy::secondaryOperationsAllowed(true) &&
             pm::sync_policy::secondaryOperationsAllowed(false),
         "durable reading backlog blocks secondary TLS operations");
@@ -558,8 +559,8 @@ void testServerSyncPolicy() {
         "consumed");
   check(pm::sync_policy::manifestPollDeadline(true, 3'600'000U, 15'000U) ==
                 15'000U &&
-            pm::sync_policy::manifestPollDeadline(false, 3'600'000U,
-                                                  15'000U) == 3'600'000U &&
+            pm::sync_policy::manifestPollDeadline(false, 3'600'000U, 15'000U) ==
+                3'600'000U &&
             pm::sync_policy::manifestPollDeadline(true, 10'000U, 15'000U) ==
                 10'000U,
         "heartbeat release availability advances only a future manifest "
@@ -567,10 +568,10 @@ void testServerSyncPolicy() {
 
   pm::sync_policy::EndpointAddressCache address_cache;
   std::uint32_t cached_address = 99U;
-  check(!address_cache.lookup("power-monitor.home.arpa", 8443U,
-                              cached_address) &&
-            cached_address == 0U,
-        "server endpoint cache begins empty");
+  check(
+      !address_cache.lookup("power-monitor.home.arpa", 8443U, cached_address) &&
+          cached_address == 0U,
+      "server endpoint cache begins empty");
   address_cache.update("power-monitor.home.arpa", 8443U, 0xAF00A8C0U);
   check(address_cache.configured() &&
             address_cache.lookup("power-monitor.home.arpa", 8443U,
@@ -579,8 +580,7 @@ void testServerSyncPolicy() {
             !address_cache.lookup("power-monitor.home.arpa", 443U,
                                   cached_address),
         "server endpoint cache is scoped to host and port");
-  check(!address_cache.recordTransportFailure() &&
-            address_cache.configured() &&
+  check(!address_cache.recordTransportFailure() && address_cache.configured() &&
             address_cache.recordTransportFailure() &&
             !address_cache.configured(),
         "two consecutive cached-address failures force fresh DNS");
@@ -588,8 +588,7 @@ void testServerSyncPolicy() {
   check(!address_cache.recordTransportFailure(),
         "first cached-address failure is retained");
   address_cache.recordTransportSuccess();
-  check(!address_cache.recordTransportFailure() &&
-            address_cache.configured(),
+  check(!address_cache.recordTransportFailure() && address_cache.configured(),
         "transport success resets cached-address failure count");
 }
 
@@ -965,17 +964,16 @@ void testProtocolCanonicalization() {
 }
 
 void testSyncCoverage() {
-  const pm::SyncCoveragePlan recovered = pm::deriveSyncCoverage(
-      244U, 756U, {463U, 533U}, {463U, 533U}, 500U);
-  check(
-      recovered.end_sequence == 533U &&
-          recovered.unavailable_sequence_ranges.size() == 2U &&
-          recovered.unavailable_sequence_ranges[0].start_sequence == 245U &&
-          recovered.unavailable_sequence_ranges[0].end_sequence == 462U &&
-          recovered.unavailable_sequence_ranges[1].start_sequence == 464U &&
-          recovered.unavailable_sequence_ranges[1].end_sequence == 532U,
-      "sync coverage declares missing local sequence holes before selected "
-      "readings");
+  const pm::SyncCoveragePlan recovered =
+      pm::deriveSyncCoverage(244U, 756U, {463U, 533U}, {463U, 533U}, 500U);
+  check(recovered.end_sequence == 533U &&
+            recovered.unavailable_sequence_ranges.size() == 2U &&
+            recovered.unavailable_sequence_ranges[0].start_sequence == 245U &&
+            recovered.unavailable_sequence_ranges[0].end_sequence == 462U &&
+            recovered.unavailable_sequence_ranges[1].start_sequence == 464U &&
+            recovered.unavailable_sequence_ranges[1].end_sequence == 532U,
+        "sync coverage declares missing local sequence holes before selected "
+        "readings");
 
   const pm::SyncCoveragePlan bounded =
       pm::deriveSyncCoverage(0U, 600U, {600U}, {600U}, 500U);
@@ -1042,8 +1040,7 @@ void testAuthenticationPolicy() {
 void testMemoryPressurePolicy() {
   pm::MemoryPressurePolicy policy;
   auto update = policy.update(72'348U, 33'780U, 0U);
-  check(!update.changed &&
-            update.current == pm::MemoryPressureState::Normal,
+  check(!update.changed && update.current == pm::MemoryPressureState::Normal,
         "the measured 72,348/33,780-byte idle baseline is normal");
 
   update = policy.update(40U * 1024U, 24U * 1024U, 1'000U,
@@ -1068,7 +1065,8 @@ void testMemoryPressurePolicy() {
                 35U * 1024U &&
             tls_metrics.tls_ready &&
             tls_metrics.operation_context == pm::MemoryOperationContext::Idle,
-        "85,744-byte post-operation heap returns to normal and retains TLS evidence");
+        "85,744-byte post-operation heap returns to normal and retains TLS "
+        "evidence");
 
   policy.update(39U * 1024U, 21U * 1024U, 7'000U,
                 pm::MemoryOperationContext::OtaActive);
@@ -1137,46 +1135,49 @@ void testMemoryPressurePolicy() {
                                    pm::MemoryOperationContext::TlsActive);
   check(update.current == pm::MemoryPressureState::Normal && !update.changed &&
             emergency_policy.metrics(1'000U)
-                    .tls_transient_minimum_free_internal_bytes ==
-                28U * 1024U,
-        "a 28-KiB TLS transient is measured without becoming persistent low memory");
+                    .tls_transient_minimum_free_internal_bytes == 28U * 1024U,
+        "a 28-KiB TLS transient is measured without becoming persistent low "
+        "memory");
   pm::MemoryPressurePolicy incident_policy;
   update = incident_policy.update(30'100U, 15'092U, 1'000U,
                                   pm::MemoryOperationContext::TlsActive);
   check(update.current == pm::MemoryPressureState::Normal && !update.changed &&
             incident_policy.metrics(1'000U)
                     .tls_transient_minimum_free_internal_bytes == 30'100U,
-        "the physical 30,100/15,092 active-TLS sample remains transient evidence");
-  update = incident_policy.update(75'848U, 34'804U, 5'000U,
-                                  pm::MemoryOperationContext::Idle, true,
-                                  1'000U);
-  check((update.current == pm::MemoryPressureState::Normal ||
-         update.current == pm::MemoryPressureState::Recovering) &&
-            pm::memoryTlsReady(75'848U, 34'804U),
-        "the physical 75,848/34,804 idle sample is TLS-ready recovery evidence");
+        "the physical 30,100/15,092 active-TLS sample remains transient "
+        "evidence");
+  update = incident_policy.update(
+      75'848U, 34'804U, 5'000U, pm::MemoryOperationContext::Idle, true, 1'000U);
+  check(
+      (update.current == pm::MemoryPressureState::Normal ||
+       update.current == pm::MemoryPressureState::Recovering) &&
+          pm::memoryTlsReady(75'848U, 34'804U),
+      "the physical 75,848/34,804 idle sample is TLS-ready recovery evidence");
   pm::MemoryPressurePolicy incident_fragmentation_policy;
   update = incident_fragmentation_policy.update(
       74'244U, 27'636U, 1'000U, pm::MemoryOperationContext::Idle);
   check(update.current == pm::MemoryPressureState::Fragmented &&
             !pm::memoryPressureIsLowMemory(update.current),
-        "the physical 74,244/27,636 idle sample is fragmentation, not low total memory");
-  update = emergency_policy.update(28U * 1024U, 12U * 1024U, 5'000U,
-                                   pm::MemoryOperationContext::Idle, true,
-                                   1'000U);
-  check(update.current == pm::MemoryPressureState::LowTotalMemory &&
-            update.changed,
-        "the same 28-KiB sample is immediately critical after TLS cleanup grace");
+        "the physical 74,244/27,636 idle sample is fragmentation, not low "
+        "total memory");
+  update =
+      emergency_policy.update(28U * 1024U, 12U * 1024U, 5'000U,
+                              pm::MemoryOperationContext::Idle, true, 1'000U);
+  check(
+      update.current == pm::MemoryPressureState::LowTotalMemory &&
+          update.changed,
+      "the same 28-KiB sample is immediately critical after TLS cleanup grace");
   pm::MemoryPressurePolicy integrity_policy;
-  update = integrity_policy.update(80U * 1024U, 40U * 1024U, 1'000U,
-                                   pm::MemoryOperationContext::OtaActive,
-                                   false);
+  update =
+      integrity_policy.update(80U * 1024U, 40U * 1024U, 1'000U,
+                              pm::MemoryOperationContext::OtaActive, false);
   check(update.current == pm::MemoryPressureState::LowTotalMemory,
         "heap-integrity failure is immediately critical during OTA");
 
   pm::MemoryPressurePolicy allocation_failure_policy;
   update = allocation_failure_policy.update(
-      80U * 1024U, 40U * 1024U, 1'000U,
-      pm::MemoryOperationContext::TlsActive, true, 0U, true);
+      80U * 1024U, 40U * 1024U, 1'000U, pm::MemoryOperationContext::TlsActive,
+      true, 0U, true);
   check(update.current == pm::MemoryPressureState::LowTotalMemory,
         "an explicit critical-allocation failure remains immediate during TLS");
 
@@ -1191,21 +1192,21 @@ void testMemoryPressurePolicy() {
   partial_recovery_policy.update(28U * 1024U, 12U * 1024U, 1'000U);
   update = partial_recovery_policy.update(60U * 1024U, 32U * 1024U, 2'000U);
   check(update.current == pm::MemoryPressureState::Recovering,
-        "low total exposes partial recovery above 56 KiB without waiting for normal");
+        "low total exposes partial recovery above 56 KiB without waiting for "
+        "normal");
 
   pm::MemoryPressurePolicy warning_policy;
   update = warning_policy.update(60U * 1024U, 30U * 1024U, 1'000U);
-  check(update.current == pm::MemoryPressureState::PressureWarning &&
-            !pm::memoryPressureIsLowMemory(pm::MemoryPressureState::Normal) &&
-            !pm::memoryPressureIsLowMemory(
-                pm::MemoryPressureState::PressureWarning) &&
-            !pm::memoryPressureIsLowMemory(
-                pm::MemoryPressureState::Fragmented) &&
-            pm::memoryPressureIsLowMemory(
-                pm::MemoryPressureState::LowTotalMemory) &&
-            !pm::memoryPressureIsLowMemory(
-                pm::MemoryPressureState::Recovering),
-        "only LowTotalMemory maps to the legacy low-memory Boolean");
+  check(
+      update.current == pm::MemoryPressureState::PressureWarning &&
+          !pm::memoryPressureIsLowMemory(pm::MemoryPressureState::Normal) &&
+          !pm::memoryPressureIsLowMemory(
+              pm::MemoryPressureState::PressureWarning) &&
+          !pm::memoryPressureIsLowMemory(pm::MemoryPressureState::Fragmented) &&
+          pm::memoryPressureIsLowMemory(
+              pm::MemoryPressureState::LowTotalMemory) &&
+          !pm::memoryPressureIsLowMemory(pm::MemoryPressureState::Recovering),
+      "only LowTotalMemory maps to the legacy low-memory Boolean");
   check(pm::memoryTlsReady(64U * 1024U, 32U * 1024U) &&
             !pm::memoryTlsReady(64U * 1024U - 1U, 32U * 1024U) &&
             !pm::memoryTlsReady(64U * 1024U, 32U * 1024U - 1U),
@@ -1255,7 +1256,8 @@ void testBoundedStorageMessagePools() {
             records.metrics().active == 2U &&
             records.metrics().peak_active == 2U &&
             records.metrics().exhaustions == 1U,
-        "the record pool is bounded and reports active, peak, and exhaustion counts");
+        "the record pool is bounded and reports active, peak, and exhaustion "
+        "counts");
   pm::FixedIntervalRecord *const fixed = records.get(first);
   pm::IntervalRecord restored;
   const bool assigned = fixed != nullptr && fixed->assign(source);
@@ -1358,25 +1360,25 @@ void testOperationAwareMemorySoaks() {
           hour_arena.largestFreeBlock() == hour_warm_largest &&
           hour_arena.allocationCount() == 1U;
     }
-    const auto update = hour_policy.update(
-        free_internal, largest_internal, now_ms, context, true,
-        last_expected_operation_completed_ms);
-    false_low = false_low ||
-                update.current == pm::MemoryPressureState::LowTotalMemory;
+    const auto update =
+        hour_policy.update(free_internal, largest_internal, now_ms, context,
+                           true, last_expected_operation_completed_ms);
+    false_low =
+        false_low || update.current == pm::MemoryPressureState::LowTotalMemory;
   }
   const pm::MemoryPressureMetrics hour_metrics =
       hour_policy.metrics(3'600'000U);
-  const bool hour_arena_released =
-      hour_arena.release(hour_persistent) && hour_arena.integrityOk() &&
-      hour_arena.allocationCount() == 0U &&
-      hour_arena.largestFreeBlock() == 196'608U;
+  const bool hour_arena_released = hour_arena.release(hour_persistent) &&
+                                   hour_arena.integrityOk() &&
+                                   hour_arena.allocationCount() == 0U &&
+                                   hour_arena.largestFreeBlock() == 196'608U;
   check(!false_low && hour_metrics.state == pm::MemoryPressureState::Normal &&
             hour_metrics.entry_count == 0U && heartbeats == 240U &&
             status_polls == 361U && meter_samples == 3'600U &&
             durable_records == 60U && session_renewals == 1U &&
             diagnostics_requests == 4U && ota_manifest_checks == 1U &&
-            ota_downloads == 1U && allocation_stable &&
-            hour_arena_released && hour_status_pool.active() == 0U &&
+            ota_downloads == 1U && allocation_stable && hour_arena_released &&
+            hour_status_pool.active() == 0U &&
             hour_status_pool.exhaustions() == 0U &&
             hour_metrics.tls_transient_minimum_free_internal_bytes == 38'000U &&
             hour_metrics.ota_transient_minimum_free_internal_bytes == 39'000U,
@@ -1412,21 +1414,17 @@ void testOperationAwareMemorySoaks() {
     pm::MemoryOperationContext context = pm::MemoryOperationContext::Idle;
     std::uint32_t free_internal = 72'348U;
     std::uint32_t largest_internal = 33'780U;
-    const bool fragmentation_episode =
-        second >= 20'000U && second <= 20'009U;
+    const bool fragmentation_episode = second >= 20'000U && second <= 20'009U;
     const bool low_episode = second >= 40'000U && second <= 40'002U;
     const bool low_intermediate = second == 40'003U;
-    const bool ota_success_window =
-        second >= 60'000U && second <= 60'004U;
-    const bool ota_rollback_window =
-        second >= 70'000U && second <= 70'004U;
+    const bool ota_success_window = second >= 60'000U && second <= 60'004U;
+    const bool ota_rollback_window = second >= 70'000U && second <= 70'004U;
     if (second % 15U == 0U) {
       ++day_heartbeat_opportunities;
       if (second >= 43'200U && second < 43'320U) {
         ++outage_heartbeat_failures;
         outage_seen = true;
-      } else if (outage_seen && second >= 43'320U &&
-                 outage_recoveries == 0U) {
+      } else if (outage_seen && second >= 43'320U && outage_recoveries == 0U) {
         ++outage_recoveries;
       }
     }
@@ -1491,44 +1489,40 @@ void testOperationAwareMemorySoaks() {
           day_arena.largestFreeBlock() == day_warm_largest &&
           day_arena.allocationCount() == 1U;
     }
-    const auto update = day_policy.update(
-        free_internal, largest_internal, now_ms, context, true,
-        last_expected_operation_completed_ms);
+    const auto update =
+        day_policy.update(free_internal, largest_internal, now_ms, context,
+                          true, last_expected_operation_completed_ms);
     if (update.current == pm::MemoryPressureState::Fragmented) {
       ++fragmentation_observations;
     }
     if (update.current == pm::MemoryPressureState::LowTotalMemory) {
       ++genuine_low_observations;
-      low_outside_injected_episode =
-          low_outside_injected_episode ||
-          !(second >= 40'002U && second <= 40'010U);
+      low_outside_injected_episode = low_outside_injected_episode ||
+                                     !(second >= 40'002U && second <= 40'010U);
     }
   }
-  const pm::MemoryPressureMetrics day_metrics =
-      day_policy.metrics(86'400'000U);
-  const bool day_arena_released =
-      day_arena.release(day_persistent) && day_arena.integrityOk() &&
-      day_arena.allocationCount() == 0U &&
-      day_arena.largestFreeBlock() == 196'608U;
-  check(!low_outside_injected_episode &&
-            day_metrics.state == pm::MemoryPressureState::Normal &&
-            day_metrics.entry_count == 1U &&
-            day_metrics.recovery_count == 2U &&
-            day_metrics.fragmentation_entry_count == 1U &&
-            day_metrics.fragmentation_recovery_count == 1U &&
-            day_heartbeat_opportunities == 5'760U &&
-            day_heartbeats > 5'750U && day_status_polls == 8'641U &&
-            day_meter_samples == 86'400U && day_durable_records == 1'440U &&
-            day_session_renewals == 48U && day_diagnostics_requests == 10U &&
-            outage_heartbeat_failures == 8U && outage_recoveries == 1U &&
-            fragmentation_observations > 0U &&
-            genuine_low_observations > 0U && ota_successes == 1U &&
-            ota_rollbacks == 1U && day_allocation_stable &&
-            day_arena_released && day_status_pool.active() == 0U &&
-            day_status_pool.exhaustions() == 0U,
-        "twenty-four-hour memory soak recovers from one fragmentation and one "
-        "genuine low-total episode while TLS, OTA success, and rollback "
-        "transients remain operation-scoped");
+  const pm::MemoryPressureMetrics day_metrics = day_policy.metrics(86'400'000U);
+  const bool day_arena_released = day_arena.release(day_persistent) &&
+                                  day_arena.integrityOk() &&
+                                  day_arena.allocationCount() == 0U &&
+                                  day_arena.largestFreeBlock() == 196'608U;
+  check(
+      !low_outside_injected_episode &&
+          day_metrics.state == pm::MemoryPressureState::Normal &&
+          day_metrics.entry_count == 1U && day_metrics.recovery_count == 2U &&
+          day_metrics.fragmentation_entry_count == 1U &&
+          day_metrics.fragmentation_recovery_count == 1U &&
+          day_heartbeat_opportunities == 5'760U && day_heartbeats > 5'750U &&
+          day_status_polls == 8'641U && day_meter_samples == 86'400U &&
+          day_durable_records == 1'440U && day_session_renewals == 48U &&
+          day_diagnostics_requests == 10U && outage_heartbeat_failures == 8U &&
+          outage_recoveries == 1U && fragmentation_observations > 0U &&
+          genuine_low_observations > 0U && ota_successes == 1U &&
+          ota_rollbacks == 1U && day_allocation_stable && day_arena_released &&
+          day_status_pool.active() == 0U && day_status_pool.exhaustions() == 0U,
+      "twenty-four-hour memory soak recovers from one fragmentation and one "
+      "genuine low-total episode while TLS, OTA success, and rollback "
+      "transients remain operation-scoped");
 }
 
 void testBoundedStatusPrimitives() {
@@ -1537,22 +1531,19 @@ void testBoundedStatusPrimitives() {
   const std::string escaped_input =
       std::string("quote=\" slash=\\ newline=\n control=") +
       static_cast<char>(0x01) + " snowman=\xE2\x98\x83";
-  check(writer.literal("{\"value\":") &&
-            writer.string(
-                pm::BoundedTextView(escaped_input.data(), escaped_input.size())) &&
-            writer.literal(",\"zero\":") && writer.number(-0.0, 2U) &&
-            writer.literal("}") && writer.ok() &&
-            std::string(writer.data()).find("quote=\\\"") !=
-                std::string::npos &&
-            std::string(writer.data()).find("slash=\\\\") !=
-                std::string::npos &&
-            std::string(writer.data()).find("newline=\\n") !=
-                std::string::npos &&
-            std::string(writer.data()).find("control=\\u0001") !=
-                std::string::npos &&
-            std::string(writer.data()).find("\"zero\":0.00") !=
-                std::string::npos,
-        "bounded JSON writer escapes hostile text and normalizes negative zero");
+  check(
+      writer.literal("{\"value\":") &&
+          writer.string(pm::BoundedTextView(escaped_input.data(),
+                                            escaped_input.size())) &&
+          writer.literal(",\"zero\":") && writer.number(-0.0, 2U) &&
+          writer.literal("}") && writer.ok() &&
+          std::string(writer.data()).find("quote=\\\"") != std::string::npos &&
+          std::string(writer.data()).find("slash=\\\\") != std::string::npos &&
+          std::string(writer.data()).find("newline=\\n") != std::string::npos &&
+          std::string(writer.data()).find("control=\\u0001") !=
+              std::string::npos &&
+          std::string(writer.data()).find("\"zero\":0.00") != std::string::npos,
+      "bounded JSON writer escapes hostile text and normalizes negative zero");
 
   char invalid_json[32]{};
   const std::string invalid_utf8(1U, static_cast<char>(0xFF));
@@ -1564,8 +1555,8 @@ void testBoundedStatusPrimitives() {
 
   char tiny[8]{};
   pm::BoundedJsonWriter tiny_writer(tiny, sizeof(tiny));
-  check(!tiny_writer.string("payload-too-large") &&
-            tiny_writer.overflowed() && tiny[sizeof(tiny) - 1U] == '\0',
+  check(!tiny_writer.string("payload-too-large") && tiny_writer.overflowed() &&
+            tiny[sizeof(tiny) - 1U] == '\0',
         "bounded JSON writer fails closed and remains terminated at capacity");
 
   pm::StatusResponsePool<2U, 64U> pool;
@@ -1575,7 +1566,8 @@ void testBoundedStatusPrimitives() {
     auto exhausted = pool.acquire();
     check(first && second && !exhausted && pool.active() == 2U &&
               pool.exhaustions() == 1U,
-          "two-client status pool rejects a third client with bounded exhaustion");
+          "two-client status pool rejects a third client with bounded "
+          "exhaustion");
     check(first.setSize(4U), "status response lease accepts an in-bound size");
     first.release();
     auto replacement = pool.acquire();
@@ -1609,10 +1601,8 @@ void testBoundedStatusPrimitives() {
         "bounded transport scratch rejects growth without changing storage");
 
   pm::ServerSyncScratch transport;
-  check(transport.begin() && transport.ready() &&
-            transport.begin() &&
-            transport.request_body.ready() &&
-            transport.response_body.ready() &&
+  check(transport.begin() && transport.ready() && transport.begin() &&
+            transport.request_body.ready() && transport.response_body.ready() &&
             transport.canonical_request.ready() && transport.url.ready() &&
             transport.canonical_target.capacity() >=
                 pm::ServerSyncScratch::kCanonicalTargetCapacity,
@@ -1661,6 +1651,9 @@ void testBoundedLocalHealthSerialization() {
   snapshot.storage_mounted = true;
   snapshot.storage_writable = true;
   snapshot.storage_index_healthy = true;
+  snapshot.storage_event_log_healthy = false;
+  snapshot.storage_event_log_integrity_status =
+      "event_record_corruption_detected";
   snapshot.meter_healthy = true;
   snapshot.sync_in_progress = true;
   snapshot.durable_reading_backlog = true;
@@ -1672,19 +1665,28 @@ void testBoundedLocalHealthSerialization() {
       pm::serializeLocalHealth(snapshot, lease.data(), lease.capacity());
   check(result.success && lease.setSize(result.bytes) &&
             result.bytes < lease.capacity() &&
-            std::string(lease.data()).find(
-                "\"schema_version\":2") != std::string::npos &&
-            std::string(lease.data()).find(
-                "\"high_memory_context\":\"tls_active\"") !=
+            std::string(lease.data()).find("\"schema_version\":2") !=
                 std::string::npos &&
-            std::string(lease.data()).find(
-                "\"record_pool_capacity\":120") !=
+            std::string(lease.data())
+                    .find("\"high_memory_context\":\"tls_active\"") !=
                 std::string::npos &&
-            std::string(lease.data()).find(
-                "\"free_internal_heap_bytes\":28016") !=
+            std::string(lease.data()).find("\"record_pool_capacity\":120") !=
+                std::string::npos &&
+            std::string(lease.data())
+                    .find("\"free_internal_heap_bytes\":28016") !=
+                std::string::npos &&
+            std::string(lease.data()).find("\"storage_index_healthy\":true") !=
+                std::string::npos &&
+            std::string(lease.data())
+                    .find("\"storage_event_log_healthy\":false") !=
+                std::string::npos &&
+            std::string(lease.data())
+                    .find("\"storage_event_log_integrity_status\":"
+                          "\"event_record_corruption_detected\"") !=
                 std::string::npos,
         "local health is serialized from a fixed snapshot into a bounded "
-        "response slot without a JsonDocument or dynamic body");
+        "response slot without a JsonDocument or dynamic body and keeps "
+        "reading-index integrity separate from event-log integrity");
 
   std::array<char, 128U> too_small{};
   const pm::LocalHealthSerializationResult overflow =
@@ -1696,26 +1698,25 @@ void testBoundedLocalHealthSerialization() {
 
 void testCompactStatusSerializationAndFreshness() {
   pm::ServerFreshnessPolicy policy;
-  check(pm::classifyServerFreshness(true, true, true, 1'000U, 5'000U,
-                                    policy) ==
-            pm::ServerFreshnessState::Live &&
-            pm::classifyServerFreshness(true, true, true, 1'000U, 23'000U,
-                                        policy) ==
-                pm::ServerFreshnessState::Delayed &&
-            pm::classifyServerFreshness(true, true, true, 1'000U, 357'000U,
-                                        policy) ==
-                pm::ServerFreshnessState::Stale &&
-            pm::classifyServerFreshness(false, false, false, 1'000U,
-                                        357'000U, policy) ==
-                pm::ServerFreshnessState::Offline &&
-            pm::classifyServerFreshness(true, true, false, 1'000U, 2'000U,
-                                        policy) ==
-                pm::ServerFreshnessState::Unauthenticated &&
-            pm::classifyServerFreshness(true, false, false, 0U, 2'000U,
-                                        policy) ==
-                pm::ServerFreshnessState::NeverConnected,
-        "freshness distinguishes live, delayed, 356-second stale, offline, "
-        "unauthenticated, and never-connected states");
+  check(
+      pm::classifyServerFreshness(true, true, true, 1'000U, 5'000U, policy) ==
+              pm::ServerFreshnessState::Live &&
+          pm::classifyServerFreshness(true, true, true, 1'000U, 23'000U,
+                                      policy) ==
+              pm::ServerFreshnessState::Delayed &&
+          pm::classifyServerFreshness(true, true, true, 1'000U, 357'000U,
+                                      policy) ==
+              pm::ServerFreshnessState::Stale &&
+          pm::classifyServerFreshness(false, false, false, 1'000U, 357'000U,
+                                      policy) ==
+              pm::ServerFreshnessState::Offline &&
+          pm::classifyServerFreshness(true, true, false, 1'000U, 2'000U,
+                                      policy) ==
+              pm::ServerFreshnessState::Unauthenticated &&
+          pm::classifyServerFreshness(true, false, false, 0U, 2'000U, policy) ==
+              pm::ServerFreshnessState::NeverConnected,
+      "freshness distinguishes live, delayed, 356-second stale, offline, "
+      "unauthenticated, and never-connected states");
 
   pm::CompactUiStatusSnapshot snapshot;
   pm::copyCompactText(snapshot.friendly_name, "Outdoor \\\"AC\\\"");
@@ -1747,8 +1748,7 @@ void testCompactStatusSerializationAndFreshness() {
   snapshot.heap.largest_internal_block_bytes = 52'000U;
   snapshot.heap.integrity_ok = true;
   snapshot.ota.protocol_version = 2U;
-  pm::copyCompactText(snapshot.ota.authentication_mode,
-                      "existing_device_hmac");
+  pm::copyCompactText(snapshot.ota.authentication_mode, "existing_device_hmac");
   pm::copyCompactText(snapshot.ota.state, "downloading");
   pm::copyCompactText(snapshot.ota.deployment_id,
                       "12345678-1234-1234-1234-123456789abc");
@@ -1766,33 +1766,28 @@ void testCompactStatusSerializationAndFreshness() {
   snapshot.ota.rollback_supported = true;
   snapshot.server_state = pm::ServerFreshnessState::Live;
   const pm::CompactUiBuildMetadata metadata{
-      "1.0.9", "abcdef0", "2026-08-01T12:00:00Z", "native-tests",
-      "index-hash", "script-hash", "style-hash"};
+      "1.0.9",        "abcdef0",    "2026-08-01T12:00:00Z",
+      "native-tests", "index-hash", "script-hash",
+      "style-hash"};
   std::array<char, 2048U> response{};
-  const pm::CompactUiSerializationResult result =
-      pm::serializeCompactUiStatus(snapshot, metadata, response.data(),
-                                   response.size());
+  const pm::CompactUiSerializationResult result = pm::serializeCompactUiStatus(
+      snapshot, metadata, response.data(), response.size());
   const std::string body(response.data(), result.bytes);
   check(result.success && result.bytes < response.size() &&
-            body.find("Outdoor \\\\\\\"AC\\\\\\\"") !=
+            body.find("Outdoor \\\\\\\"AC\\\\\\\"") != std::string::npos &&
+            body.find("\"state\":\"live\"") != std::string::npos &&
+            body.find("\"age_seconds\":0") != std::string::npos &&
+            body.find("\"low_memory\":false") != std::string::npos &&
+            body.find("\"memory_state\":\"normal\"") != std::string::npos &&
+            body.find("\"memory_severity\":\"normal\"") != std::string::npos &&
+            body.find("\"tls_ready\":true") != std::string::npos &&
+            body.find("\"operation_context\":\"idle\"") != std::string::npos &&
+            body.find("\"authentication_mode\":\"existing_device_hmac\"") !=
                 std::string::npos &&
-             body.find("\"state\":\"live\"") != std::string::npos &&
-             body.find("\"age_seconds\":0") != std::string::npos &&
-             body.find("\"low_memory\":false") != std::string::npos &&
-             body.find("\"memory_state\":\"normal\"") !=
-                 std::string::npos &&
-             body.find("\"memory_severity\":\"normal\"") !=
-                 std::string::npos &&
-             body.find("\"tls_ready\":true") != std::string::npos &&
-             body.find("\"operation_context\":\"idle\"") !=
-                 std::string::npos &&
-             body.find("\"authentication_mode\":\"existing_device_hmac\"") !=
-                 std::string::npos &&
-             body.find("\"progress_percent\":50") != std::string::npos &&
-             body.find("\"rollback_supported\":true") !=
-                 std::string::npos &&
-             body.find("\"largest_internal_block_bytes\":52000") !=
-                 std::string::npos,
+            body.find("\"progress_percent\":50") != std::string::npos &&
+            body.find("\"rollback_supported\":true") != std::string::npos &&
+            body.find("\"largest_internal_block_bytes\":52000") !=
+                std::string::npos,
         "compact status serializes within two KiB, escapes text, and retains "
         "freshness plus explicit memory diagnostics");
 
@@ -1831,11 +1826,13 @@ void testBoundedStatusAuthorizationAndResponsePath() {
       "theme=dark; pm_session="
       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; "
       "pm_csrf=not-read-for-get";
-  const auto session = pm::parseBoundedCookie<64U>(
-      cookies, sizeof(cookies) - 1U, "pm_session");
-  check(session.presented() && !session.overflow && session.view().size() == 64U &&
+  const auto session =
+      pm::parseBoundedCookie<64U>(cookies, sizeof(cookies) - 1U, "pm_session");
+  check(session.presented() && !session.overflow &&
+            session.view().size() == 64U &&
             std::memcmp(session.view().data(), "01234567", 8U) == 0,
-        "status authorization parses one session token into bounded request-local storage");
+        "status authorization parses one session token into bounded "
+        "request-local storage");
 
   constexpr char deceptive[] =
       "not_pm_session=wrong; pm_session=correct; pm_session_extra=wrong";
@@ -1845,18 +1842,21 @@ void testBoundedStatusAuthorizationAndResponsePath() {
         "bounded cookie parsing requires an exact cookie name");
 
   constexpr char oversized[] =
-      "pm_session=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefX";
+      "pm_session="
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefX";
   const auto rejected = pm::parseBoundedCookie<64U>(
       oversized, sizeof(oversized) - 1U, "pm_session");
   check(rejected.presented() && rejected.overflow && rejected.view().empty(),
-        "oversized session cookies remain classified as browser authentication and fail closed");
+        "oversized session cookies remain classified as browser authentication "
+        "and fail closed");
 
   pm::CompactUiStatusSnapshot snapshot;
   pm::copyCompactText(snapshot.friendly_name, "Allocation soak");
   snapshot.server_state = pm::ServerFreshnessState::Live;
   const pm::CompactUiBuildMetadata metadata{
-      "1.0.9", "abcdef0", "2026-08-01T12:00:00Z", "native-tests",
-      "index-hash", "script-hash", "style-hash"};
+      "1.0.9",        "abcdef0",    "2026-08-01T12:00:00Z",
+      "native-tests", "index-hash", "script-hash",
+      "style-hash"};
   pm::StatusResponsePool<2U, 2048U> pool;
   bool stable = true;
   for (std::size_t poll = 0U; poll < 100'000U; ++poll) {
@@ -1869,25 +1869,24 @@ void testBoundedStatusAuthorizationAndResponsePath() {
              serialized.success && response.setSize(serialized.bytes);
   }
   check(stable && pool.active() == 0U && pool.exhaustions() == 0U,
-        "one hundred thousand authorized status polls reuse bounded cookie and response storage without exhaustion");
+        "one hundred thousand authorized status polls reuse bounded cookie and "
+        "response storage without exhaustion");
 }
 
 void testDebugAllocationScopes() {
   pm::DebugAllocationScope<4U> scope;
   scope.begin(pm::DebugAllocationScopeId::HeartbeatJson,
               pm::DebugAllocationRegion::Psram, 65'536U, 524'288U);
-  check(scope.recordAllocation(1U, 20U * 1024U,
-                               pm::DebugAllocationRegion::Psram) &&
-            scope.recordAllocation(2U, 2U * 1024U,
-                                   pm::DebugAllocationRegion::Psram) &&
-            scope.recordAllocation(3U, 512U,
-                                   pm::DebugAllocationRegion::Internal),
-        "debug allocation scope accepts bounded internal and PSRAM records");
+  check(
+      scope.recordAllocation(1U, 20U * 1024U,
+                             pm::DebugAllocationRegion::Psram) &&
+          scope.recordAllocation(2U, 2U * 1024U,
+                                 pm::DebugAllocationRegion::Psram) &&
+          scope.recordAllocation(3U, 512U, pm::DebugAllocationRegion::Internal),
+      "debug allocation scope accepts bounded internal and PSRAM records");
   const pm::DebugAllocationScopeSnapshot active = scope.snapshot();
-  check(active.allocation_count == 3U &&
-            active.allocated_bytes == 23'040U &&
-            active.freed_bytes == 0U &&
-            active.outstanding_allocations == 3U &&
+  check(active.allocation_count == 3U && active.allocated_bytes == 23'040U &&
+            active.freed_bytes == 0U && active.outstanding_allocations == 3U &&
             active.outstanding_bytes == 23'040U &&
             active.largest_single_allocation_bytes == 20U * 1024U &&
             active.peak_simultaneous_bytes == 23'040U &&
@@ -1897,9 +1896,9 @@ void testDebugAllocationScopes() {
             active.psram_allocated_bytes == 22U * 1024U &&
             active.non_preferred_allocation_count == 1U &&
             active.operation_started && !active.operation_ended,
-        "debug allocation scope reports counts, bytes, peak, largest, region, and lifecycle");
-  check(scope.recordFree(2U) && scope.recordFree(1U) &&
-            scope.recordFree(3U),
+        "debug allocation scope reports counts, bytes, peak, largest, region, "
+        "and lifecycle");
+  check(scope.recordFree(2U) && scope.recordFree(1U) && scope.recordFree(3U),
         "debug allocation scope releases records in arbitrary order");
   scope.end(65'536U, 524'288U);
   const pm::DebugAllocationScopeSnapshot complete = scope.snapshot();
@@ -1908,7 +1907,8 @@ void testDebugAllocationScopes() {
             complete.largest_internal_block_at_end == 65'536U &&
             complete.largest_psram_block_at_start == 524'288U &&
             complete.largest_psram_block_at_end == 524'288U,
-        "completed allocation scope is balanced and records start/end largest blocks");
+        "completed allocation scope is balanced and records start/end largest "
+        "blocks");
 
   pm::DebugAllocationScope<2U> exhausted;
   exhausted.begin(pm::DebugAllocationScopeId::UiDiagnostics,
@@ -1919,7 +1919,8 @@ void testDebugAllocationScopes() {
                                        pm::DebugAllocationRegion::Internal) &&
             !exhausted.recordAllocation(12U, 256U,
                                         pm::DebugAllocationRegion::Internal),
-        "debug allocation scope fails closed when fixed record capacity is exhausted");
+        "debug allocation scope fails closed when fixed record capacity is "
+        "exhausted");
   check(exhausted.recordFree(10U) && exhausted.recordFree(11U),
         "capacity exhaustion does not prevent deterministic cleanup");
   exhausted.end(65'536U, 524'288U);
@@ -1966,10 +1967,10 @@ void testFragmentationIncidentAndSoaks() {
             deferred_tls.snapshot().balanced() &&
             fragmentation_deferrals == 1U && external_failures == 0U &&
             authentication_failures == 0U,
-        "fragmented incident defers TLS locally without external or authentication failure");
+        "fragmented incident defers TLS locally without external or "
+        "authentication failure");
   check(incident.release(middle) && incident.release(upper) &&
-            incident.largestFreeBlock() == 98'304U &&
-            incident.integrityOk(),
+            incident.largestFreeBlock() == 98'304U && incident.integrityOk(),
         "releasing optional incident allocations coalesces the arena fully");
   pm::DebugAllocationScope<2U> recovered_tls;
   recovered_tls.begin(pm::DebugAllocationScopeId::TlsTransport,
@@ -1989,7 +1990,8 @@ void testFragmentationIncidentAndSoaks() {
   check(retry_released && recovered_tls.snapshot().balanced() &&
             fragmentation_recoveries == 1U &&
             incident.largestFreeBlock() == 98'304U,
-        "coalesced incident retries within the local path and returns freshness to live");
+        "coalesced incident retries within the local path and returns "
+        "freshness to live");
 
   pm::FragmentingInternalHeap<8U> unrecoverable(98'304U);
   const auto retained_middle = unrecoverable.allocateAt(24'564U, 9'000U);
@@ -2002,9 +2004,10 @@ void testFragmentationIncidentAndSoaks() {
   check(retained_middle != pm::kInvalidHeapAllocation &&
             retained_upper != pm::kInvalidHeapAllocation && stale &&
             heavy_ui_deferred && continuing_meter_samples == 60U &&
-            continuing_storage_intervals == 1U &&
-            external_failures == 0U && authentication_failures == 0U,
-        "unrecoverable optional ownership stays stale while meter/storage continue without false external failure");
+            continuing_storage_intervals == 1U && external_failures == 0U &&
+            authentication_failures == 0U,
+        "unrecoverable optional ownership stays stale while meter/storage "
+        "continue without false external failure");
 
   struct SoakConfiguration {
     std::uint32_t duration_seconds{0U};
@@ -2066,8 +2069,7 @@ void testFragmentationIncidentAndSoaks() {
   const auto run_soak = [](const SoakConfiguration &configuration) {
     SoakCounters counters;
     pm::FragmentingInternalHeap<16U> arena(196'608U);
-    const pm::HeapAllocationId persistent =
-        arena.allocateAt(65'536U, 32'768U);
+    const pm::HeapAllocationId persistent = arena.allocateAt(65'536U, 32'768U);
     counters.valid = persistent != pm::kInvalidHeapAllocation;
     counters.desktop_clients = configuration.client_count > 0U ? 1U : 0U;
     counters.phone_clients = configuration.client_count > 1U ? 1U : 0U;
@@ -2083,20 +2085,20 @@ void testFragmentationIncidentAndSoaks() {
                   (configuration.visibility_cycles + 1U);
     bool outage_seen = false;
 
-    const auto record_scope = [&counters](
-                                  const pm::DebugAllocationScopeSnapshot &value) {
-      if (value.balanced()) {
-        ++counters.allocation_scopes_balanced;
-      } else {
-        ++counters.allocation_scopes_unbalanced;
-        counters.valid = false;
-      }
-    };
+    const auto record_scope =
+        [&counters](const pm::DebugAllocationScopeSnapshot &value) {
+          if (value.balanced()) {
+            ++counters.allocation_scopes_balanced;
+          } else {
+            ++counters.allocation_scopes_unbalanced;
+            counters.valid = false;
+          }
+        };
 
     const auto exercise_internal_operation =
-        [&arena, &counters, &record_scope](
-            const pm::DebugAllocationScopeId scope_id,
-            const std::size_t bytes) {
+        [&arena, &counters,
+         &record_scope](const pm::DebugAllocationScopeId scope_id,
+                        const std::size_t bytes) {
           pm::DebugAllocationScope<2U> scope;
           const std::size_t before = arena.largestFreeBlock();
           scope.begin(scope_id, pm::DebugAllocationRegion::Internal, before,
@@ -2114,8 +2116,7 @@ void testFragmentationIncidentAndSoaks() {
                            arena.largestFreeBlock() == before;
           if (arena.largestFreeBlock() <
               counters.minimum_largest_internal_block) {
-            counters.minimum_largest_internal_block =
-                arena.largestFreeBlock();
+            counters.minimum_largest_internal_block = arena.largestFreeBlock();
           }
           return released;
         };
@@ -2131,8 +2132,8 @@ void testFragmentationIncidentAndSoaks() {
       second_scope.begin(pm::DebugAllocationScopeId::UiStatus,
                          pm::DebugAllocationRegion::Internal,
                          arena.largestFreeBlock(), 524'288U);
-      auto second = configuration.client_count > 1U ? pool.acquire()
-                                                     : decltype(first){};
+      auto second =
+          configuration.client_count > 1U ? pool.acquire() : decltype(first){};
       const bool second_ok = configuration.client_count <= 1U ||
                              (static_cast<bool>(second) && second.setSize(64U));
       const std::uint32_t active = pool.active();
@@ -2155,15 +2156,15 @@ void testFragmentationIncidentAndSoaks() {
                        pool.active() == 0U && arena.integrityOk();
     };
 
-    for (std::uint32_t second = 1U;
-         second <= configuration.duration_seconds; ++second) {
+    for (std::uint32_t second = 1U; second <= configuration.duration_seconds;
+         ++second) {
       ++counters.meter_samples;
       if (second % 60U == 0U) {
         ++counters.durable_intervals;
         counters.valid =
-            counters.valid && exercise_internal_operation(
-                                  pm::DebugAllocationScopeId::StoragePage,
-                                  4U * 1024U);
+            counters.valid &&
+            exercise_internal_operation(pm::DebugAllocationScopeId::StoragePage,
+                                        4U * 1024U);
       }
 
       const std::uint32_t target_rounds = static_cast<std::uint32_t>(
@@ -2203,11 +2204,10 @@ void testFragmentationIncidentAndSoaks() {
         } else {
           ++counters.tls_heap_deferrals;
         }
-        const bool in_outage =
-            configuration.outage_end_second >
-                configuration.outage_start_second &&
-            second >= configuration.outage_start_second &&
-            second < configuration.outage_end_second;
+        const bool in_outage = configuration.outage_end_second >
+                                   configuration.outage_start_second &&
+                               second >= configuration.outage_start_second &&
+                               second < configuration.outage_end_second;
         if (admitted && in_outage) {
           ++counters.server_outage_heartbeats;
           ++counters.network_failures;
@@ -2217,8 +2217,7 @@ void testFragmentationIncidentAndSoaks() {
           }
         } else if (admitted) {
           ++counters.heartbeat_successes;
-          if (outage_seen &&
-              second >= configuration.outage_end_second &&
+          if (outage_seen && second >= configuration.outage_end_second &&
               counters.outage_recoveries == 0U) {
             ++counters.outage_recoveries;
           }
@@ -2228,38 +2227,40 @@ void testFragmentationIncidentAndSoaks() {
       if (configuration.setup_visits > counters.setup_visits &&
           second == configuration.duration_seconds / 4U) {
         ++counters.setup_visits;
-        counters.valid = counters.valid && exercise_internal_operation(
-                                              pm::DebugAllocationScopeId::UiSetup,
-                                              4U * 1024U);
+        counters.valid = counters.valid &&
+                         exercise_internal_operation(
+                             pm::DebugAllocationScopeId::UiSetup, 4U * 1024U);
       }
       if (configuration.diagnostics_refreshes > 0U &&
           second % (configuration.duration_seconds /
-                    configuration.diagnostics_refreshes) == 0U &&
+                    configuration.diagnostics_refreshes) ==
+              0U &&
           counters.diagnostics_refreshes <
               configuration.diagnostics_refreshes) {
         ++counters.diagnostics_refreshes;
         ++counters.manual_diagnostics_attempts;
         counters.valid =
-            counters.valid && exercise_internal_operation(
-                                  pm::DebugAllocationScopeId::UiDiagnostics,
-                                  8U * 1024U);
+            counters.valid &&
+            exercise_internal_operation(
+                pm::DebugAllocationScopeId::UiDiagnostics, 8U * 1024U);
       }
       if (configuration.diagnostics_downloads > 0U &&
           second % (configuration.duration_seconds /
-                    configuration.diagnostics_downloads) == 0U &&
+                    configuration.diagnostics_downloads) ==
+              0U &&
           counters.diagnostics_downloads <
               configuration.diagnostics_downloads) {
         ++counters.diagnostics_downloads;
         counters.valid =
-            counters.valid && exercise_internal_operation(
-                                  pm::DebugAllocationScopeId::UiDiagnostics,
-                                  12U * 1024U);
+            counters.valid &&
+            exercise_internal_operation(
+                pm::DebugAllocationScopeId::UiDiagnostics, 12U * 1024U);
       }
 
-      counters.valid = counters.valid && arena.integrityOk() &&
-                       arena.largestFreeBlock() ==
-                           counters.warm_largest_internal_block &&
-                       pool.active() == 0U;
+      counters.valid =
+          counters.valid && arena.integrityOk() &&
+          arena.largestFreeBlock() == counters.warm_largest_internal_block &&
+          pool.active() == 0U;
     }
     counters.ending_largest_internal_block = arena.largestFreeBlock();
     counters.status_pool_exhaustions = pool.exhaustions();
@@ -2270,8 +2271,8 @@ void testFragmentationIncidentAndSoaks() {
     return counters;
   };
 
-  const SoakCounters historical = run_soak(
-      {2'100U, 341U, 1U, 1U, 1U, 0U, 0U, 0U, 0U});
+  const SoakCounters historical =
+      run_soak({2'100U, 341U, 1U, 1U, 1U, 0U, 0U, 0U, 0U});
   check(historical.valid && historical.meter_samples == 2'100U &&
             historical.durable_intervals == 35U &&
             historical.heartbeat_opportunities == 140U &&
@@ -2305,10 +2306,11 @@ void testFragmentationIncidentAndSoaks() {
             historical.warm_largest_internal_block ==
                 historical.ending_largest_internal_block &&
             historical.outstanding_allocations_at_end == 0U,
-        "35-minute historical 341-request soak covers meter, durable, session, visibility, diagnostics, buffers, and freshness counters");
+        "35-minute historical 341-request soak covers meter, durable, session, "
+        "visibility, diagnostics, buffers, and freshness counters");
 
-  const SoakCounters current_policy = run_soak(
-      {2'100U, 211U, 1U, 1U, 1U, 0U, 0U, 0U, 0U});
+  const SoakCounters current_policy =
+      run_soak({2'100U, 211U, 1U, 1U, 1U, 0U, 0U, 0U, 0U});
   check(current_policy.valid && current_policy.status_requests == 211U &&
             current_policy.heartbeat_opportunities == 140U &&
             current_policy.heartbeats_admitted == 140U &&
@@ -2316,44 +2318,42 @@ void testFragmentationIncidentAndSoaks() {
             current_policy.maximum_requests_per_client == 1U &&
             current_policy.status_pool_exhaustions == 0U &&
             current_policy.outstanding_allocations_at_end == 0U,
-        "35-minute current 10-second policy stays within 211 requests with no overlap or leak");
+        "35-minute current 10-second policy stays within 211 requests with no "
+        "overlap or leak");
 
-  const SoakCounters day = run_soak(
-      {86'400U, 8'641U, 1U, 4U, 10U, 2U, 1U, 43'200U, 43'320U});
-  check(day.valid && day.meter_samples == 86'400U &&
-            day.durable_intervals == 1'440U &&
-            day.heartbeat_opportunities == 5'760U &&
-            day.heartbeats_admitted == 5'760U &&
-            day.heartbeat_successes == 5'752U &&
-            day.server_outage_heartbeats == 8U &&
-            day.network_failures == 8U && day.outage_recoveries == 1U &&
-            day.status_requests == 8'641U &&
-            day.status_response_failures == 0U &&
-            day.session_renewals == 48U && day.visibility_pauses == 4U &&
-            day.visibility_resumes == 4U && day.setup_visits == 1U &&
-            day.manual_diagnostics_attempts == 10U &&
-            day.diagnostics_refreshes == 10U &&
-            day.diagnostics_downloads == 2U &&
-            day.dashboard_offline_transitions == 1U &&
-            day.false_dashboard_offline_transitions == 0U &&
-            day.stale_connected_labels == 0U &&
-            day.session_renewal_loops == 0U &&
-            day.tls_heap_deferrals == 0U &&
-            day.tls_stack_deferrals == 0U &&
-            day.heartbeat_buffer_growths == 0U &&
-            day.response_buffer_growths == 0U &&
-            day.maximum_requests_per_client == 1U &&
-            day.status_pool_exhaustions == 0U &&
-            day.allocation_scopes_unbalanced == 0U &&
-            day.warm_largest_internal_block ==
-                day.minimum_largest_internal_block &&
-            day.warm_largest_internal_block ==
-                day.ending_largest_internal_block &&
-            day.outstanding_allocations_at_end == 0U,
-        "24-hour soak covers status, meter, durable, session, visibility, setup, diagnostics, and deliberate outage recovery without allocator drift");
+  const SoakCounters day =
+      run_soak({86'400U, 8'641U, 1U, 4U, 10U, 2U, 1U, 43'200U, 43'320U});
+  check(
+      day.valid && day.meter_samples == 86'400U &&
+          day.durable_intervals == 1'440U &&
+          day.heartbeat_opportunities == 5'760U &&
+          day.heartbeats_admitted == 5'760U &&
+          day.heartbeat_successes == 5'752U &&
+          day.server_outage_heartbeats == 8U && day.network_failures == 8U &&
+          day.outage_recoveries == 1U && day.status_requests == 8'641U &&
+          day.status_response_failures == 0U && day.session_renewals == 48U &&
+          day.visibility_pauses == 4U && day.visibility_resumes == 4U &&
+          day.setup_visits == 1U && day.manual_diagnostics_attempts == 10U &&
+          day.diagnostics_refreshes == 10U && day.diagnostics_downloads == 2U &&
+          day.dashboard_offline_transitions == 1U &&
+          day.false_dashboard_offline_transitions == 0U &&
+          day.stale_connected_labels == 0U && day.session_renewal_loops == 0U &&
+          day.tls_heap_deferrals == 0U && day.tls_stack_deferrals == 0U &&
+          day.heartbeat_buffer_growths == 0U &&
+          day.response_buffer_growths == 0U &&
+          day.maximum_requests_per_client == 1U &&
+          day.status_pool_exhaustions == 0U &&
+          day.allocation_scopes_unbalanced == 0U &&
+          day.warm_largest_internal_block ==
+              day.minimum_largest_internal_block &&
+          day.warm_largest_internal_block ==
+              day.ending_largest_internal_block &&
+          day.outstanding_allocations_at_end == 0U,
+      "24-hour soak covers status, meter, durable, session, visibility, setup, "
+      "diagnostics, and deliberate outage recovery without allocator drift");
 
-  const SoakCounters two_clients = run_soak(
-      {2'100U, 211U, 2U, 2U, 2U, 0U, 0U, 0U, 0U});
+  const SoakCounters two_clients =
+      run_soak({2'100U, 211U, 2U, 2U, 2U, 0U, 0U, 0U, 0U});
   check(two_clients.valid && two_clients.status_requests == 422U &&
             two_clients.maximum_status_leases == 2U &&
             two_clients.maximum_requests_per_client == 1U &&
@@ -2366,7 +2366,8 @@ void testFragmentationIncidentAndSoaks() {
             two_clients.storage_scans_from_status == 0U &&
             two_clients.heartbeats_admitted == 140U &&
             two_clients.outstanding_allocations_at_end == 0U,
-        "two-client 35-minute soak admits both fixed response leases without fan-out, history scans, or TLS starvation");
+        "two-client 35-minute soak admits both fixed response leases without "
+        "fan-out, history scans, or TLS starvation");
 }
 
 void testProvisioningTransaction() {
@@ -2421,8 +2422,7 @@ void testStoragePolicy() {
   check(pm::classifyStoragePressure(64U * gib, 6U * gib, policy) ==
             pm::StoragePressureState::Warning,
         "ten-percent storage is warning");
-  check(pm::classifyStoragePressure(64U * gib, 400U * 1024U * 1024U,
-                                    policy) ==
+  check(pm::classifyStoragePressure(64U * gib, 400U * 1024U * 1024U, policy) ==
             pm::StoragePressureState::Emergency,
         "absolute emergency reserve protects large cards");
 
@@ -2474,7 +2474,8 @@ void testStoragePolicy() {
   context.emergency_pressure = true;
   check(pm::segmentEligibility(untrusted, context) ==
             pm::SegmentEligibility::EligibleEmergency,
-        "explicit continuous emergency mode can reclaim acknowledged untrusted segment");
+        "explicit continuous emergency mode can reclaim acknowledged untrusted "
+        "segment");
   untrusted.minimum_window_protected = true;
   check(pm::segmentEligibility(untrusted, context) ==
             pm::SegmentEligibility::MinimumWindow,
@@ -2492,16 +2493,19 @@ void testStoragePolicy() {
   check(plan.candidate_indexes.size() == 1U &&
             plan.expected_reclaimed_bytes == 1100U &&
             plan.protected_unacknowledged_bytes == 1100U,
-        "cleanup selects only the oldest eligible bytes and reports protected backlog");
+        "cleanup selects only the oldest eligible bytes and reports protected "
+        "backlog");
   const pm::CleanupPlan target_already_met =
       pm::buildCleanupPlan(segments, context, 1000U, 1000U);
   check(target_already_met.candidate_indexes.empty() &&
             target_already_met.eligible_bytes == 1100U,
-        "pressure cleanup stops without deleting eligible evidence once the free-space target is met");
+        "pressure cleanup stops without deleting eligible evidence once the "
+        "free-space target is met");
   const pm::CleanupPlan ordinary_age_cleanup =
       pm::buildCleanupPlan(segments, context, 1000U, 0U);
   check(ordinary_age_cleanup.candidate_indexes.size() == 1U,
-        "ordinary age cleanup still selects all age-eligible segments without a pressure target");
+        "ordinary age cleanup still selects all age-eligible segments without "
+        "a pressure target");
   check(pm::conservativeWriteReserveBytes(4096U) > 300U * 1024U,
         "write reserve includes journals and filesystem overhead");
 
@@ -2516,20 +2520,17 @@ void testStoragePolicy() {
 
 void testCleanupRecoveryPolicy() {
   using pm::CleanupRecoveryAction;
-  using pm::CleanupRecoverySnapshot;
   using pm::cleanupRecoveryAction;
+  using pm::CleanupRecoverySnapshot;
 
   CleanupRecoverySnapshot snapshot{"planned", true, true, false, true, false};
-  check(cleanupRecoveryAction(snapshot) ==
-            CleanupRecoveryAction::ClearJournal,
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::ClearJournal,
         "untouched planned cleanup only clears its journal");
   snapshot = {"planned", true, false, true, true, false};
-  check(cleanupRecoveryAction(snapshot) ==
-            CleanupRecoveryAction::ReverseMoves,
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::ReverseMoves,
         "partial pre-commit move is rolled back");
   snapshot = {"planned", true, false, true, false, true};
-  check(cleanupRecoveryAction(snapshot) ==
-            CleanupRecoveryAction::ReverseMoves,
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::ReverseMoves,
         "complete pre-commit move is rolled back");
   snapshot = {"planned", true, true, true, true, false};
   check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
@@ -2541,16 +2542,13 @@ void testCleanupRecoveryPolicy() {
   check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
         "missing index copies block cleanup recovery");
   snapshot = {"files_moved", true, false, true, false, true};
-  check(cleanupRecoveryAction(snapshot) ==
-            CleanupRecoveryAction::ForwardDelete,
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::ForwardDelete,
         "committed moved files are deleted forward");
   snapshot = {"record_deleted", true, false, false, false, true};
-  check(cleanupRecoveryAction(snapshot) ==
-            CleanupRecoveryAction::ForwardDelete,
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::ForwardDelete,
         "committed remaining index trash is deleted forward");
   snapshot = {"complete", true, false, false, false, false};
-  check(cleanupRecoveryAction(snapshot) ==
-            CleanupRecoveryAction::ClearJournal,
+  check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::ClearJournal,
         "complete clean transaction clears its journal");
   snapshot = {"files_moved", true, true, false, false, true};
   check(cleanupRecoveryAction(snapshot) == CleanupRecoveryAction::Block,
@@ -2589,8 +2587,7 @@ pm::ota_v2::Manifest otaVectorManifest() {
   manifest.download_path =
       "/api/v1/device-firmware/123e4567-e89b-12d3-a456-426614174002/"
       "download?deployment_id=123e4567-e89b-12d3-a456-426614174001";
-  manifest.manifest_hmac =
-      "X5isSei-HPTOld2nWqS5TNgklg8rooUIg7hlix9WuRY";
+  manifest.manifest_hmac = "X5isSei-HPTOld2nWqS5TNgklg8rooUIg7hlix9WuRY";
   return manifest;
 }
 
@@ -2616,8 +2613,7 @@ void testOtaV2Policy() {
       "\"protocol_version\":\"pm-protocol/1.0.0\","
       "\"release_id\":\"123e4567-e89b-12d3-a456-426614174002\","
       "\"schema_version\":\"pm-ota-manifest/2\",\"sha256\":\"" +
-      vector.sha256 +
-      "\",\"size_bytes\":1456789,\"version\":\"1.0.11\"}";
+      vector.sha256 + "\",\"size_bytes\":1456789,\"version\":\"1.0.11\"}";
   check(canonicalManifest(vector) == expected_canonical,
         "OTA v2 canonical bytes match the shared Python vector");
 
@@ -2630,8 +2626,7 @@ void testOtaV2Policy() {
             canonicalManifest(parsed) == expected_canonical,
         "OTA v2 strict manifest parser accepts the normative vector");
   const std::string duplicate =
-      encoded.substr(0U, encoded.size() - 1U) +
-      ",\"attempt\":2}";
+      encoded.substr(0U, encoded.size() - 1U) + ",\"attempt\":2}";
   check(!parseManifest(duplicate, parsed, error),
         "OTA v2 rejects duplicate manifest keys");
   const std::string unexpected =
@@ -2740,36 +2735,204 @@ void testOtaV2Policy() {
             writer.failure() == StreamFailure::PartitionWriteFailure,
         "OTA stream rejects inactive-partition write failure");
 
-  check(classifyPostBoot(true, true, "1.0.11", "target-build", "1.0.11",
-                         "target-build", "1.0.10", "previous-build", true) ==
-            PostBootAction::Validate,
-        "pending OTA image validates only after health and authenticated identity match");
-  check(classifyPostBoot(true, false, "1.0.11", "target-build", "1.0.11",
-                         "target-build", "1.0.10", "previous-build", true) ==
-            PostBootAction::Rollback,
+  PostBootHealthEvidence health_evidence;
+  health_evidence.core_primitives_ready = true;
+  health_evidence.heap_integrity_ok = true;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::RetryableLocalInitialization,
+        "OTA post-boot health defers while local tasks are still starting");
+  health_evidence.observation_window_expired = true;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::FatalLocalRuntime,
+        "OTA post-boot health fails locally stalled tasks after the "
+        "observation window");
+  health_evidence.meter_task_progressed = true;
+  health_evidence.aggregation_task_progressed = true;
+  health_evidence.network_task_progressed = true;
+  health_evidence.sync_task_progressed = true;
+  health_evidence.observation_window_expired = false;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::RetryableLocalInitialization,
+        "OTA post-boot health keeps microSD, PZEM, and network initialization "
+        "retryable before the deadline");
+  health_evidence.observation_window_expired = true;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::LocalInitializationBlocked,
+        "OTA post-boot health blocks without reboot after persistent local "
+        "initialization failure");
+  health_evidence.storage_available = true;
+  health_evidence.meter_hardware_available = true;
+  health_evidence.network_initialized = true;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::HealthyExternalDegraded,
+        "OTA post-boot health ignores only temporary external Wi-Fi, time, and "
+        "server conditions");
+  health_evidence.storage_available = false;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::LocalInitializationBlocked,
+        "OTA post-boot health never misclassifies microSD recovery as external "
+        "degradation");
+  health_evidence.storage_available = true;
+  health_evidence.meter_hardware_available = false;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::LocalInitializationBlocked,
+        "OTA post-boot health never misclassifies PZEM startup as external "
+        "degradation");
+  health_evidence.meter_hardware_available = true;
+  health_evidence.network_initialized = false;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::LocalInitializationBlocked,
+        "OTA post-boot health never misclassifies network subsystem "
+        "initialization as external degradation");
+  health_evidence.network_initialized = true;
+  health_evidence.wifi_connected = true;
+  health_evidence.time_trusted = true;
+  health_evidence.server_reachable = true;
+  check(
+      classifyPostBootHealth(health_evidence) == PostBootHealthClass::Healthy,
+      "OTA post-boot health accepts fully healthy local and external evidence");
+  health_evidence.heap_integrity_ok = false;
+  check(classifyPostBootHealth(health_evidence) ==
+            PostBootHealthClass::FatalLocalRuntime,
+        "OTA post-boot health fails closed on heap-integrity failure");
+
+  check(classifyPostBoot(true, PostBootHealthClass::Healthy, "1.0.11",
+                         "target-build", "1.0.11", "target-build", "1.0.10",
+                         "previous-build", true) == PostBootAction::Validate,
+        "pending OTA image validates only after health and authenticated "
+        "identity match");
+  check(classifyPostBoot(true, PostBootHealthClass::FatalLocalRuntime, "1.0.11",
+                         "target-build", "1.0.11", "target-build", "1.0.10",
+                         "previous-build", true) == PostBootAction::Rollback,
         "pending OTA image rolls back after health failure");
-  check(classifyPostBoot(true, true, "1.0.12", "target-build", "1.0.11",
-                         "target-build", "1.0.10", "previous-build", true) ==
-            PostBootAction::Rollback,
+  check(classifyPostBoot(true, PostBootHealthClass::Healthy, "1.0.12",
+                         "target-build", "1.0.11", "target-build", "1.0.10",
+                         "previous-build", true) == PostBootAction::Rollback,
         "pending OTA image with the wrong running version rolls back");
-  check(classifyPostBoot(true, true, "1.0.11", "wrong-build", "1.0.11",
-                         "target-build", "1.0.10", "previous-build", true) ==
-            PostBootAction::Rollback,
+  check(classifyPostBoot(true, PostBootHealthClass::Healthy, "1.0.11",
+                         "wrong-build", "1.0.11", "target-build", "1.0.10",
+                         "previous-build", true) == PostBootAction::Rollback,
         "same-version pending OTA image with the wrong build hash rolls back");
-  check(classifyPostBoot(true, true, "1.0.11", "target-build", "1.0.11",
-                         "target-build", "1.0.10", "previous-build", false) ==
-            PostBootAction::Rollback,
+  check(classifyPostBoot(true, PostBootHealthClass::Healthy, "1.0.11",
+                         "target-build", "1.0.11", "target-build", "1.0.10",
+                         "previous-build", false) == PostBootAction::Rollback,
         "pending OTA image without authenticated recovery metadata rolls back");
-  check(classifyPostBoot(false, false, "1.0.10", "previous-build", "1.0.11",
-                         "target-build", "1.0.10", "previous-build", true) ==
-            PostBootAction::ReportRollback,
+  check(classifyPostBoot(false, PostBootHealthClass::FatalLocalRuntime,
+                         "1.0.10", "previous-build", "1.0.11", "target-build",
+                         "1.0.10", "previous-build",
+                         true) == PostBootAction::ReportRollback,
         "previous image reports automatic rollback on next boot");
-  check(classifyPostBoot(false, true, "1.0.11", "target-build", "1.0.11",
-                         "target-build", "1.0.10", "previous-build", true) ==
-            PostBootAction::Validate,
-        "already-valid target identity recovers a validation report after a checkpoint gap");
+  check(classifyPostBoot(false, PostBootHealthClass::Healthy, "1.0.11",
+                         "target-build", "1.0.11", "target-build", "1.0.10",
+                         "previous-build", true) == PostBootAction::Validate,
+        "already-valid target identity recovers a validation report after a "
+        "checkpoint gap");
+  check(classifyPostBoot(
+            true, PostBootHealthClass::RetryableLocalInitialization, "1.0.11",
+            "target-build", "1.0.11", "target-build", "1.0.10",
+            "previous-build", true) == PostBootAction::Defer,
+        "pending OTA validation waits for retryable local initialization");
+  check(classifyPostBoot(true, PostBootHealthClass::LocalInitializationBlocked,
+                         "1.0.11", "target-build", "1.0.11", "target-build",
+                         "1.0.10", "previous-build",
+                         true) == PostBootAction::Block,
+        "persistent local initialization blocks validation without scheduling "
+        "a reboot");
+  check(std::string(runningImageCheckResultName(
+            RunningImageCheckResult::ValidationBlocked)) ==
+            "validation_blocked",
+        "OTA exposes a typed non-rebooting local initialization blocker");
+  check(classifyPreServiceRecovery(
+            RunningImageCheckResult::RollbackInitiated) ==
+            PreServiceRecoveryAction::RollbackRebooting,
+        "a successful pre-service rollback mark never boots the candidate");
+  for (const RunningImageCheckResult result : {
+           RunningImageCheckResult::RollbackUnavailable,
+           RunningImageCheckResult::RollbackMarkFailed,
+           RunningImageCheckResult::RecoveryCheckpointFailed,
+           RunningImageCheckResult::PartitionStateUnavailable,
+       }) {
+    check(classifyPreServiceRecovery(result) ==
+              PreServiceRecoveryAction::RestrictedLocalRecovery,
+          "every non-rebooting pre-service rollback outcome enters restricted "
+          "local recovery");
+  }
+
+  PartitionVerificationEvidence partition;
+  partition.expected_present = true;
+  partition.selected_present = true;
+  partition.running_present = true;
+  partition.expected_is_ota_app = true;
+  partition.selected_not_running = true;
+  partition.selected_state_available = true;
+  partition.selected_state_new = true;
+  partition.descriptor_available = true;
+  partition.expected_type = 0U;
+  partition.selected_type = 0U;
+  partition.expected_subtype = 17U;
+  partition.selected_subtype = 17U;
+  partition.expected_address = 0x350000U;
+  partition.selected_address = 0x350000U;
+  partition.expected_size = 0x330000U;
+  partition.selected_size = 0x330000U;
+  partition.expected_label = "ota_1";
+  partition.selected_label = "ota_1";
+  partition.project_name = "power-monitor-sensor";
+  partition.version = "1.0.11";
+  partition.build_hash = "target-build";
+  std::string partition_error;
+  check(validateSelectedPartition(partition, "power-monitor-sensor", "1.0.11",
+                                  "target-build", 0x200000U, partition_error),
+        "OTA boot partition selection requires a complete matching identity");
+  const auto expect_partition_failure =
+      [&](const PartitionVerificationEvidence &changed,
+          const char *expected_error, const char *description) {
+        partition_error.clear();
+        check(!validateSelectedPartition(changed, "power-monitor-sensor",
+                                         "1.0.11", "target-build", 0x200000U,
+                                         partition_error) &&
+                  partition_error == expected_error,
+              description);
+      };
+  auto changed_partition = partition;
+  changed_partition.selected_address += 0x1000U;
+  expect_partition_failure(changed_partition,
+                           "ota_boot_partition_address_mismatch",
+                           "OTA rejects a selected partition address mismatch");
+  changed_partition = partition;
+  changed_partition.selected_label = "ota_0";
+  expect_partition_failure(changed_partition,
+                           "ota_boot_partition_label_mismatch",
+                           "OTA rejects a selected partition label mismatch");
+  changed_partition = partition;
+  changed_partition.selected_subtype = 16U;
+  expect_partition_failure(changed_partition,
+                           "ota_boot_partition_subtype_mismatch",
+                           "OTA rejects a selected partition subtype mismatch");
+  changed_partition = partition;
+  changed_partition.selected_size -= 1U;
+  expect_partition_failure(changed_partition,
+                           "ota_boot_partition_size_mismatch",
+                           "OTA rejects a selected partition size mismatch");
+  changed_partition = partition;
+  changed_partition.selected_not_running = false;
+  expect_partition_failure(
+      changed_partition, "ota_target_partition_is_running",
+      "OTA rejects selecting the currently running partition");
+  changed_partition = partition;
+  changed_partition.selected_state_new = false;
+  expect_partition_failure(
+      changed_partition, "ota_boot_partition_state_invalid",
+      "OTA rejects a partition outside the ESP-IDF NEW state");
+  changed_partition = partition;
+  changed_partition.build_hash = "wrong-build";
+  expect_partition_failure(changed_partition,
+                           "ota_boot_partition_build_hash_mismatch",
+                           "OTA rejects a selected image metadata mismatch");
   check(std::string(reportMilestoneForState(State::DownloadStarting)) ==
                 "download_started" &&
+            std::string(reportMilestoneForState(State::WaitingForSchedule)) ==
+                "waiting_for_schedule" &&
             std::string(reportMilestoneForState(State::BinaryVerifying)) ==
                 "downloading" &&
             std::string(reportMilestoneForState(State::RebootPending)) ==
@@ -2778,17 +2941,22 @@ void testOtaV2Policy() {
                 "rebooting",
         "OTA internal lifecycle states map to the strict server aliases");
   const char *report = nextReportMilestone({}, "validated");
-  bool report_sequence_valid = report != nullptr &&
-                               std::string(report) == "manifest_authenticated";
+  bool report_sequence_valid =
+      report != nullptr && std::string(report) == "manifest_authenticated";
   std::string last_report = report == nullptr ? std::string{} : report;
   constexpr std::array<const char *, 7U> remaining_reports{{
-      "download_started", "downloading", "binary_verified",
-      "partition_written", "rebooting", "post_boot_validation", "validated",
+      "download_started",
+      "downloading",
+      "binary_verified",
+      "partition_written",
+      "rebooting",
+      "post_boot_validation",
+      "validated",
   }};
   for (const char *expected : remaining_reports) {
     report = nextReportMilestone(last_report, "validated");
-    report_sequence_valid =
-        report_sequence_valid && report != nullptr && report == std::string(expected);
+    report_sequence_valid = report_sequence_valid && report != nullptr &&
+                            report == std::string(expected);
     if (report != nullptr)
       last_report = report;
   }
@@ -2800,12 +2968,26 @@ void testOtaV2Policy() {
                                             "rolled_back")) == "rolled_back" &&
             std::string(nextReportMilestone("download_started", "failed")) ==
                 "failed" &&
+            std::string(nextReportMilestone({}, "waiting_for_schedule")) ==
+                "manifest_authenticated" &&
+            std::string(nextReportMilestone("manifest_authenticated",
+                                            "waiting_for_schedule")) ==
+                "waiting_for_schedule" &&
+            nextReportMilestone("waiting_for_schedule",
+                                "waiting_for_schedule") == nullptr &&
+            std::string(nextReportMilestone("manifest_authenticated",
+                                            "download_started")) ==
+                "download_started" &&
+            std::string(nextReportMilestone("waiting_for_schedule",
+                                            "download_started")) ==
+                "download_started" &&
             !reportStateAcceptsFailureEvidence("manifest_authenticated") &&
             !reportStateAcceptsFailureEvidence("rebooting") &&
             reportStateAcceptsFailureEvidence("failed") &&
             reportStateAcceptsFailureEvidence("rollback_detected") &&
             reportStateAcceptsFailureEvidence("rolled_back"),
-        "OTA report checkpoints replay every legal install and rollback transition");
+        "OTA report checkpoints replay every legal install and rollback "
+        "transition");
 
   RecoveryRecord recovery;
   recovery.deployment_id = vector.deployment_id;
@@ -2819,32 +3001,74 @@ void testOtaV2Policy() {
   recovery.bytes_received = vector.size_bytes;
   recovery.progress_percent = 100U;
   recovery.attempt = 1U;
+  recovery.evidence_sequence = 42U;
   recovery.state = State::RebootPending;
   recovery.last_report_state = "partition_written";
   recovery.pending_reboot = true;
   RecoveryRecord restored;
   check(parseRecovery(serializeRecovery(recovery), restored) &&
+            recoveryRecordsEqual(recovery, restored) &&
             restored.pending_reboot && restored.state == State::RebootPending &&
             restored.image_size == vector.size_bytes &&
             restored.bytes_received == vector.size_bytes &&
             restored.progress_percent == 100U &&
+            restored.evidence_sequence == 42U &&
             restored.last_report_state == "partition_written",
-        "OTA recovery preserves pending image and report checkpoints across reset");
+        "OTA recovery preserves pending image and report checkpoints across "
+        "reset");
+  restored.failure_code = "readback-mutated";
+  check(!recoveryRecordsEqual(recovery, restored),
+        "OTA recovery readback detects mutation of any persisted identity or "
+        "state field");
+  std::string legacy_recovery = serializeRecovery(recovery);
+  const std::string evidence_field =
+      "\"evidence_sequence\":" +
+      std::to_string(recovery.evidence_sequence) + ",";
+  const std::size_t evidence_offset = legacy_recovery.find(evidence_field);
+  if (evidence_offset != std::string::npos)
+    legacy_recovery.erase(evidence_offset, evidence_field.size());
+  RecoveryRecord legacy_restored;
+  check(evidence_offset != std::string::npos &&
+            parseRecovery(legacy_recovery, legacy_restored) &&
+            legacy_restored.evidence_sequence == 0U,
+        "OTA recovery accepts legacy records without an evidence sequence");
+  std::string malformed_sequence = serializeRecovery(recovery);
+  constexpr const char *kEvidencePrefix = "\"evidence_sequence\":";
+  const std::size_t malformed_offset = malformed_sequence.find(kEvidencePrefix);
+  if (malformed_offset != std::string::npos)
+    malformed_sequence.replace(
+        malformed_offset + std::strlen(kEvidencePrefix), 2U, "null");
+  RecoveryRecord malformed_restored;
+  check(malformed_offset != std::string::npos &&
+            !parseRecovery(malformed_sequence, malformed_restored),
+        "OTA recovery rejects a present non-integer evidence sequence");
 }
 
 void testOtaFaultInjectionPolicy() {
   using pm::ota_fault::Point;
   using pm::ota_fault::shouldInject;
-  check(shouldInject(0, Point::BeforeFirstByte) &&
-            shouldInject(1, Point::AfterMetadata) &&
-            shouldInject(2, Point::AfterUpdateBegin) &&
-            shouldInject(3, Point::HalfwayThroughDownload) &&
-            shouldInject(4, Point::AfterCompleteDownload) &&
-            shouldInject(5, Point::BeforeUpdateEnd) &&
-            shouldInject(6, Point::AfterUpdateEnd) &&
-            shouldInject(7, Point::BeforeReboot) &&
-            !shouldInject(-1, Point::BeforeReboot),
-        "OTA fault injection selects every major stream boundary without enabling production faults");
+  check(
+      shouldInject(0, Point::BeforeFirstByte) &&
+          shouldInject(1, Point::AfterMetadata) &&
+          shouldInject(2, Point::AfterUpdateBegin) &&
+          shouldInject(3, Point::HalfwayThroughDownload) &&
+          shouldInject(4, Point::AfterCompleteDownload) &&
+          shouldInject(5, Point::BeforeUpdateEnd) &&
+          shouldInject(6, Point::AfterUpdateEnd) &&
+          shouldInject(7, Point::BeforeReboot) &&
+          shouldInject(8, Point::BeforeRecoveryPersist) &&
+          shouldInject(9, Point::AfterRecoveryPersist) &&
+          shouldInject(10, Point::BeforeRecoveryReadback) &&
+          shouldInject(11, Point::RecoveryReadbackMismatch) &&
+          shouldInject(12, Point::AfterBootPartitionSelect) &&
+          shouldInject(13, Point::BeforePostBootValidation) &&
+          shouldInject(14, Point::BeforeMarkValid) &&
+          shouldInject(15, Point::MarkValidFailure) &&
+          shouldInject(16, Point::BeforeRollbackMark) &&
+          shouldInject(17, Point::RollbackMarkFailure) &&
+          !shouldInject(-1, Point::BeforeReboot),
+      "OTA fault injection selects every stream, persistence, boot-selection, "
+      "validation, and rollback boundary without enabling production faults");
 }
 } // namespace
 
@@ -2876,6 +3100,14 @@ int main() {
   testOtaV2Policy();
   testOtaFaultInjectionPolicy();
   testProvisioningTransaction();
+  const auto randomized = pm::randomized_reliability::run();
+  if (!randomized.passed) {
+    std::cerr << "FAIL: " << randomized.failure << '\n';
+    ++failures;
+  } else {
+    std::cout << "randomized reliability sequences=" << randomized.sequences
+              << " events=" << randomized.events << '\n';
+  }
   if (failures == 0) {
     std::cout << "native C++ tests passed\n";
   }

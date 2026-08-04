@@ -215,6 +215,26 @@ components:
         status: {type: string}
         error_count: {type: integer, minimum: 0}
         details: {type: object}
+      additionalProperties: true
+    StorageHealthDetails:
+      type: object
+      properties:
+        history_integrity_verified: {type: [boolean, 'null']}
+        reading_index_integrity_verified: {type: [boolean, 'null']}
+        event_log_integrity_verified: {type: [boolean, 'null']}
+        event_log_integrity_status:
+          type: [string, 'null']
+          enum: [verified, not_scanned, unavailable, event_record_corruption_detected, event_log_open_failed, null]
+      additionalProperties: true
+    StorageSubsystemHealth:
+      type: object
+      required: [ok, status]
+      properties:
+        ok: {type: boolean}
+        status: {type: string}
+        error_count: {type: integer, minimum: 0}
+        details: {$ref: '#/components/schemas/StorageHealthDetails'}
+      additionalProperties: true
     TimeHealth:
       type: object
       required: [trusted, source]
@@ -241,7 +261,7 @@ components:
         protocol_version: {const: pm-protocol/1.0.0}
         schema_version: {const: heartbeat/1.0.0}
         device_id: {type: string, format: uuid}
-        boot_id: {type: string}
+        boot_id: {type: string, format: uuid}
         firmware_version: {type: string}
         firmware_build_hash: {type: string}
         ota: {$ref: '#/components/schemas/OtaCapability'}
@@ -256,15 +276,36 @@ components:
             - {$ref: '#/components/schemas/LiveMeasurement'}
             - {type: 'null'}
         pzem: {$ref: '#/components/schemas/SubsystemHealth'}
-        sd: {$ref: '#/components/schemas/SubsystemHealth'}
+        sd: {$ref: '#/components/schemas/StorageSubsystemHealth'}
         oldest_stored_sequence: {type: integer, minimum: 0}
         oldest_syncable_sequence: {type: integer, minimum: 0, description: Oldest retained durable interval with trustworthy UTC bounds that can be synchronized.}
+        newest_syncable_sequence: {type: integer, minimum: 0}
         newest_stored_sequence: {type: integer, minimum: 0}
         server_ack_sequence: {type: integer, minimum: 0}
+        server_maximum_seen_sequence: {type: integer, minimum: 0}
         backlog_estimate: {type: integer, minimum: 0}
         configuration_version: {type: integer, minimum: 0}
         time: {$ref: '#/components/schemas/TimeHealth'}
-        resources: {type: object}
+        resources:
+          type: object
+          description: Runtime resource evidence. ota_recovery.evidence_sequence is an optional unsigned, per-deployment-attempt monotonic OTA evidence counter emitted by current firmware.
+          properties:
+            ota_recovery:
+              type: object
+              properties:
+                deployment_id: {type: string, format: uuid}
+                attempt: {type: integer, minimum: 1}
+                evidence_sequence:
+                  type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  description: Latest durably persisted OTA evidence sequence for the active deployment attempt.
+              dependentRequired:
+                evidence_sequence: [deployment_id, attempt]
+                deployment_id: [attempt, evidence_sequence]
+                attempt: [deployment_id, evidence_sequence]
+              additionalProperties: true
+          additionalProperties: true
         queue: {type: object}
     HeartbeatResponse:
       type: object
@@ -424,7 +465,11 @@ components:
         attempt: {type: integer, minimum: 1}
         state:
           type: string
-          enum: [manifest_authenticated, download_started, downloading, binary_verified, partition_written, rebooting, post_boot_validation, validated, failed, rollback_detected, rolled_back]
+          enum: [manifest_authenticated, waiting_for_schedule, download_started, downloading, binary_verified, partition_written, rebooting, post_boot_validation, validated, failed, rollback_detected, rolled_back]
+        evidence_sequence:
+          type: integer
+          minimum: 0
+          description: Optional monotonic OTA evidence sequence. Legacy firmware may omit it; retries of the same durable evidence retain the same value.
         current_firmware_version: {type: string, minLength: 1, maxLength: 80}
         current_build_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
         target_version: {type: string, minLength: 1, maxLength: 80}

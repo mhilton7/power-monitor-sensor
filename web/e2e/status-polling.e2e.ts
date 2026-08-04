@@ -347,6 +347,10 @@ test("polls once per 10 seconds for ten virtual minutes without fan-out", async 
 test("bounds two visible clients while a second tab is hidden", async ({
   browser,
 }) => {
+  // WebKit needs more than the suite default to advance ten virtual minutes
+  // across three isolated contexts on slower Windows runners. Keep all sixty
+  // cadence assertions; only bound this multi-context stress test separately.
+  test.setTimeout(60_000);
   const desktopContext = await browser.newContext({
     viewport: { width: 1440, height: 900 },
   });

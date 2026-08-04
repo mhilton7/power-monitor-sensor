@@ -1805,11 +1805,20 @@ void HttpApi::registerReadRoutes() {
         snapshot.storage_mounted = storage.mounted;
         snapshot.storage_writable = storage.writable;
         snapshot.storage_index_healthy = storage.index_healthy;
+        snapshot.storage_event_log_healthy = storage.event_log_healthy;
+        snapshot.storage_event_log_integrity_status =
+            storage.event_log_integrity_status.data();
         snapshot.meter_healthy = meter.last_error == MeterError::None;
         snapshot.sync_in_progress = sync.sync_in_progress;
         snapshot.sync_pending = sync.sync_pending;
         snapshot.durable_reading_backlog = sync.durable_reading_backlog;
-        snapshot.tls_ready = pressure.tls_ready;
+        // Report the admission decision for this exact heap snapshot. The
+        // pressure controller is deliberately hysteretic and may describe an
+        // earlier idle sample; using its cached Boolean here made the public
+        // liveness probe disagree with the next ServerSync TLS preflight.
+        snapshot.tls_ready = memoryTlsReady(
+            heap.free_internal_bytes, heap.largest_internal_block_bytes,
+            heap.integrity_ok);
         snapshot.heap_integrity_ok = heap.integrity_ok;
 
         const LocalHealthSerializationResult serialized =
@@ -1982,6 +1991,10 @@ void HttpApi::registerReadRoutes() {
                document["last_write_utc_ms"] = value.last_write_utc_ms;
                document["last_write_latency_ms"] = value.last_write_latency_ms;
                document["index_healthy"] = value.index_healthy;
+               document["reading_index_healthy"] = value.index_healthy;
+               document["event_log_healthy"] = value.event_log_healthy;
+               document["event_log_integrity_status"] =
+                   value.event_log_integrity_status;
                document["repair_count"] = value.repair_count;
                document["oldest_sequence"] = value.oldest_sequence;
                document["newest_sequence"] = value.newest_sequence;
@@ -2112,6 +2125,16 @@ void HttpApi::registerReadRoutes() {
                document["pending_reboot"] = status.pending_reboot;
                document["rollback_supported"] = status.rollback_supported;
                document["rollback_detected"] = status.rollback_detected;
+               document["restricted_recovery_mode"] =
+                   status.restricted_recovery_mode;
+               document["restricted_incident_durable"] =
+                   status.restricted_incident_durable;
+               document["restricted_incident_report_pending"] =
+                   status.restricted_incident_report_pending;
+               document["restricted_failure_code"] =
+                   status.restricted_failure_code;
+               document["restricted_rollback_result"] =
+                   status.restricted_rollback_result;
                document["bytes_received"] = status.bytes_received;
                document["image_size"] = status.image_size;
                document["progress_percent"] = status.progress_percent;
@@ -2535,6 +2558,19 @@ bool HttpApi::authorize(AsyncWebServerRequest *request,
   const std::uint64_t now = clock_.monotonicMs();
   const BoundedSessionCookie session_cookie = sessionCookie(request);
   const RequestAuthMode mode = classifyAuthMode(request, session_cookie);
+  const std::string request_path = request->url().c_str();
+  const bool restricted_mutation_allowed =
+      request_path == "/api/v1/auth/logout" ||
+      request_path == "/api/v1/config" ||
+      request_path == "/api/v1/network-settings" ||
+      request_path == "/api/v1/actions/reboot" ||
+      request_path == "/api/v1/actions/network-reset" ||
+      request_path == "/api/v1/actions/factory-reset" ||
+      request_path == "/api/v1/actions/rollback-ota" ||
+      request_path == "/api/v1/ota/apply";
+  const bool restricted_mutation_rejected =
+      mutation && ota_.restrictedRecoveryMode() &&
+      !restricted_mutation_allowed;
   PM_LOG_DEBUG("AUTH", "AUTH_MODE_CLASSIFIED",
                "route=%s method=%s mode=%s cookie_present=%s",
                request->url().c_str(), request->methodToString(),
@@ -2670,6 +2706,14 @@ bool HttpApi::authorize(AsyncWebServerRequest *request,
                  mutation ? "true" : "false",
                   require_elevated_local ? "true" : "false");
     diagnostics_.recordBrowserAuth(BrowserAuthMetric::Accepted);
+    if (restricted_mutation_rejected) {
+      sendProblem(
+          request, 409, "ota_restricted_recovery_active",
+          "This unverifiable pending image is running only the local recovery "
+          "surface. Normal measurement, storage, synchronization, and their "
+          "mutations remain disabled until rollback or a verified update.");
+      return false;
+    }
     return true;
   }
 
@@ -2777,6 +2821,13 @@ bool HttpApi::authorize(AsyncWebServerRequest *request,
               "route=%s method=%s nonce=redacted", request->url().c_str(),
               request->methodToString());
   diagnostics_.recordServerHmac(ServerHmacMetric::Accepted);
+  if (restricted_mutation_rejected) {
+    sendProblem(
+        request, 409, "ota_restricted_recovery_active",
+        "This unverifiable pending image accepts only local recovery "
+        "operations until rollback or a verified update.");
+    return false;
+  }
   return true;
 }
 

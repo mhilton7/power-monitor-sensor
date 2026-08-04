@@ -214,11 +214,11 @@ bool exactManifestKeys(const JsonDocument &document) {
 }
 
 bool validReportState(const std::string &value) {
-  static const std::array<const char *, 11U> states{{
-      "manifest_authenticated", "download_started", "downloading",
-      "binary_verified",        "partition_written", "rebooting",
-      "post_boot_validation",   "validated",         "failed",
-      "rollback_detected",      "rolled_back",
+  static const std::array<const char *, 12U> states{{
+      "manifest_authenticated", "waiting_for_schedule", "download_started",
+      "downloading",            "binary_verified",      "partition_written",
+      "rebooting",              "post_boot_validation", "validated",
+      "failed",                 "rollback_detected",    "rolled_back",
   }};
   return value.empty() ||
          std::find_if(states.begin(), states.end(),
@@ -651,6 +651,7 @@ std::string serializeRecovery(const RecoveryRecord &record) {
   document["bytes_received"] = record.bytes_received;
   document["progress_percent"] = record.progress_percent;
   document["attempt"] = record.attempt;
+  document["evidence_sequence"] = record.evidence_sequence;
   document["state"] = stateName(record.state);
   document["last_report_state"] = record.last_report_state;
   document["failure_code"] = record.failure_code;
@@ -703,6 +704,14 @@ bool parseRecovery(const std::string &json, RecoveryRecord &record) {
     return false;
   record.progress_percent = static_cast<std::uint8_t>(progress_percent);
   record.attempt = document["attempt"].as<std::uint32_t>();
+  for (const JsonPairConst property : document.as<JsonObjectConst>()) {
+    if (std::strcmp(property.key().c_str(), "evidence_sequence") != 0)
+      continue;
+    if (!property.value().is<std::uint64_t>())
+      return false;
+    record.evidence_sequence = property.value().as<std::uint64_t>();
+    break;
+  }
   record.last_report_state =
       document["last_report_state"].as<const char *>();
   record.failure_code = document["failure_code"].as<const char *>();
@@ -719,6 +728,26 @@ bool parseRecovery(const std::string &json, RecoveryRecord &record) {
          record.attempt != 0U && parseState(state, record.state) &&
          validReportState(record.last_report_state) &&
          printableAscii(record.failure_code, 96U, true);
+}
+
+bool recoveryRecordsEqual(const RecoveryRecord &left,
+                          const RecoveryRecord &right) {
+  return left.deployment_id == right.deployment_id &&
+         left.release_id == right.release_id &&
+         left.target_version == right.target_version &&
+         left.target_sha256 == right.target_sha256 &&
+         left.target_build_hash == right.target_build_hash &&
+         left.previous_version == right.previous_version &&
+         left.previous_build_hash == right.previous_build_hash &&
+         left.image_size == right.image_size &&
+         left.bytes_received == right.bytes_received &&
+         left.progress_percent == right.progress_percent &&
+         left.attempt == right.attempt &&
+         left.evidence_sequence == right.evidence_sequence &&
+         left.state == right.state &&
+         left.last_report_state == right.last_report_state &&
+         left.failure_code == right.failure_code &&
+         left.pending_reboot == right.pending_reboot;
 }
 
 } // namespace ota_v2

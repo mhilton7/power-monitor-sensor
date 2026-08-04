@@ -229,9 +229,7 @@ class RepositoryHotPathPolicyTests(unittest.TestCase):
         self.assertEqual(check(ROOT), [])
 
     def test_status_response_objects_use_bounded_storage(self) -> None:
-        source = (ROOT / "src" / "api" / "HttpApi.cpp").read_text(
-            encoding="utf-8"
-        )
+        source = (ROOT / "src" / "api" / "HttpApi.cpp").read_text(encoding="utf-8")
         handler = status_handler(source)
         self.assertIn("ui_status_response_objects.acquire()", handler)
         self.assertIn("new (response_storage)", handler)
@@ -265,6 +263,142 @@ class RepositoryHotPathPolicyTests(unittest.TestCase):
         self.assertIn("kRequestCapacity = 20U * 1024U", scratch)
         self.assertIn("kResponseCapacity = 24U * 1024U", scratch)
         self.assertIn("kMaximumResponseBytes = 24U * 1024U", policy)
+
+
+class RuntimeResourceRegressionTests(unittest.TestCase):
+    def test_server_sync_stack_reclaims_dram_with_measured_margin(self) -> None:
+        task_config = (ROOT / "include" / "app" / "TaskConfig.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kServerSyncStackBytes = 20U * 1024U", task_config)
+        # The physical 1.0.15 minimum was 14,612 unused bytes from 24 KiB.
+        # Reclaiming 4 KiB therefore leaves 10,516 bytes (51%) on the same
+        # measured path, well above the repository's mandatory 25% margin.
+        measured_unused = 14_612
+        reclaimed = 4 * 1024
+        new_allocation = 20 * 1024
+        projected_unused = measured_unused - reclaimed
+        self.assertEqual(projected_unused, 10_516)
+        self.assertGreaterEqual(
+            projected_unused * 100 // new_allocation,
+            25,
+        )
+
+    def test_tls_admission_guards_remain_64k_total_and_32k_contiguous(self) -> None:
+        memory_policy = (
+            ROOT / "include" / "core" / "MemoryPressurePolicy.h"
+        ).read_text(encoding="utf-8")
+        sync_policy = (ROOT / "src" / "network" / "ServerSyncPolicy.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kTlsMinimumFreeInternalBytes = 64U * 1024U", memory_policy)
+        self.assertIn(
+            "kTlsMinimumLargestInternalBlockBytes =\n    32U * 1024U",
+            memory_policy,
+        )
+        self.assertIn("kMinimumInternalHeapBytes = 64U * 1024U", sync_policy)
+        self.assertIn("kMinimumLargestInternalBlockBytes = 32U * 1024U", sync_policy)
+
+    def test_local_health_tls_ready_uses_its_current_heap_snapshot(self) -> None:
+        source = (ROOT / "src" / "api" / "HttpApi.cpp").read_text(encoding="utf-8")
+        start = source.index('"/api/local/health"')
+        end = source.index('server_.on("/api/v1/info"', start)
+        local_health = source[start:end]
+        self.assertIn(
+            "snapshot.tls_ready = memoryTlsReady(\n"
+            "            heap.free_internal_bytes, heap.largest_internal_block_bytes,\n"
+            "            heap.integrity_ok);",
+            local_health,
+        )
+        self.assertNotIn("snapshot.tls_ready = pressure.tls_ready", local_health)
+
+    def test_server_sync_runtime_metrics_report_the_created_core(self) -> None:
+        source = (ROOT / "src" / "app" / "Application.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            '{"ServerSyncTask", sync_task_, task_config::kServerSyncStackBytes, 1,',
+            source,
+        )
+        create_start = source.index(
+            'xTaskCreatePinnedToCore(syncTaskEntry, "ServerSyncTask"'
+        )
+        create_end = source.index(";", create_start)
+        self.assertIn("&sync_task_, 1)", source[create_start:create_end])
+
+
+class StorageIntegrityRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (ROOT / "src" / "storage" / "SdStorage.cpp").read_text(
+            encoding="utf-8"
+        )
+        rebuild_start = cls.source.index("bool SdStorage::rebuildIndexes()")
+        rebuild_end = cls.source.index(
+            "SegmentMetadata SdStorage::inspectSegment", rebuild_start
+        )
+        cls.rebuild = cls.source[rebuild_start:rebuild_end]
+        recover_start = cls.source.index("bool SdStorage::recover()")
+        recover_end = cls.source.index("bool SdStorage::recoverFile", recover_start)
+        cls.recover = cls.source[recover_start:recover_end]
+
+    def test_event_corruption_does_not_poison_reading_index_health(self) -> None:
+        self.assertIn("bool reading_index_valid = true;", self.recover)
+        self.assertIn("bool event_log_valid = true;", self.recover)
+        self.assertIn("health_.index_healthy = reading_index_valid;", self.recover)
+        self.assertIn("health_.event_log_healthy = event_log_valid;", self.recover)
+        self.assertIn(
+            "const SegmentMetadata inspected = inspectSegment(path);", self.recover
+        )
+        self.assertIn("inspected.index_valid", self.recover)
+        event_failure = self.recover.index(
+            'event_log_status = "event_record_corruption_detected";'
+        )
+        next_reading_assignment = self.recover.find(
+            "reading_index_valid =", event_failure
+        )
+        self.assertEqual(next_reading_assignment, -1)
+
+    def test_reading_index_rebuild_cannot_clear_event_fault(self) -> None:
+        self.assertIn("health_.index_healthy = ok;", self.rebuild)
+        self.assertNotIn("event_log_healthy =", self.rebuild)
+        self.assertNotIn("event_log_integrity_status =", self.rebuild)
+        self.assertIn("health_.event_log_integrity_status.c_str()", self.rebuild)
+
+    def test_index_replacement_is_staged_verified_and_recoverable(self) -> None:
+        for marker in (
+            'index_path + ".rebuild"',
+            'index_path + ".previous"',
+            "const SegmentMetadata installed = inspectSegment(data_path);",
+            '"INDEX_REBUILD_VERIFY_FAILED"',
+            "action=restore_previous_index",
+        ):
+            self.assertIn(marker, self.rebuild)
+        self.assertNotIn("SD.remove(data_path", self.rebuild)
+        self.assertNotIn("/POWERMON/events", self.rebuild)
+        self.assertNotIn("format", self.rebuild.lower())
+
+    def test_interrupted_index_swap_restores_only_derived_artifacts(self) -> None:
+        cleanup_start = self.source.index("bool SdStorage::recoverCleanupJournal()")
+        cleanup_end = self.source.index(
+            "bool SdStorage::removeSegmentTransactionally", cleanup_start
+        )
+        cleanup = self.source[cleanup_start:cleanup_end]
+        index_artifact_start = cleanup.index("std::vector<std::string> index_backups;")
+        index_artifact_end = cleanup.index(
+            "if (!temporary_recovery_ok)", index_artifact_start
+        )
+        index_artifacts = cleanup[index_artifact_start:index_artifact_end]
+        self.assertIn('collectFiles("/POWERMON/indexes", ".previous"', cleanup)
+        self.assertIn('collectFiles("/POWERMON/indexes", ".rebuild"', cleanup)
+        self.assertIn("SD.rename(backup.c_str(), target.c_str())", cleanup)
+        self.assertNotIn("/POWERMON/events", index_artifacts)
+        self.assertNotIn("/POWERMON/records", index_artifacts)
+
+    def test_mount_never_formats_a_failed_card(self) -> None:
+        self.assertIn(
+            'SD.begin(pins::SD_CS, spi_, candidate_hz, "/sd", 8, false)',
+            self.source,
+        )
+        self.assertIn('"format_on_failure=false"', self.source)
 
 
 if __name__ == "__main__":

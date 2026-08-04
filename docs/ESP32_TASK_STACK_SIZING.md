@@ -21,16 +21,20 @@ of being repeated as numeric literals:
 | Aggregation | 8 KiB |
 | Storage | 12 KiB |
 | Network | 8 KiB |
-| Server synchronization | 24 KiB |
+| Server synchronization | 20 KiB |
 | Health | 12 KiB |
-| Maintenance | 12 KiB |
+| Maintenance | 16 KiB |
 | Serial command | 24 KiB |
 | Password worker (on demand) | 16 KiB |
 
-`ServerSyncTask` remains on core 0 at priority 2. Before this repair it was
-12 KiB on the same core and priority. The larger 24 KiB allocation is a
-measured safety provision for secure-client call depth; it is not the primary
-memory fix. Peak heap ownership was reduced and bounded independently.
+`ServerSyncTask` runs on core 1 at priority 2. Earlier firmware used 16 KiB,
+then conservatively used 24 KiB while transport ownership was made bounded.
+The physical 1.0.15 runtime subsequently measured a 14,612-byte minimum unused
+watermark on the 24 KiB stack. The 20 KiB allocation therefore projects 10,516
+bytes unused (51 percent) for the same path, above the mandatory 25-percent
+margin, while returning one 4 KiB contiguous task-stack allocation to internal
+DRAM. Peak request and response bodies remain fixed in PSRAM. The 64 KiB total
+and 32 KiB contiguous TLS admission guards are unchanged.
 `SerialCommandTask` was first increased from 4 KiB to 8 KiB after the
 baseline diagnostic capture proved that formatting a task/memory report could
 overflow that task. It is now 24 KiB because configuration-changing serial
@@ -61,8 +65,8 @@ It submits bounded history jobs to `StorageTask` through
 `StorageCoordinator`, then polls the result from later scheduler ticks. This
 keeps recursive FAT directory scans and SPI reads off the Wi-Fi core, so a
 large offline backlog cannot starve `NetworkTask` or the core idle task.
-On core 1, `StorageTask` runs at priority 0 while the watchdog-supervised
-`AggregationTask` runs at priority 3. Recovery also yields while scanning
+`StorageTask` runs on core 0 at priority 0, while the watchdog-supervised
+`AggregationTask` runs on core 1 at priority 3. Recovery also yields while scanning
 record bytes and records. Idle priority lets the scheduler service the
 watchdog-monitored idle task while every online task can preempt a slow 400 kHz
 card recovery. This ordering is intentional: recovery must never prevent
@@ -92,7 +96,7 @@ margin_percent = min(high_water_bytes, allocated_bytes)
                  * 100 / allocated_bytes
 ```
 
-For a 24 KiB task, acceptance requires at least 6 KiB of measured high-water
+For a 20 KiB task, acceptance requires at least 5 KiB of measured high-water
 space at the worst tested checkpoint. NetworkTask and ServerSyncTask have a
 30-percent target; other application tasks retain the 25-percent minimum.
 Native/simulated runs can prove configured capacity and modelled margin only.
@@ -118,11 +122,9 @@ an unbounded stack allocation.
 ## Physical verification
 
 Physical results are valid only for the exact source fingerprint and binary
-listed in the release verification record. Earlier ServerSyncTask soak claims
-do not describe the current 24 KiB layout, fixed Status-response pool, or
-PSRAM transport scratch and therefore are not current acceptance evidence.
-
-This repair run is software-only: it records configured/static and simulated
-evidence, builds all ESP32 environments, and does not connect, flash, or
-monitor hardware. Physical task high-water, Wi-Fi, and TLS confirmation remain
-a later deployment-verification step using the exact final ELF.
+listed in the release verification record. The 1.0.15 reading supports the
+20 KiB allocation mathematically, but it is pre-change evidence: it does not
+prove the internal allocator will coalesce the returned stack block or prove
+the final binary's maximum-payload/failure paths. The exact new ELF still
+requires a canary soak before promotion. See the cross-repository benchmark at
+`docs/benchmarks/SENSOR_STABILITY_PERFORMANCE.md` in the server repository.

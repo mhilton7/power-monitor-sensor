@@ -32,6 +32,27 @@ from simulator.protocol import (
 )
 
 
+def _dereference_local_schema(value: object, root: dict[str, object]) -> object:
+    """Resolve document-local JSON Schema/OpenAPI references for parity checks."""
+    if isinstance(value, list):
+        return [_dereference_local_schema(item, root) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if set(value) == {"$ref"}:
+        reference = value["$ref"]
+        if not isinstance(reference, str) or not reference.startswith("#/"):
+            raise AssertionError(
+                f"expected a document-local schema reference: {reference}"
+            )
+        target: object = root
+        for part in reference[2:].split("/"):
+            if not isinstance(target, dict) or part not in target:
+                raise AssertionError(f"unresolved schema reference: {reference}")
+            target = target[part]
+        return _dereference_local_schema(target, root)
+    return {key: _dereference_local_schema(item, root) for key, item in value.items()}
+
+
 class ProtocolContractTests(unittest.TestCase):
     def test_shared_hkdf_and_hmac_vectors(self) -> None:
         vectors = json.loads((ROOT / "shared/fixtures/auth-vectors.json").read_text())
@@ -127,6 +148,75 @@ class ProtocolContractTests(unittest.TestCase):
             invalid = json.loads((ROOT / "shared/fixtures" / invalid_name).read_text())
             self.assertEqual(list(validator.iter_errors(valid)), [], valid_name)
             self.assertNotEqual(list(validator.iter_errors(invalid)), [], invalid_name)
+
+    def test_heartbeat_schema_fixture_openapi_and_runtime_stay_in_lockstep(
+        self,
+    ) -> None:
+        standalone = json.loads(
+            (ROOT / "shared/schemas/heartbeat.schema.json").read_text(encoding="utf-8")
+        )
+        contract = yaml.safe_load(
+            (ROOT / "shared/openapi/server-ingest-api.yaml").read_text(encoding="utf-8")
+        )
+        openapi_heartbeat = contract["components"]["schemas"]["Heartbeat"]
+        standalone_heartbeat = {
+            key: standalone[key] for key in ("type", "required", "properties")
+        }
+        self.assertEqual(
+            _dereference_local_schema(standalone_heartbeat, standalone),
+            _dereference_local_schema(openapi_heartbeat, contract),
+            "standalone heartbeat schema drifted from server-ingest OpenAPI",
+        )
+
+        server_sync = (ROOT / "src/network/ServerSync.cpp").read_text(encoding="utf-8")
+        heartbeat_start = server_sync.index("bool ServerSync::heartbeatBody(")
+        heartbeat_end = server_sync.index(
+            "std::uint32_t ServerSync::heartbeatDelayMs()", heartbeat_start
+        )
+        heartbeat_source = server_sync[heartbeat_start:heartbeat_end]
+        runtime_fields = set(
+            re.findall(r'document\["([a-z0-9_]+)"\]', heartbeat_source)
+        )
+        schema_fields = set(standalone["properties"])
+        self.assertEqual(
+            runtime_fields,
+            schema_fields,
+            "ServerSync heartbeat top-level fields drifted from its schema",
+        )
+
+        valid = json.loads(
+            (ROOT / "shared/fixtures/valid-heartbeat.json").read_text(encoding="utf-8")
+        )
+        invalid = json.loads(
+            (ROOT / "shared/fixtures/invalid-heartbeat.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(set(valid), runtime_fields)
+        self.assertEqual(set(invalid), runtime_fields)
+        self.assertEqual(valid["protocol_version"], "pm-protocol/1.0.0")
+        self.assertEqual(valid["schema_version"], "heartbeat/1.0.0")
+        self.assertNotEqual(invalid["protocol_version"], valid["protocol_version"])
+        self.assertEqual(
+            {key: value for key, value in invalid.items() if key != "protocol_version"},
+            {key: value for key, value in valid.items() if key != "protocol_version"},
+            "invalid heartbeat fixture must isolate the protocol-version failure",
+        )
+
+        server_root = ROOT.parent / "power-monitor"
+        server_schema_path = server_root / "shared/schemas/heartbeat.schema.json"
+        server_fixture_path = server_root / "shared/fixtures/valid-heartbeat.json"
+        if server_schema_path.exists() and server_fixture_path.exists():
+            self.assertEqual(
+                standalone,
+                json.loads(server_schema_path.read_text(encoding="utf-8")),
+                "sensor and server heartbeat schemas diverged",
+            )
+            self.assertEqual(
+                valid,
+                json.loads(server_fixture_path.read_text(encoding="utf-8")),
+                "sensor and server exact-wire heartbeat fixtures diverged",
+            )
 
     def test_openapi_documents_and_path_item_references(self) -> None:
         for path in (ROOT / "shared/openapi").glob("*.yaml"):
@@ -988,9 +1078,9 @@ class ProtocolContractTests(unittest.TestCase):
             'server_.on("/api/v1/info"', local_health_start
         )
         local_health_source = local_api_source[local_health_start:local_health_end]
-        local_health_serializer = (
-            ROOT / "include/api/LocalHealthStatus.h"
-        ).read_text(encoding="utf-8")
+        local_health_serializer = (ROOT / "include/api/LocalHealthStatus.h").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("authorize(request", local_health_source)
         self.assertNotIn("readPage(", local_health_source)
         self.assertNotIn("requestImmediateSync", local_health_source)
@@ -1029,15 +1119,14 @@ class ProtocolContractTests(unittest.TestCase):
             "the OTA workflow lock must not retain a broad TLS-memory lease",
         )
         self.assertNotIn("setInsecure(", ota_source)
-        self.assertIn(
-            'document["firmware_release_available"].as<bool>()', sync_source
-        )
+        self.assertIn('document["firmware_release_available"].as<bool>()', sync_source)
         self.assertIn("sync_policy::manifestPollDeadline", sync_source)
         report_schema = contract["components"]["schemas"]["FirmwareReport"]
         self.assertEqual(
             report_schema["properties"]["state"]["enum"],
             [
                 "manifest_authenticated",
+                "waiting_for_schedule",
                 "download_started",
                 "downloading",
                 "binary_verified",
@@ -1050,6 +1139,16 @@ class ProtocolContractTests(unittest.TestCase):
                 "rolled_back",
             ],
         )
+        self.assertEqual(report_schema["properties"]["evidence_sequence"]["minimum"], 0)
+        heartbeat_schema = contract["components"]["schemas"]["Heartbeat"]
+        heartbeat_recovery = heartbeat_schema["properties"]["resources"]["properties"][
+            "ota_recovery"
+        ]["properties"]
+        self.assertEqual(heartbeat_recovery["deployment_id"]["format"], "uuid")
+        self.assertEqual(heartbeat_recovery["attempt"]["minimum"], 1)
+        heartbeat_sequence = heartbeat_recovery["evidence_sequence"]
+        self.assertEqual(heartbeat_sequence["type"], "integer")
+        self.assertEqual(heartbeat_sequence["minimum"], 0)
         release_generator = (ROOT / "tools/generate_release.py").read_text(
             encoding="utf-8"
         )

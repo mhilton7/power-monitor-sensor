@@ -75,6 +75,8 @@ struct LocalHealthSnapshot {
   bool storage_mounted{false};
   bool storage_writable{false};
   bool storage_index_healthy{false};
+  bool storage_event_log_healthy{false};
+  const char *storage_event_log_integrity_status{"not_scanned"};
   bool meter_healthy{false};
   bool sync_in_progress{false};
   bool sync_pending{false};
@@ -129,6 +131,10 @@ serializeLocalHealth(const LocalHealthSnapshot &value, char *output,
       boolean(writer, first, "storage_mounted", value.storage_mounted) &&
       boolean(writer, first, "storage_writable", value.storage_writable) &&
       boolean(writer, first, "storage_index_healthy", value.storage_index_healthy) &&
+      boolean(writer, first, "storage_event_log_healthy",
+              value.storage_event_log_healthy) &&
+      text(writer, first, "storage_event_log_integrity_status",
+           value.storage_event_log_integrity_status) &&
       boolean(writer, first, "meter_healthy", value.meter_healthy) &&
       text(writer, first, "high_memory_context", value.high_memory_context) &&
       text(writer, first, "high_memory_owner", value.high_memory_context) &&

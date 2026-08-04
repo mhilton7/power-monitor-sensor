@@ -226,6 +226,9 @@ bool SdStorage::remountPreferred() {
   health_.sequence_reconciliation_in_progress = false;
   health_.sequence_conflict = false;
   health_.card_replaced_or_initialized = false;
+  health_.index_healthy = false;
+  health_.event_log_healthy = false;
+  health_.event_log_integrity_status = "not_scanned";
   // Retry the configured speed once after issuing the SD recovery clocks.
   // A CPU-only reset can leave a card mid-transaction: the first standard
   // Arduino initialization may fail even though the same card immediately
@@ -305,7 +308,8 @@ bool SdStorage::remountPreferred() {
   PM_LOG_INFO(
       "SD", "MOUNT_COMPLETE",
       "result=%s card_type=%s filesystem=%s spi_hz=%lu capacity=%llu used=%llu "
-      "free=%llu layout=%s self_test=%s recovery=%s history_integrity=%s "
+      "free=%llu layout=%s self_test=%s recovery=%s reading_index=%s "
+      "event_log=%s event_log_status=%s "
       "next_sequence=%llu sequence_floor=%llu floor_ready=%s card_identity=%s",
       !health_.writable
           ? "failed"
@@ -318,6 +322,8 @@ bool SdStorage::remountPreferred() {
       layout_ok ? "ok" : "failed", self_test_ok ? "ok" : "failed",
       recovery_ok ? "ok" : "failed",
       health_.index_healthy ? "verified" : "degraded_preserved",
+      health_.event_log_healthy ? "verified" : "degraded_preserved",
+      health_.event_log_integrity_status.c_str(),
       static_cast<unsigned long long>(next_sequence_),
       static_cast<unsigned long long>(health_.sequence_floor),
       health_.sequence_floor_ready ? "true" : "false",
@@ -707,56 +713,244 @@ bool SdStorage::rebuildIndexes() {
   std::vector<std::string> files;
   collectFiles("/POWERMON/records", ".pmr", files);
   bool ok = true;
+  std::size_t installed_count = 0U;
   for (const auto &data_path : files) {
-    std::string index_path = data_path;
-    const std::size_t records_pos = index_path.find("/records/");
-    if (records_pos == std::string::npos) {
+    const std::string index_path = pairedIndexPath(data_path);
+    if (index_path.empty()) {
+      ok = false;
       continue;
     }
-    index_path.replace(records_pos, 9, "/indexes/");
-    index_path.replace(index_path.size() - 4, 4, ".idx");
     const std::size_t slash = index_path.find_last_of('/');
-    ensureDirectory(index_path.substr(0, slash));
-    SD.remove(index_path.c_str());
+    if (slash == std::string::npos ||
+        !ensureDirectory(index_path.substr(0, slash))) {
+      ok = false;
+      continue;
+    }
+
+    // A rebuild is a transaction over a derived index only. Recover a backup
+    // left by an interrupted swap before starting, then stage the replacement
+    // beside the live index. The authoritative .pmr file is never renamed,
+    // removed, truncated, or quarantined here.
+    const std::string staged_path = index_path + ".rebuild";
+    const std::string backup_path = index_path + ".previous";
+    if (!SD.exists(index_path.c_str()) && SD.exists(backup_path.c_str()) &&
+        !SD.rename(backup_path.c_str(), index_path.c_str())) {
+      ok = false;
+      continue;
+    }
+    if ((SD.exists(staged_path.c_str()) &&
+         !SD.remove(staged_path.c_str())) ||
+        (SD.exists(backup_path.c_str()) &&
+         !SD.remove(backup_path.c_str()))) {
+      ok = false;
+      continue;
+    }
+
     File input = SD.open(data_path.c_str(), FILE_READ);
+    bool segment_ok = static_cast<bool>(input);
     std::uint64_t offset = 0;
-    while (input && input.available() > 0) {
+    std::uint64_t first_sequence = 0U;
+    std::uint64_t last_sequence = 0U;
+    std::size_t record_count = 0U;
+    while (segment_ok && input && input.available() > 0) {
       std::string line;
+      bool newline = false;
       while (input.available() > 0) {
         const char value = static_cast<char>(input.read());
         line.push_back(value);
         if (value == '\n') {
+          newline = true;
+          break;
+        }
+        if (line.size() > 8192U) {
           break;
         }
       }
       std::string payload;
       std::uint32_t checksum = 0;
-      if (!record::decodeEnvelope(line, payload, checksum)) {
-        ok = false;
-        break;
-      }
       JsonDocument document;
-      if (deserializeJson(document, payload)) {
-        ok = false;
+      if (!newline || !record::decodeEnvelope(line, payload, checksum) ||
+          deserializeJson(document, payload) ||
+          !document["sequence"].is<std::uint64_t>() ||
+          !document["start_utc_ms"].is<std::uint64_t>()) {
+        segment_ok = false;
         break;
       }
-      ok = appendIndex(index_path, document["sequence"].as<std::uint64_t>(),
-                       document["start_utc_ms"].as<std::uint64_t>(), offset,
-                       checksum) &&
-           ok;
+      const std::uint64_t sequence =
+          document["sequence"].as<std::uint64_t>();
+      if (sequence == 0U || (last_sequence != 0U && sequence <= last_sequence)) {
+        segment_ok = false;
+        break;
+      }
+      segment_ok =
+          appendIndex(staged_path, sequence,
+                      document["start_utc_ms"].as<std::uint64_t>(), offset,
+                      checksum);
+      first_sequence = first_sequence == 0U ? sequence : first_sequence;
+      last_sequence = sequence;
+      ++record_count;
       offset += line.size();
+      if (record_count % kCooperativeScanRecords == 0U) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
     }
     if (input) {
       input.close();
     }
+    segment_ok = segment_ok && record_count > 0U;
+
+    // Read both authoritative records and the complete staged index back in
+    // lockstep before replacing the live index. Comparing the exact serialized
+    // row (including newline) verifies every sequence, timestamp, cumulative
+    // byte offset, and envelope checksum without retaining an unbounded table
+    // in RAM. Count/end-point-only validation would miss a corrupted middle
+    // offset and could make a later indexed history read seek to the wrong
+    // record.
+    File authoritative =
+        segment_ok ? SD.open(data_path.c_str(), FILE_READ) : File{};
+    File staged =
+        segment_ok ? SD.open(staged_path.c_str(), FILE_READ) : File{};
+    segment_ok = segment_ok && authoritative && staged;
+    std::size_t verified_count = 0U;
+    std::uint64_t verified_first = 0U;
+    std::uint64_t verified_last = 0U;
+    std::uint64_t verified_offset = 0U;
+    while (segment_ok && authoritative && authoritative.available() > 0) {
+      std::string source_line;
+      bool source_newline = false;
+      while (authoritative.available() > 0) {
+        const char value = static_cast<char>(authoritative.read());
+        source_line.push_back(value);
+        if (value == '\n') {
+          source_newline = true;
+          break;
+        }
+        if (source_line.size() > 8192U)
+          break;
+      }
+      std::string payload;
+      std::uint32_t source_checksum = 0U;
+      JsonDocument document;
+      if (!source_newline ||
+          !record::decodeEnvelope(source_line, payload, source_checksum) ||
+          deserializeJson(document, payload) ||
+          !document["sequence"].is<std::uint64_t>() ||
+          !document["start_utc_ms"].is<std::uint64_t>()) {
+        segment_ok = false;
+        break;
+      }
+
+      std::string staged_line;
+      bool staged_newline = false;
+      while (staged && staged.available() > 0) {
+        const char value = static_cast<char>(staged.read());
+        staged_line.push_back(value);
+        if (value == '\n') {
+          staged_newline = true;
+          break;
+        }
+        if (staged_line.size() >= 96U)
+          break;
+      }
+      const std::uint64_t source_sequence =
+          document["sequence"].as<std::uint64_t>();
+      const std::uint64_t source_timestamp =
+          document["start_utc_ms"].as<std::uint64_t>();
+      char expected_line[96]{};
+      const int expected_length = std::snprintf(
+          expected_line, sizeof(expected_line), "%llu,%llu,%llu,%08x\n",
+          static_cast<unsigned long long>(source_sequence),
+          static_cast<unsigned long long>(source_timestamp),
+          static_cast<unsigned long long>(verified_offset), source_checksum);
+      if (!staged_newline || expected_length <= 0 ||
+          static_cast<std::size_t>(expected_length) >= sizeof(expected_line) ||
+          staged_line.size() != static_cast<std::size_t>(expected_length) ||
+          staged_line.compare(0U, staged_line.size(), expected_line,
+                              static_cast<std::size_t>(expected_length)) != 0) {
+        segment_ok = false;
+        break;
+      }
+      verified_first =
+          verified_first == 0U ? source_sequence : verified_first;
+      verified_last = source_sequence;
+      ++verified_count;
+      verified_offset += source_line.size();
+      if (verified_count % kCooperativeScanRecords == 0U)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (authoritative) {
+      authoritative.close();
+    }
+    const bool staged_has_extra = staged && staged.available() > 0;
+    if (staged) {
+      staged.close();
+    }
+    segment_ok = segment_ok && !staged_has_extra &&
+                 verified_count == record_count &&
+                 verified_first == first_sequence &&
+                 verified_last == last_sequence && verified_offset == offset;
+    if (!segment_ok) {
+      SD.remove(staged_path.c_str());
+      ok = false;
+      PM_LOG_ERROR("SD", "INDEX_REBUILD_STAGE_FAILED",
+                   "error=PM-SD-028 source=%s action=preserve_existing_index",
+                   data_path.c_str());
+      continue;
+    }
+
+    const bool had_index = SD.exists(index_path.c_str());
+    if ((had_index &&
+         !SD.rename(index_path.c_str(), backup_path.c_str())) ||
+        !SD.rename(staged_path.c_str(), index_path.c_str())) {
+      SD.remove(staged_path.c_str());
+      if (had_index && !SD.exists(index_path.c_str())) {
+        SD.rename(backup_path.c_str(), index_path.c_str());
+      }
+      ok = false;
+      PM_LOG_ERROR("SD", "INDEX_REBUILD_INSTALL_FAILED",
+                   "error=PM-SD-029 source=%s action=restore_previous_index",
+                   data_path.c_str());
+      continue;
+    }
+
+    const SegmentMetadata installed = inspectSegment(data_path);
+    if (!installed.complete || !installed.index_valid ||
+        installed.record_count != record_count ||
+        installed.first_sequence != first_sequence ||
+        installed.last_sequence != last_sequence) {
+      SD.remove(index_path.c_str());
+      if (had_index) {
+        SD.rename(backup_path.c_str(), index_path.c_str());
+      }
+      ok = false;
+      PM_LOG_ERROR("SD", "INDEX_REBUILD_VERIFY_FAILED",
+                   "error=PM-SD-030 source=%s action=restore_previous_index",
+                   data_path.c_str());
+      continue;
+    }
+    if (!persistSegmentMetadata(installed)) {
+      // The verified index remains safe and discoverable. A later boot will
+      // conservatively rescan it because the metadata cache was not refreshed.
+      ok = false;
+      PM_LOG_WARN("SD", "INDEX_REBUILD_METADATA_DEFERRED",
+                  "error=PM-SD-031 source=%s action=rescan_on_next_boot",
+                  data_path.c_str());
+    }
+    SD.remove(backup_path.c_str());
+    ++installed_count;
   }
   health_.index_healthy = ok;
   if (ok) {
     ++health_.repair_count;
   }
   PM_LOG_INFO("SD", "INDEX_REBUILD_COMPLETE",
-              "result=%s files=%u repair_count=%lu", ok ? "success" : "failed",
+              "result=%s files=%u installed=%u event_log=%s "
+              "event_log_status=%s repair_count=%lu",
+              ok ? "success" : "failed",
               static_cast<unsigned>(files.size()),
+              static_cast<unsigned>(installed_count),
+              health_.event_log_healthy ? "verified" : "degraded_preserved",
+              health_.event_log_integrity_status.c_str(),
               static_cast<unsigned long>(health_.repair_count));
   unlock();
   return ok;
@@ -1120,6 +1314,25 @@ bool SdStorage::recoverCleanupJournal() {
         (SD.exists(target.c_str()) ? SD.remove(temporary.c_str())
                                   : SD.rename(temporary.c_str(), target.c_str())) &&
         temporary_recovery_ok;
+  }
+  // Recover an interrupted derived-index swap before reading segment
+  // metadata. A previous index wins when no installed target exists; staged
+  // rebuild files are never authoritative and can be discarded. Neither path
+  // touches a .pmr reading or an event envelope.
+  std::vector<std::string> index_backups;
+  collectFiles("/POWERMON/indexes", ".previous", index_backups);
+  for (const auto &backup : index_backups) {
+    const std::string target =
+        backup.substr(0U, backup.size() - std::strlen(".previous"));
+    temporary_recovery_ok =
+        (SD.exists(target.c_str()) ? SD.remove(backup.c_str())
+                                  : SD.rename(backup.c_str(), target.c_str())) &&
+        temporary_recovery_ok;
+  }
+  std::vector<std::string> staged_indexes;
+  collectFiles("/POWERMON/indexes", ".rebuild", staged_indexes);
+  for (const auto &staged : staged_indexes) {
+    temporary_recovery_ok = SD.remove(staged.c_str()) && temporary_recovery_ok;
   }
   if (!temporary_recovery_ok) {
     health_.last_error = "temporary_artifact_recovery_failed";
@@ -1761,6 +1974,7 @@ HeartbeatStorageHealth SdStorage::heartbeatHealth() const {
     output.last_self_test_passed = source.last_self_test_passed;
     output.card_replaced_or_initialized = source.card_replaced_or_initialized;
     output.index_healthy = source.index_healthy;
+    output.event_log_healthy = source.event_log_healthy;
     output.acknowledgement_verified = source.acknowledgement_verified;
     output.cleanup_in_progress = source.cleanup_in_progress;
     output.cleanup_recovery_required = source.cleanup_recovery_required;
@@ -1818,6 +2032,8 @@ HeartbeatStorageHealth SdStorage::heartbeatHealth() const {
     copy_text(output.pressure_reason, source.pressure_reason);
     copy_text(output.last_cleanup_result, source.last_cleanup_result);
     copy_text(output.last_cleanup_reason, source.last_cleanup_reason);
+    copy_text(output.event_log_integrity_status,
+              source.event_log_integrity_status);
     copy_text(output.last_error, source.last_error);
     return output;
   };
@@ -2065,7 +2281,7 @@ bool SdStorage::recover() {
   std::sort(files.begin(), files.end());
   PM_LOG_INFO("SD", "RECOVERY_SCAN_BEGIN", "record_files=%u",
               static_cast<unsigned>(files.size()));
-  bool all_valid = true;
+  bool reading_index_valid = true;
   health_.oldest_sequence = 0U;
   health_.oldest_syncable_sequence = 0;
   health_.newest_syncable_sequence = 0;
@@ -2102,7 +2318,10 @@ bool SdStorage::recover() {
           static_cast<unsigned long long>(metadata.last_sequence),
           static_cast<unsigned long>(metadata.record_count));
     } else {
-      all_valid = recoverFile(path, maximum_sequence) && all_valid;
+      const bool record_valid = recoverFile(path, maximum_sequence);
+      const SegmentMetadata inspected = inspectSegment(path);
+      reading_index_valid = record_valid && inspected.complete &&
+                            inspected.index_valid && reading_index_valid;
     }
     vTaskDelay(pdMS_TO_TICKS(1));
   }
@@ -2133,6 +2352,8 @@ bool SdStorage::recover() {
   health_.newest_sequence = maximum_sequence;
   std::uint64_t maximum_event_sequence = 0U;
   std::uint64_t minimum_event_sequence = 0U;
+  bool event_log_valid = true;
+  const char *event_log_status = "verified";
   std::vector<std::string> event_files;
   collectFiles("/POWERMON/events", ".events", event_files);
   for (const auto &path : event_files) {
@@ -2149,6 +2370,16 @@ bool SdStorage::recover() {
       continue;
     }
     File event_file = SD.open(path.c_str(), FILE_READ);
+    if (!event_file) {
+      event_log_valid = false;
+      event_log_status = "event_log_open_failed";
+      health_.last_error = event_log_status;
+      PM_LOG_ERROR("SD", "EVENT_LOG_OPEN_FAILED",
+                   "error=PM-SD-026 file=%s action=preserve_no_rewrite",
+                   path.c_str());
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
     std::size_t scanned_event_records = 0U;
     while (event_file && event_file.available() > 0) {
       const String raw = event_file.readStringUntil('\n');
@@ -2158,8 +2389,12 @@ bool SdStorage::recover() {
       if (!record::decodeEnvelope(raw.c_str(), event_payload, event_checksum) ||
           deserializeJson(event_document, event_payload) ||
           !event_document["event_sequence"].is<std::uint64_t>()) {
-        all_valid = false;
-        health_.last_error = "event_record_corruption_detected";
+        event_log_valid = false;
+        event_log_status = "event_record_corruption_detected";
+        health_.last_error = event_log_status;
+        PM_LOG_ERROR("SD", "EVENT_RECORD_CORRUPTION_DETECTED",
+                     "error=PM-SD-027 file=%s action=preserve_no_rewrite",
+                     path.c_str());
         break;
       }
       const std::uint64_t sequence =
@@ -2190,16 +2425,25 @@ bool SdStorage::recover() {
       std::max(maximum_event_sequence, event_journal_sequence) + 1U;
   health_.oldest_event_sequence = minimum_event_sequence;
   health_.newest_event_sequence = maximum_event_sequence;
-  // Reading and event history share the public integrity state. Publish it
-  // only after both scans so an event-record fault cannot be mislabeled as a
-  // fully verified card in MOUNT_COMPLETE or the heartbeat health payload.
-  health_.index_healthy = all_valid;
+  // Reading indexes and event evidence intentionally have independent
+  // integrity states. Events are never part of reading batch selection, and
+  // a damaged event envelope must not relabel valid unacknowledged readings
+  // as corrupt. Conversely, an index rebuild must not clear this separately
+  // retained event fault.
+  health_.index_healthy = reading_index_valid;
+  health_.event_log_healthy = event_log_valid;
+  health_.event_log_integrity_status = event_log_status;
   PM_LOG_INFO("SD", "RECOVERY_SCAN_COMPLETE",
-              "result=%s files=%u oldest_sequence=%llu newest_sequence=%llu "
+              "result=%s files=%u reading_index=%s event_log=%s "
+              "event_log_status=%s oldest_sequence=%llu newest_sequence=%llu "
               "oldest_syncable_sequence=%llu journal_sequence=%llu "
               "next_sequence=%llu repairs=%lu",
-              all_valid ? "success" : "corruption_detected",
+              reading_index_valid && event_log_valid ? "success"
+                                                     : "degraded_preserved",
               static_cast<unsigned>(files.size()),
+              reading_index_valid ? "verified" : "degraded_preserved",
+              event_log_valid ? "verified" : "degraded_preserved",
+              event_log_status,
               static_cast<unsigned long long>(health_.oldest_sequence),
               static_cast<unsigned long long>(health_.newest_sequence),
               static_cast<unsigned long long>(

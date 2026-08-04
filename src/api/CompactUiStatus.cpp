@@ -283,6 +283,8 @@ CompactUiSerializationResult serializeCompactUiStatus(
                 snapshot.ota.lifecycle_stack_high_water_bytes) &&
             writer.literal(",\"rollback_detected\":") &&
             writer.boolean(snapshot.ota.rollback_detected) &&
+            writer.literal(",\"restricted_recovery_mode\":") &&
+            writer.boolean(snapshot.ota.restricted_recovery_mode) &&
             writer.literal("}}") &&
             writer.ok();
   return {writer.size(), ok};

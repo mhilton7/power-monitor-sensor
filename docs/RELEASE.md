@@ -13,7 +13,7 @@
 5. Generate the existing-trust bundle, for example:
 
    ```sh
-   python tools/generate_release.py --skip-build --version 1.0.12 --channel stable
+   python tools/generate_release.py --skip-build --version 1.0.16 --channel stable
    ```
 
    The generator verifies current source/build provenance and strict embedded

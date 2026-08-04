@@ -24,7 +24,11 @@ struct StorageHealth {
   bool sequence_conflict{false};
   bool last_self_test_passed{false};
   bool card_replaced_or_initialized{false};
+  // Backward-compatible reading-record/index integrity. Event evidence has
+  // its own state so a damaged diagnostic envelope cannot make a valid,
+  // unacknowledged measurement backlog look corrupt.
   bool index_healthy{false};
+  bool event_log_healthy{false};
   std::uint64_t capacity_bytes{0};
   std::uint64_t used_bytes{0};
   std::uint64_t free_bytes{0};
@@ -88,6 +92,7 @@ struct StorageHealth {
   std::string pressure_reason{"not_initialized"};
   std::string last_cleanup_result{"never"};
   std::string last_cleanup_reason;
+  std::string event_log_integrity_status{"not_scanned"};
   std::string last_error;
 };
 
@@ -115,6 +120,7 @@ struct HeartbeatStorageHealth {
   bool last_self_test_passed{false};
   bool card_replaced_or_initialized{false};
   bool index_healthy{false};
+  bool event_log_healthy{false};
   bool acknowledgement_verified{false};
   bool cleanup_in_progress{false};
   bool cleanup_recovery_required{false};
@@ -162,6 +168,7 @@ struct HeartbeatStorageHealth {
   std::array<char, 48> last_cleanup_result{};
   // Remote cleanup reasons are contract-bounded to 500 bytes.
   std::array<char, 512> last_cleanup_reason{};
+  std::array<char, 48> event_log_integrity_status{};
   std::array<char, 192> last_error{};
   bool truncated{false};
 };

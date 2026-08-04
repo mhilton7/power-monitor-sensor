@@ -100,6 +100,9 @@ struct RecoveryRecord {
   std::uint32_t bytes_received{0U};
   std::uint8_t progress_percent{0U};
   std::uint32_t attempt{0};
+  // Monotonic per deployment attempt. It orders durable OTA evidence across
+  // reports and heartbeats without changing the shared device protocol.
+  std::uint64_t evidence_sequence{0U};
   State state{State::Idle};
   std::string last_report_state;
   std::string failure_code;
@@ -108,6 +111,8 @@ struct RecoveryRecord {
 
 std::string serializeRecovery(const RecoveryRecord &record);
 bool parseRecovery(const std::string &json, RecoveryRecord &record);
+bool recoveryRecordsEqual(const RecoveryRecord &left,
+                          const RecoveryRecord &right);
 
 } // namespace ota_v2
 } // namespace pm

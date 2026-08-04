@@ -127,6 +127,26 @@ function Get-CounterDelta {
     return $delta
 }
 
+function Get-Maximum {
+    param([object[]]$Values)
+    $numbers = @($Values | ForEach-Object { Convert-ToNullableInt64 $_ } |
+        Where-Object { $null -ne $_ })
+    if ($numbers.Count -eq 0) {
+        return $null
+    }
+    return ($numbers | Measure-Object -Maximum).Maximum
+}
+
+function Get-Minimum {
+    param([object[]]$Values)
+    $numbers = @($Values | ForEach-Object { Convert-ToNullableInt64 $_ } |
+        Where-Object { $null -ne $_ })
+    if ($numbers.Count -eq 0) {
+        return $null
+    }
+    return ($numbers | Measure-Object -Minimum).Minimum
+}
+
 function Get-RecoverySeconds {
     param([object[]]$Rows)
     $recoveries = [System.Collections.Generic.List[double]]::new()
@@ -216,11 +236,16 @@ try {
                     UptimeSeconds = Get-PathValue $health @("uptime_seconds")
                     BootId = Get-PathValue $health @("boot_id", "identity.boot_id")
                     FirmwareVersion = Get-PathValue $health @("firmware_version", "identity.firmware_version")
-                    FirmwareBuildHash = Get-PathValue $health @("firmware_build_hash", "build_hash", "identity.firmware_build_hash")
+                    FirmwareBuildHash = Get-PathValue $health @("firmware_build_hash", "build_hash", "git_commit", "identity.firmware_build_hash")
                     TimeTrusted = Get-PathValue $health @("time_trusted")
                     WiFiConnected = Get-PathValue $health @("wifi_connected")
                     RSSI = Get-PathValue $health @("rssi", "rssi_dbm", "network.rssi_dbm")
                     StorageWritable = Get-PathValue $health @("storage_writable")
+                    StoragePresent = Get-PathValue $health @("storage_present")
+                    StorageMounted = Get-PathValue $health @("storage_mounted")
+                    StorageIndexHealthy = Get-PathValue $health @("storage_index_healthy")
+                    StorageEventLogHealthy = Get-PathValue $health @("storage_event_log_healthy")
+                    StorageEventLogIntegrityStatus = Get-PathValue $health @("storage_event_log_integrity_status")
                     MeterHealthy = Get-PathValue $health @("meter_healthy")
                     FreeTotalHeapBytes = Get-PathValue $health @("free_total_heap_bytes", "free_heap_bytes", "memory.free_total_heap_bytes")
                     FreeInternalHeapBytes = $freeInternal
@@ -239,11 +264,24 @@ try {
                     MemoryOperationContext = Get-PathValue $health @("memory_operation_context", "memory.operation_context")
                     MemoryState = Get-PathValue $health @("memory_state", "memory.state")
                     MemorySeverity = Get-PathValue $health @("memory_severity", "memory.severity")
+                    HeapIntegrityOk = Get-PathValue $health @("heap_integrity_ok", "memory.heap_integrity_ok")
                     HeartbeatSuccesses = Get-PathValue $health @("heartbeat_successes")
                     HeartbeatFailures = Get-PathValue $health @("heartbeat_failures")
                     HeartbeatTransportFailures = Get-PathValue $health @("heartbeat_transport_failures")
                     HeartbeatContractFailures = Get-PathValue $health @("heartbeat_contract_failures")
                     HeartbeatAuthenticationFailures = Get-PathValue $health @("heartbeat_authentication_failures")
+                    LastHeartbeatUtcMs = Get-PathValue $health @("last_heartbeat_utc_ms")
+                    LastHeartbeatAttemptMonotonicMs = Get-PathValue $health @("last_heartbeat_attempt_monotonic_ms")
+                    LastHeartbeatSuccessMonotonicMs = Get-PathValue $health @("last_heartbeat_success_monotonic_ms")
+                    HeartbeatSuccessAgeMs = if (
+                        $null -ne (Convert-ToNullableInt64 (Get-PathValue $health @("uptime_seconds"))) -and
+                        $null -ne (Convert-ToNullableInt64 (Get-PathValue $health @("last_heartbeat_success_monotonic_ms")))) {
+                        [math]::Max(
+                            0,
+                            ((Convert-ToNullableInt64 (Get-PathValue $health @("uptime_seconds"))) * 1000) -
+                            (Convert-ToNullableInt64 (Get-PathValue $health @("last_heartbeat_success_monotonic_ms")))
+                        )
+                    } else { $null }
                     TlsRequestsAdmitted = Get-PathValue $health @("tls_requests_admitted")
                     TlsRequestsRejectedHeap = Get-PathValue $health @("tls_requests_rejected_heap")
                     FragmentationDeferrals = Get-PathValue $health @("fragmentation_deferrals")
@@ -252,7 +290,12 @@ try {
                     ReadingBatchFailures = Get-PathValue $health @("reading_batch_failures")
                     EventBatchSuccesses = Get-PathValue $health @("event_batch_successes")
                     EventBatchFailures = Get-PathValue $health @("event_batch_failures")
+                    TransactionsStarted = Get-PathValue $health @("transactions_started")
+                    TransactionsCompleted = Get-PathValue $health @("transactions_completed")
+                    TransactionsFailed = Get-PathValue $health @("transactions_failed")
                     ServerAckSequence = Get-PathValue $health @("server_ack_sequence")
+                    OldestStoredSequence = Get-PathValue $health @("oldest_stored_sequence")
+                    OldestSyncableSequence = Get-PathValue $health @("oldest_syncable_sequence")
                     NewestStoredSequence = Get-PathValue $health @("newest_stored_sequence")
                     NewestSyncableSequence = Get-PathValue $health @("newest_syncable_sequence")
                     LastHeartbeatResult = Get-PathValue $health @("last_heartbeat_result")
@@ -260,6 +303,12 @@ try {
                     LastSyncError = Get-PathValue $health @("last_sync_error")
                     OtaState = Get-PathValue $health @("ota_state", "ota.state")
                     OtaReportPending = Get-PathValue $health @("ota_report_pending", "ota.report_pending")
+                    StackHighWaterBytes = Get-PathValue $health @("stack_high_water_bytes")
+                    StackMarginPercent = Get-PathValue $health @("stack_margin_percent")
+                    StorageQueueDepth = Get-PathValue $health @("storage_queue_depth")
+                    ActionQueueDepth = Get-PathValue $health @("action_queue_depth")
+                    StorageDropped = Get-PathValue $health @("storage_dropped")
+                    ActionDropped = Get-PathValue $health @("action_dropped")
                     RecordPoolCapacity = Get-PathValue $health @("record_pool_capacity")
                     RecordPoolActive = Get-PathValue $health @("record_pool_active")
                     RecordPoolPeak = Get-PathValue $health @("record_pool_peak")
@@ -320,6 +369,13 @@ foreach ($entry in $Sensors.GetEnumerator()) {
         })
     $activeRows = @($sensorRows | Where-Object Classification -eq "TLS_ACTIVE_TRANSIENT")
     $recoveries = @(Get-RecoverySeconds $sensorRows)
+    $comparisonWindow = [math]::Max(1, [math]::Floor($idleRows.Count / 10))
+    $initialIdleRows = @($idleRows | Select-Object -First $comparisonWindow)
+    $finalIdleRows = @($idleRows | Select-Object -Last $comparisonWindow)
+    $initialFreeMedian = Get-Median @($initialIdleRows | ForEach-Object { $_.FreeInternalHeapBytes })
+    $finalFreeMedian = Get-Median @($finalIdleRows | ForEach-Object { $_.FreeInternalHeapBytes })
+    $initialLargestMedian = Get-Median @($initialIdleRows | ForEach-Object { $_.LargestInternalBlockBytes })
+    $finalLargestMedian = Get-Median @($finalIdleRows | ForEach-Object { $_.LargestInternalBlockBytes })
     $classCounts = [ordered]@{}
     foreach ($group in ($sensorRows | Group-Object Classification)) {
         $classCounts[$group.Name] = $group.Count
@@ -331,15 +387,36 @@ foreach ($entry in $Sensors.GetEnumerator()) {
         classifications = $classCounts
         idle_free_internal_median = Get-Median @($idleRows | ForEach-Object { $_.FreeInternalHeapBytes })
         idle_largest_block_median = Get-Median @($idleRows | ForEach-Object { $_.LargestInternalBlockBytes })
+        initial_idle_free_internal_median = $initialFreeMedian
+        final_idle_free_internal_median = $finalFreeMedian
+        final_to_initial_free_internal_ratio = if ($initialFreeMedian -gt 0) { $finalFreeMedian / $initialFreeMedian } else { $null }
+        initial_idle_largest_block_median = $initialLargestMedian
+        final_idle_largest_block_median = $finalLargestMedian
+        final_to_initial_largest_block_ratio = if ($initialLargestMedian -gt 0) { $finalLargestMedian / $initialLargestMedian } else { $null }
         minimum_idle_largest_block = if ($idleRows.Count) { ($idleRows | ForEach-Object { $_.LargestInternalBlockBytes } | Measure-Object -Minimum).Minimum } else { $null }
         active_tls_minimum_free_internal = if ($activeRows.Count) { ($activeRows | ForEach-Object { $_.FreeInternalHeapBytes } | Measure-Object -Minimum).Minimum } else { $null }
         active_tls_minimum_largest_block = if ($activeRows.Count) { ($activeRows | ForEach-Object { $_.LargestInternalBlockBytes } | Measure-Object -Minimum).Minimum } else { $null }
         post_tls_recovery_seconds = $recoveries
         heartbeat_increase = Get-CounterDelta $sensorRows "HeartbeatSuccesses"
         heartbeat_failure_increase = Get-CounterDelta $sensorRows "HeartbeatFailures"
+        maximum_heartbeat_success_age_ms = Get-Maximum @($sensorRows | ForEach-Object { $_.HeartbeatSuccessAgeMs })
         reading_batch_increase = Get-CounterDelta $sensorRows "ReadingBatchSuccesses"
         reading_batch_failure_increase = Get-CounterDelta $sensorRows "ReadingBatchFailures"
         tls_heap_rejection_increase = Get-CounterDelta $sensorRows "TlsRequestsRejectedHeap"
+        transaction_failure_increase = Get-CounterDelta $sensorRows "TransactionsFailed"
+        storage_drop_increase = Get-CounterDelta $sensorRows "StorageDropped"
+        action_drop_increase = Get-CounterDelta $sensorRows "ActionDropped"
+        record_pool_exhaustion_increase = Get-CounterDelta $sensorRows "RecordPoolExhaustions"
+        event_pool_exhaustion_increase = Get-CounterDelta $sensorRows "EventPoolExhaustions"
+        maximum_storage_queue_depth = Get-Maximum @($sensorRows | ForEach-Object { $_.StorageQueueDepth })
+        maximum_action_queue_depth = Get-Maximum @($sensorRows | ForEach-Object { $_.ActionQueueDepth })
+        minimum_stack_high_water_bytes = Get-Minimum @($sensorRows | ForEach-Object { $_.StackHighWaterBytes })
+        minimum_stack_margin_percent = Get-Minimum @($sensorRows | ForEach-Object { $_.StackMarginPercent })
+        heap_integrity_failures = @($sensorRows | Where-Object HeapIntegrityOk -eq $false).Count
+        storage_unmounted_samples = @($sensorRows | Where-Object StorageMounted -eq $false).Count
+        storage_unwritable_samples = @($sensorRows | Where-Object StorageWritable -eq $false).Count
+        meter_unhealthy_samples = @($sensorRows | Where-Object MeterHealthy -eq $false).Count
+        event_log_unhealthy_samples = @($sensorRows | Where-Object StorageEventLogHealthy -eq $false).Count
         backlog_first = if ($sensorRows.Count) { $sensorRows[0].DurableBacklogCount } else { $null }
         backlog_last = if ($sensorRows.Count) { $sensorRows[-1].DurableBacklogCount } else { $null }
         boot_ids = @($sensorRows | ForEach-Object { $_.BootId } | Where-Object { $_ } | Sort-Object -Unique)

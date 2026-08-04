@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import secrets
 import shutil
@@ -22,6 +23,14 @@ from release_integrity import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def release_generated_utc() -> str:
+    """Return a reproducible generation timestamp when the build epoch is pinned."""
+    source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if source_date_epoch is not None:
+        return datetime.fromtimestamp(int(source_date_epoch), timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def existing_trust_metadata(
@@ -176,7 +185,7 @@ def main() -> None:
             newline="\n",
         )
         dependency = {
-            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "generated_utc": release_generated_utc(),
             "platform": "espressif32@6.13.0",
             "arduino_esp32": "2.0.17",
             "libraries": [

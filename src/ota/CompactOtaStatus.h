@@ -37,6 +37,7 @@ struct CompactOtaStatus {
   bool previous_boot_update_open{false};
   bool previous_boot_reboot_expected{false};
   bool rollback_detected{false};
+  bool restricted_recovery_mode{false};
   bool truncated{false};
 };
 

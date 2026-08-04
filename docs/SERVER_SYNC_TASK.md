@@ -2,7 +2,7 @@
 
 `ServerSyncTask` is the only owner of active central-server DNS, TLS, HTTP,
 response-stream, heartbeat, reading-upload, event-upload, remote-configuration,
-and firmware-manifest operations. It runs on core 0 at priority 2. AsyncTCP,
+and firmware-manifest operations. It runs on core 1 at priority 2. AsyncTCP,
 the WebUI, Wi-Fi callbacks, the meter task, and the storage task never execute
 central-server transport work.
 

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <limits>
 
 #include <ArduinoJson.h>
 #include <ESP.h>
@@ -20,6 +21,7 @@
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
 
+#include "api/BoundedJsonWriter.h"
 #include "diagnostics/SerialLogger.h"
 #include "network/ResolvedTlsClient.h"
 #include "ota/OtaFaultInjection.h"
@@ -62,6 +64,26 @@ public:
 
 private:
   std::uint8_t *data_{nullptr};
+};
+
+class OtaWorkflowLock final {
+public:
+  OtaWorkflowLock(SemaphoreHandle_t mutex, const TickType_t timeout)
+      : mutex_(mutex), acquired_(mutex_ != nullptr &&
+                                xSemaphoreTakeRecursive(mutex_, timeout) ==
+                                    pdTRUE) {}
+  ~OtaWorkflowLock() {
+    if (acquired_)
+      xSemaphoreGiveRecursive(mutex_);
+  }
+  OtaWorkflowLock(const OtaWorkflowLock &) = delete;
+  OtaWorkflowLock &operator=(const OtaWorkflowLock &) = delete;
+
+  explicit operator bool() const { return acquired_; }
+
+private:
+  SemaphoreHandle_t mutex_{nullptr};
+  bool acquired_{false};
 };
 
 class OtaTransactionLease final {
@@ -367,25 +389,115 @@ bool unavailableManifest(const std::string &json) {
          version::PROTOCOL;
 }
 
+bool recoverySaved(const OtaRecoveryStoreResult result) {
+  return result == OtaRecoveryStoreResult::SavedAndVerified;
+}
+
+const char *recoveryLoadFailureCode(const OtaRecoveryStoreResult result) {
+  switch (result) {
+  case OtaRecoveryStoreResult::NotFound:
+    return "ota_post_boot_recovery_missing";
+  case OtaRecoveryStoreResult::LoadFailed:
+    return "ota_post_boot_recovery_load_failed";
+  case OtaRecoveryStoreResult::ParseFailed:
+    return "ota_post_boot_recovery_parse_failed";
+  default: return "ota_post_boot_recovery_invalid";
+  }
+}
+
 } // namespace
 
 OtaService::OtaService(ConfigService &config, Diagnostics &diagnostics)
     : config_(config), diagnostics_(diagnostics) {
+  workflow_mutex_ = xSemaphoreCreateRecursiveMutex();
   mutex_ = xSemaphoreCreateMutex();
   initializePartitionStatus();
 }
 
 bool OtaService::begin() {
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(5000));
+  if (!workflow_lock)
+    return false;
   const auto &identity = config_.identity();
   ota_stage::beginBoot(
       identity.boot_id.c_str(), version::FIRMWARE, runningBuildHash().c_str(),
       diag::SerialLogger::instance().bootCount(),
       static_cast<std::uint32_t>(esp_reset_reason()));
   initializePartitionStatus();
+  OtaRestrictedRecoveryRecord previous_incident;
+  const OtaRecoveryStoreResult previous_incident_result =
+      recovery_store_.loadRestrictedIncident(previous_incident);
+  if (previous_incident_result == OtaRecoveryStoreResult::Loaded) {
+    restricted_incident_ = previous_incident;
+    if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
+      status_.restricted_incident_durable = true;
+      status_.restricted_incident_report_pending =
+          previous_incident.report_pending;
+      status_.restricted_failure_code = previous_incident.failure_code;
+      status_.restricted_rollback_result = previous_incident.rollback_result;
+      xSemaphoreGive(mutex_);
+    }
+  }
   ota_v2::RecoveryRecord recovered;
-  if (!recovery_store_.load(recovered))
+  recovery_load_result_ = recovery_store_.load(recovered);
+  if (recovery_load_result_ != OtaRecoveryStoreResult::Loaded) {
+    const bool pending_image = runningImagePendingVerification();
+    if (recovery_load_result_ != OtaRecoveryStoreResult::NotFound ||
+        pending_image) {
+      const char *failure_code =
+          recoveryLoadFailureCode(recovery_load_result_);
+      ota_stage::recordFailure(failure_code);
+      if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
+        status_.last_error = failure_code;
+        status_.last_result = "recovery_unavailable";
+        xSemaphoreGive(mutex_);
+      }
+      PM_LOG_ERROR(
+          "OTA", "RECOVERY_LOAD_FAILED",
+          "error=PM-OTA-012 result=%s pending_image=%s action=%s",
+          otaRecoveryStoreResultName(recovery_load_result_),
+          pending_image ? "true" : "false",
+          pending_image ? "rollback_required" : "continue_without_record");
+      if (pending_image) {
+        // A PENDING_VERIFY image without authenticated, readable recovery
+        // evidence cannot be allowed to start production services. Ask
+        // ESP-IDF to return to the previous image immediately. If that call
+        // cannot reboot, the caller starts only the restricted recovery
+        // surface below.
+        const ota_v2::RunningImageCheckResult rollback_result =
+            initiatePostBootRollback(failure_code);
+        const ota_v2::PreServiceRecoveryAction recovery_action =
+            ota_v2::classifyPreServiceRecovery(rollback_result);
+        PM_LOG_FATAL(
+            "OTA", "PRE_SERVICE_RECOVERY_ROLLBACK",
+            "reason=%s result=%s action=%s "
+            "production_services_started=false",
+            failure_code,
+            ota_v2::runningImageCheckResultName(rollback_result),
+            recovery_action ==
+                    ota_v2::PreServiceRecoveryAction::RollbackRebooting
+                ? "rollback_rebooting"
+                : "restricted_local_recovery");
+        if (recovery_action ==
+            ota_v2::PreServiceRecoveryAction::RollbackRebooting) {
+          // ESP-IDF normally never returns from a successful rollback mark.
+          // A test double may return, but the unverifiable candidate must not
+          // continue into any service bootstrap in that case.
+          return false;
+        }
+        const OtaRecoveryStoreResult incident_result =
+            persistRestrictedIncident(failure_code, rollback_result);
+        enterRestrictedRecovery(failure_code, rollback_result,
+                                incident_result);
+        return true;
+      }
+    }
     return true;
+  }
   recovery_ = recovered;
+  ota_stage::bindDeployment(recovered.deployment_id.c_str(),
+                            recovered.attempt,
+                            recovered.evidence_sequence);
   if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) != pdTRUE)
     return false;
   status_.deployment_id = recovered.deployment_id;
@@ -403,16 +515,40 @@ bool OtaService::begin() {
   status_.last_result = ota_v2::stateName(recovered.state);
   xSemaphoreGive(mutex_);
 
+  const bool running_pending = runningImagePendingVerification();
+  if (running_pending && !recovered.pending_reboot) {
+    const std::string failure_code = "ota_post_boot_recovery_missing";
+    const ota_v2::RunningImageCheckResult rollback_result =
+        initiatePostBootRollback(failure_code);
+    const ota_v2::PreServiceRecoveryAction recovery_action =
+        ota_v2::classifyPreServiceRecovery(rollback_result);
+    PM_LOG_FATAL(
+        "OTA", "PRE_SERVICE_RECOVERY_ROLLBACK",
+        "reason=ota_post_boot_recovery_missing result=%s "
+        "action=%s production_services_started=false",
+        ota_v2::runningImageCheckResultName(rollback_result),
+        recovery_action ==
+                ota_v2::PreServiceRecoveryAction::RollbackRebooting
+            ? "rollback_rebooting"
+            : "restricted_local_recovery");
+    if (recovery_action ==
+        ota_v2::PreServiceRecoveryAction::RollbackRebooting) {
+      return false;
+    }
+    const OtaRecoveryStoreResult incident_result =
+        persistRestrictedIncident(failure_code, rollback_result);
+    enterRestrictedRecovery(failure_code, rollback_result, incident_result);
+    return true;
+  }
+
   if (recovered.pending_reboot) {
-    ota_stage::bindDeployment(recovered.deployment_id.c_str(),
-                              recovered.attempt);
     ota_stage::record(ota_stage::Stage::PostBootImageDetected,
                       recovered.bytes_received, recovered.image_size, false,
                       recovered.pending_reboot);
-    const bool running_pending = runningImagePendingVerification();
     const std::string running_build_hash = runningBuildHash();
     const ota_v2::PostBootAction action = ota_v2::classifyPostBoot(
-        running_pending, true, version::FIRMWARE, running_build_hash,
+        running_pending, ota_v2::PostBootHealthClass::Healthy,
+        version::FIRMWARE, running_build_hash,
         recovered.target_version, recovered.target_build_hash,
         recovered.previous_version, recovered.previous_build_hash, true);
     if (action == ota_v2::PostBootAction::Validate) {
@@ -442,11 +578,31 @@ bool OtaService::begin() {
                true);
       report_pending_.store(true, std::memory_order_release);
     } else if (action == ota_v2::PostBootAction::Rollback) {
-      setState(ota_v2::State::Failed, "post_boot_identity_rejected",
-               version::FIRMWARE != recovered.target_version
-                   ? "ota_post_boot_version_mismatch"
-                   : "ota_post_boot_build_hash_mismatch",
-               true, false);
+      const std::string failure_code =
+          version::FIRMWARE != recovered.target_version
+              ? "ota_post_boot_version_mismatch"
+              : "ota_post_boot_build_hash_mismatch";
+      const ota_v2::RunningImageCheckResult rollback_result =
+          initiatePostBootRollback(failure_code);
+      const ota_v2::PreServiceRecoveryAction recovery_action =
+          ota_v2::classifyPreServiceRecovery(rollback_result);
+      PM_LOG_FATAL(
+          "OTA", "PRE_SERVICE_IDENTITY_ROLLBACK",
+          "reason=%s result=%s action=%s production_services_started=false",
+          failure_code.c_str(),
+          ota_v2::runningImageCheckResultName(rollback_result),
+          recovery_action ==
+                  ota_v2::PreServiceRecoveryAction::RollbackRebooting
+              ? "rollback_rebooting"
+              : "restricted_local_recovery");
+      if (recovery_action ==
+          ota_v2::PreServiceRecoveryAction::RollbackRebooting) {
+        return false;
+      }
+      const OtaRecoveryStoreResult incident_result =
+          persistRestrictedIncident(failure_code, rollback_result);
+      enterRestrictedRecovery(failure_code, rollback_result, incident_result);
+      return true;
     } else {
       setState(ota_v2::State::Failed, "failed",
                "ota_post_boot_version_unexpected", true);
@@ -458,6 +614,73 @@ bool OtaService::begin() {
   return true;
 }
 
+bool OtaService::restrictedRecoveryMode() const {
+  return restricted_recovery_mode_.load(std::memory_order_acquire);
+}
+
+OtaRecoveryStoreResult OtaService::persistRestrictedIncident(
+    const std::string &failure_code,
+    const ota_v2::RunningImageCheckResult rollback_result) {
+  const DeviceIdentity identity = config_.identity();
+  OtaRestrictedRecoveryRecord incident;
+  incident.failure_code = failure_code;
+  incident.rollback_result =
+      ota_v2::runningImageCheckResultName(rollback_result);
+  incident.running_version = version::FIRMWARE;
+  incident.running_build_hash = runningBuildHash();
+  incident.boot_id = identity.boot_id;
+  incident.boot_count = diag::SerialLogger::instance().bootCount();
+  incident.pending_image = true;
+  incident.report_pending = true;
+  const OtaRecoveryStoreResult result =
+      recovery_store_.saveRestrictedIncidentAndVerify(incident);
+  if (recoverySaved(result)) {
+    restricted_incident_ = incident;
+  }
+  PM_LOG_FATAL(
+      "OTA", "RESTRICTED_RECOVERY_INCIDENT_CHECKPOINT",
+      "failure=%s rollback_result=%s store_result=%s "
+      "report_pending=true deployment_identity_invented=false",
+      failure_code.c_str(),
+      ota_v2::runningImageCheckResultName(rollback_result),
+      otaRecoveryStoreResultName(result));
+  return result;
+}
+
+void OtaService::enterRestrictedRecovery(
+    const std::string &failure_code,
+    const ota_v2::RunningImageCheckResult rollback_result,
+    const OtaRecoveryStoreResult incident_result) {
+  restricted_recovery_mode_.store(true, std::memory_order_release);
+  // The ordinary deployment report cannot be signed without its authenticated
+  // deployment/release tuple.  Keep that channel off instead of inventing an
+  // identity; the independent incident is exposed by the local status and
+  // diagnostics APIs for operator reporting and survives power loss.
+  report_pending_.store(false, std::memory_order_release);
+  if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
+    status_.state = ota_v2::State::Failed;
+    status_.last_result = "restricted_local_recovery";
+    status_.last_error = failure_code;
+    status_.restricted_recovery_mode = true;
+    status_.restricted_incident_durable = recoverySaved(incident_result);
+    status_.restricted_incident_report_pending =
+        recoverySaved(incident_result);
+    status_.restricted_failure_code = failure_code;
+    status_.restricted_rollback_result =
+        ota_v2::runningImageCheckResultName(rollback_result);
+    xSemaphoreGive(mutex_);
+  }
+  PM_LOG_FATAL(
+      "OTA", "RESTRICTED_LOCAL_RECOVERY_REQUIRED",
+      "failure=%s rollback_result=%s incident_durable=%s "
+      "normal_measurement=false normal_sync=false "
+      "local_network_requested=true local_web_ui_requested=true "
+      "serial_recovery=true",
+      failure_code.c_str(),
+      ota_v2::runningImageCheckResultName(rollback_result),
+      recoverySaved(incident_result) ? "true" : "false");
+}
+
 bool OtaService::runningImagePendingVerification() const {
   const esp_partition_t *running = esp_ota_get_running_partition();
   esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
@@ -466,57 +689,126 @@ bool OtaService::runningImagePendingVerification() const {
          state == ESP_OTA_IMG_PENDING_VERIFY;
 }
 
-bool OtaService::checkRunningImage(const bool health_checks_passed) {
+ota_v2::RunningImageCheckResult OtaService::checkRunningImage(
+    const ota_v2::PostBootHealthClass health) {
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(5000));
+  if (!workflow_lock) {
+    return ota_v2::RunningImageCheckResult::RecoveryCheckpointFailed;
+  }
   const esp_partition_t *running = esp_ota_get_running_partition();
   esp_ota_img_states_t image_state = ESP_OTA_IMG_UNDEFINED;
   if (running == nullptr ||
       esp_ota_get_state_partition(running, &image_state) != ESP_OK) {
-    return false;
+    ota_stage::recordFailure("ota_partition_state_unavailable");
+    return ota_v2::RunningImageCheckResult::PartitionStateUnavailable;
   }
   if (image_state != ESP_OTA_IMG_PENDING_VERIFY)
-    return true;
+    return ota_v2::RunningImageCheckResult::NotPending;
+
+  if (ota_fault::configured(
+          ota_fault::Point::BeforePostBootValidation)) {
+    return initiatePostBootRollback(ota_fault::failureCode(
+        ota_fault::Point::BeforePostBootValidation));
+  }
 
   const std::string running_build_hash = runningBuildHash();
   const ota_v2::PostBootAction action = ota_v2::classifyPostBoot(
-      true, health_checks_passed, version::FIRMWARE, running_build_hash,
+      true, health, version::FIRMWARE, running_build_hash,
       recovery_.target_version, recovery_.target_build_hash,
       recovery_.previous_version, recovery_.previous_build_hash,
       recovery_.pending_reboot);
-  setState(ota_v2::State::PostBootValidation, "post_boot_validation", {},
-           true, false);
-  if (action == ota_v2::PostBootAction::Validate &&
-      esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+
+  if (action == ota_v2::PostBootAction::Defer) {
+    const OtaRecoveryStoreResult checkpoint = setState(
+        ota_v2::State::PostBootValidation, "post_boot_validation_retryable",
+        {}, true, false);
+    if (!recoverySaved(checkpoint)) {
+      return initiatePostBootRollback("ota_post_boot_checkpoint_failed");
+    }
+    ota_stage::record(ota_stage::Stage::PostBootValidationRetryable,
+                      recovery_.bytes_received, recovery_.image_size, false,
+                      true);
+    PM_LOG_WARN("OTA", "POST_BOOT_VALIDATION_RETRYABLE",
+                "health=%s action=wait",
+                ota_v2::postBootHealthClassName(health));
+    return ota_v2::RunningImageCheckResult::ValidationDeferred;
+  }
+
+  if (action == ota_v2::PostBootAction::Block) {
+    constexpr const char *kFailureCode =
+        "ota_post_boot_local_initialization_blocked";
+    const OtaRecoveryStoreResult checkpoint = setState(
+        ota_v2::State::Failed, "post_boot_local_initialization_blocked",
+        kFailureCode, true, true);
+    PM_LOG_FATAL(
+        "OTA", "POST_BOOT_LOCAL_INITIALIZATION_BLOCKED",
+        "error=PM-OTA-014 reason=%s health=%s checkpoint=%s reboot=false "
+        "rollback=false recovery_ui=available",
+        kFailureCode, ota_v2::postBootHealthClassName(health),
+        otaRecoveryStoreResultName(checkpoint));
+    return recoverySaved(checkpoint)
+               ? ota_v2::RunningImageCheckResult::ValidationBlocked
+               : ota_v2::RunningImageCheckResult::RecoveryCheckpointFailed;
+  }
+
+  if (action != ota_v2::PostBootAction::Validate) {
+    std::string failure_code = "ota_post_boot_health_failed";
+    if (recovery_load_result_ != OtaRecoveryStoreResult::Loaded) {
+      failure_code = recoveryLoadFailureCode(recovery_load_result_);
+    } else if (!recovery_.pending_reboot) {
+      failure_code = "ota_post_boot_recovery_missing";
+    } else if (version::FIRMWARE != recovery_.target_version) {
+      failure_code = "ota_post_boot_version_mismatch";
+    } else if (running_build_hash != recovery_.target_build_hash) {
+      failure_code = "ota_post_boot_build_hash_mismatch";
+    } else if (health == ota_v2::PostBootHealthClass::FatalLocalRuntime) {
+      failure_code = "ota_post_boot_local_runtime_failed";
+    }
+    return initiatePostBootRollback(failure_code);
+  }
+
+  const OtaRecoveryStoreResult checkpoint = setState(
+      ota_v2::State::PostBootValidation, "post_boot_validation", {}, true,
+      false);
+  if (!recoverySaved(checkpoint)) {
+    return initiatePostBootRollback("ota_post_boot_checkpoint_failed");
+  }
+  const bool mark_valid_fault =
+      ota_fault::configured(ota_fault::Point::BeforeMarkValid) ||
+      ota_fault::configured(ota_fault::Point::MarkValidFailure);
+  const esp_err_t mark_valid_result =
+      mark_valid_fault ? ESP_FAIL : esp_ota_mark_app_valid_cancel_rollback();
+  if (mark_valid_result == ESP_OK) {
     if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
       status_.pending_reboot = false;
       status_.progress_percent = 100U;
       xSemaphoreGive(mutex_);
     }
-    setState(ota_v2::State::Validated, "installed_and_verified", {}, true);
+    const OtaRecoveryStoreResult validated = setState(
+        ota_v2::State::Validated, "installed_and_verified", {}, true);
     report_pending_.store(true, std::memory_order_release);
     ota_stage::record(ota_stage::Stage::PostBootValidated,
                       recovery_.bytes_received, recovery_.image_size);
     PM_LOG_INFO("OTA", "POST_BOOT_VALIDATED",
                 "version=%s build_hash=%s rollback_cancelled=true",
                 version::FIRMWARE, runningBuildHash().c_str());
-    return true;
+    if (!recoverySaved(validated)) {
+      ota_stage::recordFailure("ota_validated_checkpoint_save_failed");
+      PM_LOG_ERROR(
+          "OTA", "VALIDATED_CHECKPOINT_SAVE_FAILED",
+          "error=PM-OTA-013 store_result=%s image_valid=true reboot=false",
+          otaRecoveryStoreResultName(validated));
+      return ota_v2::RunningImageCheckResult::ValidatedRecoverySaveFailed;
+    }
+    return ota_v2::RunningImageCheckResult::Validated;
   }
 
-  std::string failure_code = "ota_post_boot_health_failed";
-  if (!recovery_.pending_reboot) {
-    failure_code = "ota_post_boot_recovery_missing";
-  } else if (version::FIRMWARE != recovery_.target_version) {
-    failure_code = "ota_post_boot_version_mismatch";
-  } else if (running_build_hash != recovery_.target_build_hash) {
-    failure_code = "ota_post_boot_build_hash_mismatch";
-  } else if (action == ota_v2::PostBootAction::Validate) {
-    failure_code = "ota_mark_valid_failed";
-  }
-  setState(ota_v2::State::Failed, "post_boot_failed",
-           failure_code, true, false);
-  PM_LOG_FATAL("OTA", "POST_BOOT_REJECTED",
-               "error=PM-OTA-006 health_checks=%s rollback=automatic",
-               health_checks_passed ? "passed" : "failed");
-  return esp_ota_mark_app_invalid_rollback_and_reboot() == ESP_OK;
+  return initiatePostBootRollback(
+      ota_fault::configured(ota_fault::Point::BeforeMarkValid)
+          ? ota_fault::failureCode(ota_fault::Point::BeforeMarkValid)
+          : ota_fault::configured(ota_fault::Point::MarkValidFailure)
+                ? ota_fault::failureCode(ota_fault::Point::MarkValidFailure)
+                : "ota_mark_valid_failed");
 }
 
 bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
@@ -529,12 +821,35 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     std::atomic<bool> &flag;
     ~ProgressRelease() { flag.store(false, std::memory_order_release); }
   } progress_release{in_progress_};
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(5000));
+  if (!workflow_lock) {
+    PM_LOG_ERROR("OTA", "WORKFLOW_LOCK_UNAVAILABLE",
+                 "operation=install install=false");
+    return false;
+  }
   ota_stage::record(ota_stage::Stage::WorkflowLockAcquired);
 
   const RuntimeConfig active_config = config_.config();
   if (config_.safeMode()) {
     setState(ota_v2::State::Failed, "rejected", "ota_disabled_in_safe_mode",
              false);
+    return false;
+  }
+
+  // A PENDING_VERIFY candidate normally has exactly one rollback image: the
+  // other OTA slot. esp_ota_get_next_update_partition() would select that same
+  // slot, so writing a replacement while rollback is still possible would
+  // destroy the last known-good image before this candidate is valid. Keep the
+  // authenticated OTA endpoint available in restricted recovery, but require
+  // the operator to complete the available rollback first. A replacement
+  // remains possible when ESP-IDF proves that no rollback image exists.
+  if (restrictedRecoveryMode() && esp_ota_check_rollback_is_possible()) {
+    setState(ota_v2::State::Failed, "rejected",
+             "ota_restricted_rollback_must_be_resolved", false);
+    PM_LOG_ERROR(
+        "OTA", "RESTRICTED_UPDATE_REJECTED",
+        "reason=rollback_image_must_be_preserved install=false "
+        "recovery_action=rollback_first");
     return false;
   }
 
@@ -589,12 +904,14 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
       }
     }
 
-    const std::string last_report_state =
+    const bool continuing_attempt =
         prior.deployment_id == manifest.deployment_id &&
-                prior.release_id == manifest.release_id &&
-                manifest.attempt == prior.attempt
-            ? prior.last_report_state
-            : std::string{};
+        prior.release_id == manifest.release_id &&
+        manifest.attempt == prior.attempt;
+    const std::string last_report_state =
+        continuing_attempt ? prior.last_report_state : std::string{};
+    const std::uint64_t evidence_sequence =
+        continuing_attempt ? prior.evidence_sequence : 0U;
     recovery_ = {};
     recovery_.deployment_id = manifest.deployment_id;
     recovery_.release_id = manifest.release_id;
@@ -606,7 +923,9 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     recovery_.image_size = manifest.size_bytes;
     recovery_.attempt = manifest.attempt;
     recovery_.last_report_state = last_report_state;
-    ota_stage::bindDeployment(manifest.deployment_id.c_str(), manifest.attempt);
+    recovery_.evidence_sequence = evidence_sequence;
+    ota_stage::bindDeployment(manifest.deployment_id.c_str(), manifest.attempt,
+                              evidence_sequence);
     if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
       status_.deployment_id = manifest.deployment_id;
       status_.release_id = manifest.release_id;
@@ -621,8 +940,15 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
       status_.pending_reboot = false;
       xSemaphoreGive(mutex_);
     }
-    setState(ota_v2::State::ManifestAuthenticated,
-             "manifest_authenticated", {}, true);
+    const OtaRecoveryStoreResult manifest_checkpoint = setState(
+        ota_v2::State::ManifestAuthenticated, "manifest_authenticated", {},
+        true);
+    if (!recoverySaved(manifest_checkpoint)) {
+      PM_LOG_ERROR("OTA", "MANIFEST_CHECKPOINT_FAILED",
+                   "error=PM-OTA-014 store_result=%s install=false",
+                   otaRecoveryStoreResultName(manifest_checkpoint));
+      return false;
+    }
     ota_stage::record(ota_stage::Stage::ManifestAuthenticated);
     if (flushPendingReportWithLease()) {
       ota_stage::record(ota_stage::Stage::ManifestMilestoneReported);
@@ -633,7 +959,14 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
                "outside_ota_update_window", true);
       return false;
     }
-    setState(ota_v2::State::DownloadStarting, "download_starting", {}, true);
+    const OtaRecoveryStoreResult download_checkpoint = setState(
+        ota_v2::State::DownloadStarting, "download_starting", {}, true);
+    if (!recoverySaved(download_checkpoint)) {
+      PM_LOG_ERROR("OTA", "DOWNLOAD_CHECKPOINT_FAILED",
+                   "error=PM-OTA-015 store_result=%s install=false",
+                   otaRecoveryStoreResultName(download_checkpoint));
+      return false;
+    }
     if (flushPendingReportWithLease()) {
       ota_stage::record(ota_stage::Stage::DownloadMilestoneReported, 0U,
                         manifest.size_bytes);
@@ -645,33 +978,70 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     }
     // All stream/TLS/Update objects have been destroyed before durable state
     // and report catch-up touch Preferences or begin another TLS session.
-    setState(ota_v2::State::PartitionWritten, "partition_written", {}, true);
+    if (ota_fault::configured(
+            ota_fault::Point::BeforeRecoveryPersist)) {
+      return failClosedAfterBootSelection(
+          ota_fault::failureCode(ota_fault::Point::BeforeRecoveryPersist),
+          error);
+    }
+    const OtaRecoveryStoreResult partition_checkpoint = setState(
+        ota_v2::State::PartitionWritten, "partition_written", {}, true);
+    if (!recoverySaved(partition_checkpoint)) {
+      PM_LOG_ERROR("OTA", "PARTITION_CHECKPOINT_FAILED",
+                   "error=PM-OTA-016 store_result=%s",
+                   otaRecoveryStoreResultName(partition_checkpoint));
+      return failClosedAfterBootSelection(
+          "ota_partition_checkpoint_save_failed", error);
+    }
     (void)flushPendingReportWithLease();
     ota_stage::record(ota_stage::Stage::RecoveryRecordPersisted,
                       status().bytes_received, status().image_size);
+    if (ota_fault::configured(
+            ota_fault::Point::AfterRecoveryPersist)) {
+      return failClosedAfterBootSelection(
+          ota_fault::failureCode(ota_fault::Point::AfterRecoveryPersist),
+          error);
+    }
     if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
       status_.pending_reboot = true;
       status_.progress_percent = 100U;
       xSemaphoreGive(mutex_);
     }
-    setState(ota_v2::State::RebootPending, "verified_pending_reboot", {},
-             true);
+    const OtaRecoveryStoreResult pending_checkpoint = setState(
+        ota_v2::State::RebootPending, "verified_pending_reboot", {}, true);
+    if (!recoverySaved(pending_checkpoint)) {
+      PM_LOG_ERROR("OTA", "REBOOT_PENDING_CHECKPOINT_FAILED",
+                   "error=PM-OTA-017 store_result=%s",
+                   otaRecoveryStoreResultName(pending_checkpoint));
+      return failClosedAfterBootSelection(
+          "ota_reboot_pending_checkpoint_save_failed", error);
+    }
     if (flushPendingReportWithLease()) {
       ota_stage::record(ota_stage::Stage::RebootMilestoneReported,
                         status().bytes_received, status().image_size, false,
                         true);
     }
-    setState(ota_v2::State::Rebooting, "rebooting", {}, true);
+    const OtaRecoveryStoreResult rebooting_checkpoint =
+        setState(ota_v2::State::Rebooting, "rebooting", {}, true);
+    if (!recoverySaved(rebooting_checkpoint)) {
+      PM_LOG_ERROR("OTA", "REBOOTING_CHECKPOINT_FAILED",
+                   "error=PM-OTA-018 store_result=%s",
+                   otaRecoveryStoreResultName(rebooting_checkpoint));
+      return failClosedAfterBootSelection(
+          "ota_rebooting_checkpoint_save_failed", error);
+    }
     (void)flushPendingReportWithLease();
+    if (ota_fault::configured(ota_fault::Point::BeforeReboot)) {
+      return failClosedAfterBootSelection(
+          ota_fault::failureCode(ota_fault::Point::BeforeReboot), error);
+    }
+    if (!verifyRecoveryBeforeReboot(error)) {
+      const std::string verification_error = error;
+      return failClosedAfterBootSelection(verification_error.c_str(), error);
+    }
     ota_stage::record(ota_stage::Stage::RebootScheduled,
                       status().bytes_received, status().image_size, false,
                       true);
-    if (ota_fault::configured(ota_fault::Point::BeforeReboot)) {
-      setState(ota_v2::State::Failed, "fault_injected",
-               ota_fault::failureCode(ota_fault::Point::BeforeReboot), true,
-               false);
-      return false;
-    }
     install_ready = true;
   }
 
@@ -760,6 +1130,7 @@ CompactOtaStatus OtaService::compactStatus() const {
   compact.pending_reboot = snapshot.pending_reboot;
   compact.rollback_supported = snapshot.rollback_supported;
   compact.rollback_detected = snapshot.rollback_detected;
+  compact.restricted_recovery_mode = snapshot.restricted_recovery_mode;
   compact.lifecycle_stack_high_water_bytes =
       lifecycle.task_stack_high_water_bytes;
   compact.previous_boot_bytes_received = previous.bytes_received;
@@ -796,17 +1167,83 @@ CompactOtaStatus OtaService::compactStatus() const {
   return compact;
 }
 
-bool OtaService::rollbackAndReboot() {
+ota_v2::RollbackResult OtaService::rollbackAndReboot() {
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(5000));
+  if (!workflow_lock)
+    return ota_v2::RollbackResult::RecoveryCheckpointFailed;
   const bool possible = esp_ota_check_rollback_is_possible();
   if (!possible)
-    return false;
-  setState(ota_v2::State::RolledBack, "manual_rollback", {}, true);
-  report_pending_.store(true, std::memory_order_release);
-  (void)flushPendingReportWithLease();
-  return esp_ota_mark_app_invalid_rollback_and_reboot() == ESP_OK;
+    return ota_v2::RollbackResult::NotPossible;
+
+  // Persist only the intent to reboot before asking ESP-IDF to invalidate the
+  // running image. `esp_ota_mark_app_invalid_rollback_and_reboot()` reboots on
+  // success, so the subsequent boot is the first point at which a RolledBack
+  // state can be proven. Publishing RolledBack here would falsely terminalize
+  // a deployment if the mark operation failed or a fault was injected.
+  if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) != pdTRUE) {
+    return ota_v2::RollbackResult::RecoveryCheckpointFailed;
+  }
+  status_.pending_reboot = true;
+  xSemaphoreGive(mutex_);
+  const OtaRecoveryStoreResult checkpoint = setState(
+      ota_v2::State::Rebooting, "manual_rollback_pending", {}, true, false);
+  if (!recoverySaved(checkpoint)) {
+    if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
+      status_.pending_reboot = false;
+      xSemaphoreGive(mutex_);
+    }
+    PM_LOG_ERROR("OTA", "MANUAL_ROLLBACK_CHECKPOINT_FAILED",
+                 "store_result=%s reboot=false",
+                 otaRecoveryStoreResultName(checkpoint));
+    return ota_v2::RollbackResult::RecoveryCheckpointFailed;
+  }
+
+  const auto mark_failed = [this](const char *failure_code,
+                                  const int esp_error) {
+    if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
+      status_.pending_reboot = false;
+      xSemaphoreGive(mutex_);
+    }
+    const OtaRecoveryStoreResult failed_checkpoint = setState(
+        ota_v2::State::Failed, "manual_rollback_mark_failed", failure_code,
+        true, true);
+    ota_stage::record(ota_stage::Stage::RollbackMarkFailed,
+                      recovery_.bytes_received, recovery_.image_size);
+    PM_LOG_FATAL(
+        "OTA", "MANUAL_ROLLBACK_MARK_FAILED",
+        "failure=%s esp_error=%d checkpoint=%s reboot=false "
+        "rollback_confirmed=false recovery_ui=available",
+        failure_code, esp_error,
+        otaRecoveryStoreResultName(failed_checkpoint));
+    return ota_v2::RollbackResult::MarkFailed;
+  };
+  if (ota_fault::configured(ota_fault::Point::BeforeRollbackMark)) {
+    return mark_failed(
+        ota_fault::failureCode(ota_fault::Point::BeforeRollbackMark),
+        static_cast<int>(ESP_FAIL));
+  }
+  ota_stage::record(ota_stage::Stage::RollbackMarkRequested,
+                    recovery_.bytes_received, recovery_.image_size);
+  const esp_err_t result =
+      ota_fault::configured(ota_fault::Point::RollbackMarkFailure)
+          ? ESP_FAIL
+          : esp_ota_mark_app_invalid_rollback_and_reboot();
+  if (result != ESP_OK) {
+    return mark_failed(
+        ota_fault::configured(ota_fault::Point::RollbackMarkFailure)
+            ? ota_fault::failureCode(ota_fault::Point::RollbackMarkFailure)
+            : "ota_manual_rollback_mark_failed",
+        static_cast<int>(result));
+  }
+  return ota_v2::RollbackResult::Initiated;
 }
 
 bool OtaService::pendingReport(std::string &body) const {
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(250));
+  if (!workflow_lock) {
+    body.clear();
+    return false;
+  }
   if (!report_pending_.load(std::memory_order_acquire)) {
     body.clear();
     return false;
@@ -814,8 +1251,14 @@ bool OtaService::pendingReport(std::string &body) const {
   const char *desired = ota_v2::reportMilestoneForState(recovery_.state);
   const char *next =
       ota_v2::nextReportMilestone(recovery_.last_report_state, desired);
-  body = next == nullptr ? std::string{} : reportJson(next);
-  return !body.empty();
+  std::array<char, kOtaReportMaximumBytes> bounded{};
+  std::size_t size = 0U;
+  if (next == nullptr || !reportJson(next, bounded, size)) {
+    body.clear();
+    return false;
+  }
+  body.assign(bounded.data(), size);
+  return true;
 }
 
 bool OtaService::hasPendingReport() const {
@@ -823,6 +1266,9 @@ bool OtaService::hasPendingReport() const {
 }
 
 bool OtaService::flushPendingReport() {
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(250));
+  if (!workflow_lock)
+    return false;
   if (!hasPendingReport())
     return true;
   return flushPendingReportWithLease();
@@ -844,7 +1290,14 @@ bool OtaService::flushPendingReportWithLease() {
 }
 
 void OtaService::markPendingReportDelivered() {
-  report_pending_.store(false, std::memory_order_release);
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(250));
+  if (!workflow_lock)
+    return;
+  const char *desired = ota_v2::reportMilestoneForState(recovery_.state);
+  report_pending_.store(
+      ota_v2::nextReportMilestone(recovery_.last_report_state, desired) !=
+          nullptr,
+      std::memory_order_release);
 }
 
 std::string OtaService::runningBuildHash() {
@@ -880,7 +1333,8 @@ bool OtaService::serverTarget(const RuntimeConfig &config,
 
 bool OtaService::addDeviceAuthentication(HTTPClient &http, const char *method,
                                          const std::string &target,
-                                         const std::string &body,
+                                         const char *body,
+                                         const std::size_t body_size,
                                          std::string &error) const {
   const std::time_t now = std::time(nullptr);
   if (now < 1'600'000'000) {
@@ -897,8 +1351,13 @@ bool OtaService::addDeviceAuthentication(HTTPClient &http, const char *method,
   }
   const std::string timestamp = std::to_string(now);
   const std::string nonce = crypto::randomHex(16U);
+  static constexpr std::uint8_t kEmptyBody[1U]{0U};
+  const auto *body_bytes =
+      body_size == 0U
+          ? kEmptyBody
+          : reinterpret_cast<const std::uint8_t *>(body);
   const std::string body_hash = crypto::sha256Hex(
-      reinterpret_cast<const std::uint8_t *>(body.data()), body.size());
+      body_bytes, body_size);
   const std::string canonical = crypto::canonicalRequest(
       method, target, timestamp, nonce, body_hash);
   const std::string signature =
@@ -951,7 +1410,7 @@ bool OtaService::fetchText(const std::string &url, std::string &body,
   http.setConnectTimeout(5000);
   http.setTimeout(10000);
   if (!http.begin(client, url.c_str()) ||
-      !addDeviceAuthentication(http, "GET", target, {}, error)) {
+      !addDeviceAuthentication(http, "GET", target, nullptr, 0U, error)) {
     return false;
   }
   lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
@@ -1086,7 +1545,7 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
   http.setConnectTimeout(5000);
   http.setTimeout(15000);
   if (!http.begin(client, image_url.c_str()) ||
-      !addDeviceAuthentication(http, "GET", target, {}, error)) {
+      !addDeviceAuthentication(http, "GET", target, nullptr, 0U, error)) {
     return false;
   }
   lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
@@ -1305,22 +1764,270 @@ bool OtaService::downloadAndApply(const ota_v2::Manifest &manifest,
   update_open = false;
   ota_stage::record(ota_stage::Stage::UpdateEndCompleted, received,
                     manifest.size_bytes, false, true);
+  if (ota_fault::configured(ota_fault::Point::AfterUpdateEnd)) {
+    return failClosedAfterBootSelection(
+        ota_fault::failureCode(ota_fault::Point::AfterUpdateEnd), error);
+  }
+  if (ota_fault::configured(
+          ota_fault::Point::AfterBootPartitionSelect)) {
+    return failClosedAfterBootSelection(
+        ota_fault::failureCode(ota_fault::Point::AfterBootPartitionSelect),
+        error);
+  }
+  ota_stage::record(ota_stage::Stage::BootPartitionVerification, received,
+                    manifest.size_bytes, false, true);
+  if (!verifySelectedBootPartition(update_partition, manifest, error)) {
+    const std::string verification_error = error;
+    return failClosedAfterBootSelection(verification_error.c_str(), error);
+  }
   ota_stage::record(ota_stage::Stage::BootPartitionSelected, received,
                     manifest.size_bytes, false, true);
-  if (ota_fault::configured(ota_fault::Point::AfterUpdateEnd)) {
-    (void)esp_ota_set_boot_partition(esp_ota_get_running_partition());
-    error = ota_fault::failureCode(ota_fault::Point::AfterUpdateEnd);
-    return false;
-  }
   ota_stage::record(ota_stage::Stage::PartitionWritten, received,
                     manifest.size_bytes, false, true);
   setState(ota_v2::State::PartitionWritten, "partition_written", {}, false);
   return true;
 }
 
+bool OtaService::verifySelectedBootPartition(
+    const esp_partition_t *expected, const ota_v2::Manifest &manifest,
+    std::string &error) const {
+  const esp_partition_t *selected = esp_ota_get_boot_partition();
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t selected_state = ESP_OTA_IMG_UNDEFINED;
+  esp_app_desc_t descriptor{};
+  const bool descriptor_available =
+      selected != nullptr &&
+      esp_ota_get_partition_description(selected, &descriptor) == ESP_OK;
+  std::string project_name;
+  std::string firmware_version;
+  const bool descriptor_strings_valid =
+      descriptor_available &&
+      boundedDescriptorString(descriptor.project_name,
+                              sizeof(descriptor.project_name), project_name) &&
+      boundedDescriptorString(descriptor.version, sizeof(descriptor.version),
+                              firmware_version);
+  const bool state_available =
+      selected != nullptr &&
+      esp_ota_get_state_partition(selected, &selected_state) == ESP_OK;
+
+  ota_v2::PartitionVerificationEvidence evidence;
+  evidence.expected_present = expected != nullptr;
+  evidence.selected_present = selected != nullptr;
+  evidence.running_present = running != nullptr;
+  if (expected != nullptr) {
+    evidence.expected_type = static_cast<std::uint8_t>(expected->type);
+    evidence.expected_subtype = static_cast<std::uint8_t>(expected->subtype);
+    evidence.expected_address = expected->address;
+    evidence.expected_size = expected->size;
+    evidence.expected_label = partitionLabel(expected);
+    evidence.expected_is_ota_app =
+        expected->type == ESP_PARTITION_TYPE_APP &&
+        expected->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN &&
+        expected->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MAX;
+  }
+  if (selected != nullptr) {
+    evidence.selected_type = static_cast<std::uint8_t>(selected->type);
+    evidence.selected_subtype = static_cast<std::uint8_t>(selected->subtype);
+    evidence.selected_address = selected->address;
+    evidence.selected_size = selected->size;
+    evidence.selected_label = partitionLabel(selected);
+  }
+  evidence.selected_not_running =
+      selected != nullptr && running != nullptr &&
+      selected->address != running->address;
+  evidence.selected_state_available = state_available;
+  evidence.selected_state_new =
+      state_available && selected_state == ESP_OTA_IMG_NEW;
+  evidence.descriptor_available = descriptor_strings_valid;
+  evidence.project_name = project_name;
+  evidence.version = firmware_version;
+  evidence.build_hash =
+      descriptor_available ? descriptorHash(descriptor) : std::string{};
+
+  if (!ota_v2::validateSelectedPartition(
+          evidence, manifest.project_name, manifest.version,
+          manifest.build_hash, manifest.size_bytes, error)) {
+    PM_LOG_ERROR(
+        "OTA", "BOOT_PARTITION_VERIFICATION_FAILED",
+        "error=PM-OTA-019 reason=%s expected_label=%s selected_label=%s "
+        "expected_address=%lu selected_address=%lu expected_size=%lu "
+        "selected_size=%lu selected_state=%d",
+        error.c_str(), evidence.expected_label.c_str(),
+        evidence.selected_label.c_str(),
+        static_cast<unsigned long>(evidence.expected_address),
+        static_cast<unsigned long>(evidence.selected_address),
+        static_cast<unsigned long>(evidence.expected_size),
+        static_cast<unsigned long>(evidence.selected_size),
+        static_cast<int>(selected_state));
+    return false;
+  }
+  PM_LOG_INFO(
+      "OTA", "BOOT_PARTITION_VERIFIED",
+      "label=%s address=%lu subtype=%u size=%lu state=new version=%s",
+      evidence.selected_label.c_str(),
+      static_cast<unsigned long>(evidence.selected_address),
+      static_cast<unsigned>(evidence.selected_subtype),
+      static_cast<unsigned long>(evidence.selected_size),
+      evidence.version.c_str());
+  return true;
+}
+
+bool OtaService::verifyRecoveryBeforeReboot(std::string &error) {
+  if (ota_fault::configured(
+          ota_fault::Point::BeforeRecoveryReadback)) {
+    error = ota_fault::failureCode(
+        ota_fault::Point::BeforeRecoveryReadback);
+    return false;
+  }
+  ota_v2::RecoveryRecord readback;
+  const OtaRecoveryStoreResult result = recovery_store_.load(readback);
+  if (result != OtaRecoveryStoreResult::Loaded) {
+    error = "ota_recovery_final_readback_failed";
+    PM_LOG_ERROR("OTA", "RECOVERY_FINAL_READBACK_FAILED",
+                 "error=PM-OTA-020 store_result=%s",
+                 otaRecoveryStoreResultName(result));
+    return false;
+  }
+  if (ota_fault::configured(
+          ota_fault::Point::RecoveryReadbackMismatch) ||
+      !ota_v2::recoveryRecordsEqual(recovery_, readback)) {
+    error = ota_fault::configured(
+                ota_fault::Point::RecoveryReadbackMismatch)
+                ? ota_fault::failureCode(
+                      ota_fault::Point::RecoveryReadbackMismatch)
+                : "ota_recovery_final_identity_mismatch";
+    return false;
+  }
+  if (!readback.pending_reboot || readback.state != ota_v2::State::Rebooting ||
+      readback.deployment_id.empty() || readback.release_id.empty() ||
+      readback.target_version.empty() || readback.target_sha256.empty() ||
+      readback.target_build_hash.empty() || readback.attempt == 0U ||
+      readback.image_size == 0U ||
+      readback.bytes_received != readback.image_size ||
+      readback.progress_percent != 100U) {
+    error = "ota_recovery_final_state_invalid";
+    return false;
+  }
+  ota_stage::record(ota_stage::Stage::RecoveryReadbackVerified,
+                    readback.bytes_received, readback.image_size, false,
+                    true);
+  error.clear();
+  return true;
+}
+
+bool OtaService::restoreRunningBootPartition(const char *primary_failure,
+                                             std::string &restore_error) {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (running == nullptr) {
+    restore_error = "ota_running_partition_unavailable";
+    return false;
+  }
+  if (esp_ota_set_boot_partition(running) != ESP_OK) {
+    restore_error = "ota_boot_partition_restore_failed";
+    return false;
+  }
+  const esp_partition_t *selected = esp_ota_get_boot_partition();
+  if (selected == nullptr || selected->address != running->address ||
+      selected->subtype != running->subtype ||
+      partitionLabel(selected) != partitionLabel(running)) {
+    restore_error = "ota_boot_partition_restore_mismatch";
+    return false;
+  }
+  ota_stage::record(ota_stage::Stage::BootPartitionRestored,
+                    status().bytes_received, status().image_size);
+  PM_LOG_WARN("OTA", "BOOT_PARTITION_RESTORED",
+              "primary_failure=%s running_label=%s running_address=%lu "
+              "reboot=false",
+              primary_failure == nullptr ? "unknown" : primary_failure,
+              partitionLabel(running).c_str(),
+              static_cast<unsigned long>(running->address));
+  restore_error.clear();
+  return true;
+}
+
+bool OtaService::failClosedAfterBootSelection(const char *failure_code,
+                                              std::string &error) {
+  const char *primary = failure_code == nullptr || failure_code[0] == '\0'
+                            ? "ota_fail_closed_unspecified"
+                            : failure_code;
+  const OtaStatus snapshot = status();
+  ota_stage::recordFailure(primary, snapshot.bytes_received,
+                           snapshot.image_size);
+  std::string restore_error;
+  const bool restored = restoreRunningBootPartition(primary, restore_error);
+  if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
+    status_.pending_reboot = false;
+    xSemaphoreGive(mutex_);
+  }
+  const OtaRecoveryStoreResult persisted = setState(
+      ota_v2::State::Failed, "fail_closed", primary, true, true);
+  if (!recoverySaved(persisted)) {
+    PM_LOG_ERROR("OTA", "FAIL_CLOSED_CHECKPOINT_FAILED",
+                 "primary_failure=%s store_result=%s reboot=false", primary,
+                 otaRecoveryStoreResultName(persisted));
+  }
+  if (!restored) {
+    ota_stage::recordFailure(restore_error.c_str(), snapshot.bytes_received,
+                             snapshot.image_size);
+    PM_LOG_FATAL("OTA", "BOOT_PARTITION_RESTORE_FAILED",
+                 "primary_failure=%s restore_failure=%s reboot=false",
+                 primary, restore_error.c_str());
+  }
+  error = restored ? primary : restore_error;
+  return false;
+}
+
+ota_v2::RunningImageCheckResult OtaService::initiatePostBootRollback(
+    const std::string &failure_code) {
+  const OtaRecoveryStoreResult persisted = setState(
+      ota_v2::State::Failed, "post_boot_failed", failure_code, true, true);
+  // Only the authenticated deployment record may use the ordinary report
+  // channel.  Missing/corrupt recovery identity cannot be made reportable by
+  // inventing a tuple; its non-rebooting outcomes are persisted independently
+  // and exposed by restricted local recovery instead.
+  report_pending_.store(recoverySaved(persisted),
+                        std::memory_order_release);
+  ota_stage::recordFailure(failure_code.c_str(), recovery_.bytes_received,
+                           recovery_.image_size);
+  PM_LOG_FATAL(
+      "OTA", "POST_BOOT_REJECTED",
+      "error=PM-OTA-006 reason=%s checkpoint=%s rollback=required",
+      failure_code.c_str(), otaRecoveryStoreResultName(persisted));
+  if (!esp_ota_check_rollback_is_possible()) {
+    PM_LOG_FATAL("OTA", "ROLLBACK_UNAVAILABLE",
+                 "reason=%s reboot=false recovery_ui=available",
+                 failure_code.c_str());
+    return ota_v2::RunningImageCheckResult::RollbackUnavailable;
+  }
+  if (ota_fault::configured(ota_fault::Point::BeforeRollbackMark)) {
+    ota_stage::record(ota_stage::Stage::RollbackMarkFailed);
+    PM_LOG_FATAL("OTA", "ROLLBACK_MARK_FAULT_INJECTED",
+                 "reason=%s reboot=false",
+                 ota_fault::failureCode(
+                     ota_fault::Point::BeforeRollbackMark));
+    return ota_v2::RunningImageCheckResult::RollbackMarkFailed;
+  }
+  ota_stage::record(ota_stage::Stage::RollbackMarkRequested,
+                    recovery_.bytes_received, recovery_.image_size);
+  const esp_err_t rollback_result =
+      ota_fault::configured(ota_fault::Point::RollbackMarkFailure)
+          ? ESP_FAIL
+          : esp_ota_mark_app_invalid_rollback_and_reboot();
+  if (rollback_result != ESP_OK) {
+    ota_stage::record(ota_stage::Stage::RollbackMarkFailed,
+                      recovery_.bytes_received, recovery_.image_size);
+    PM_LOG_FATAL("OTA", "ROLLBACK_MARK_FAILED",
+                 "reason=%s esp_error=%d reboot=false recovery_ui=available",
+                 failure_code.c_str(), static_cast<int>(rollback_result));
+    return ota_v2::RunningImageCheckResult::RollbackMarkFailed;
+  }
+  return ota_v2::RunningImageCheckResult::RollbackInitiated;
+}
+
 bool OtaService::postReport(const char *report_state, std::string &error) {
-  const std::string body = reportJson(report_state);
-  if (body.empty()) {
+  std::array<char, kOtaReportMaximumBytes> body{};
+  std::size_t body_size = 0U;
+  if (!reportJson(report_state, body, body_size)) {
     error = "ota_report_unavailable";
     return false;
   }
@@ -1358,7 +2065,8 @@ bool OtaService::postReport(const char *report_state, std::string &error) {
   http.setConnectTimeout(5000);
   http.setTimeout(10000);
   if (!http.begin(client, url.c_str()) ||
-      !addDeviceAuthentication(http, "POST", endpoint, body, error)) {
+      !addDeviceAuthentication(http, "POST", endpoint, body.data(),
+                               body_size, error)) {
     return false;
   }
   lifecycle.record(TlsLifecycleStage::AfterHttpBegin);
@@ -1369,21 +2077,31 @@ bool OtaService::postReport(const char *report_state, std::string &error) {
   }
   http.addHeader("Content-Type", "application/json");
   const int response = http.POST(
-      reinterpret_cast<std::uint8_t *>(const_cast<char *>(body.data())),
-      body.size());
+      reinterpret_cast<std::uint8_t *>(body.data()), body_size);
   lifecycle.record(TlsLifecycleStage::AfterRequest);
   cleanup.end();
   if (response != 200 && response != 204) {
     error = "ota_report_rejected";
     return false;
   }
-  recovery_.last_report_state = report_state;
-  if (!recovery_store_.save(recovery_)) {
+  ota_v2::RecoveryRecord candidate = recovery_;
+  candidate.last_report_state = report_state;
+  const OtaRecoveryStoreResult saved =
+      recovery_store_.saveAndVerify(candidate);
+  if (!recoverySaved(saved)) {
     error = "ota_report_checkpoint_save_failed";
     report_pending_.store(true, std::memory_order_release);
+    PM_LOG_ERROR("OTA", "REPORT_CHECKPOINT_SAVE_FAILED",
+                 "store_result=%s state=%s",
+                 otaRecoveryStoreResultName(saved), report_state);
     return false;
   }
-  report_pending_.store(false, std::memory_order_release);
+  recovery_ = candidate;
+  const char *desired = ota_v2::reportMilestoneForState(recovery_.state);
+  report_pending_.store(
+      ota_v2::nextReportMilestone(recovery_.last_report_state, desired) !=
+          nullptr,
+      std::memory_order_release);
   error.clear();
   return true;
 }
@@ -1397,46 +2115,63 @@ bool OtaService::configureTls(WiFiClientSecure &client,
   return true;
 }
 
-bool OtaService::persistState(const ota_v2::State state,
-                              const std::string &failure_code,
-                              const bool pending_reboot) {
+OtaRecoveryStoreResult OtaService::persistState(
+    const ota_v2::State state, const std::string &failure_code,
+    const bool pending_reboot) {
   if (recovery_.deployment_id.empty() || recovery_.release_id.empty())
-    return false;
-  recovery_.state = state;
-  recovery_.failure_code = failure_code;
-  recovery_.pending_reboot = pending_reboot;
-  if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
-    recovery_.target_build_hash = status_.target_build_hash;
-    recovery_.image_size = status_.image_size;
-    recovery_.bytes_received = status_.bytes_received;
-    recovery_.progress_percent = status_.progress_percent;
-    xSemaphoreGive(mutex_);
+    return OtaRecoveryStoreResult::IdentityMismatch;
+  if (recovery_.evidence_sequence ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    PM_LOG_FATAL("OTA", "EVIDENCE_SEQUENCE_EXHAUSTED",
+                 "error=PM-OTA-019 fail_closed=true");
+    return OtaRecoveryStoreResult::EvidenceSequenceExhausted;
   }
-  const bool saved = recovery_store_.save(recovery_);
-  if (!saved) {
+  ota_v2::RecoveryRecord candidate = recovery_;
+  ++candidate.evidence_sequence;
+  candidate.state = state;
+  candidate.failure_code = failure_code;
+  candidate.pending_reboot = pending_reboot;
+  if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) != pdTRUE)
+    return OtaRecoveryStoreResult::StateLockUnavailable;
+  candidate.target_build_hash = status_.target_build_hash;
+  candidate.image_size = status_.image_size;
+  candidate.bytes_received = status_.bytes_received;
+  candidate.progress_percent = status_.progress_percent;
+  xSemaphoreGive(mutex_);
+  const OtaRecoveryStoreResult saved =
+      recovery_store_.saveAndVerify(candidate);
+  if (!recoverySaved(saved)) {
     PM_LOG_ERROR("OTA", "RECOVERY_STATE_SAVE_FAILED",
-                 "error=PM-OTA-011 state=%s", ota_v2::stateName(state));
+                 "error=PM-OTA-011 state=%s store_result=%s",
+                 ota_v2::stateName(state),
+                 otaRecoveryStoreResultName(saved));
+    return saved;
   }
+  recovery_ = candidate;
+  recovery_load_result_ = OtaRecoveryStoreResult::Loaded;
+  ota_stage::setEvidenceSequence(recovery_.evidence_sequence);
   return saved;
 }
 
-void OtaService::setState(const ota_v2::State state,
-                          const std::string &result,
-                          const std::string &error, const bool persist,
-                          const bool report) {
+OtaRecoveryStoreResult OtaService::setState(
+    const ota_v2::State state, const std::string &result,
+    const std::string &error, const bool persist, const bool report) {
   bool pending_reboot = false;
-  if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) == pdTRUE) {
-    status_.state = state;
-    status_.last_result = result;
-    status_.last_error = error;
-    status_.in_progress = in_progress_.load(std::memory_order_acquire);
-    pending_reboot = status_.pending_reboot;
-    xSemaphoreGive(mutex_);
+  if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(250)) != pdTRUE) {
+    PM_LOG_ERROR("OTA", "STATE_LOCK_UNAVAILABLE", "state=%s",
+                 ota_v2::stateName(state));
+    return OtaRecoveryStoreResult::StateLockUnavailable;
   }
-  bool persisted = false;
+  status_.state = state;
+  status_.last_result = result;
+  status_.last_error = error;
+  status_.in_progress = in_progress_.load(std::memory_order_acquire);
+  pending_reboot = status_.pending_reboot;
+  xSemaphoreGive(mutex_);
+  OtaRecoveryStoreResult persisted = OtaRecoveryStoreResult::NotRequired;
   if (persist) {
     persisted = persistState(state, error, pending_reboot);
-    if (persisted) {
+    if (recoverySaved(persisted)) {
       const OtaStatus snapshot = status();
       ota_stage::record(ota_stage::Stage::RecoveryRecordPersisted,
                         snapshot.bytes_received, snapshot.image_size,
@@ -1456,46 +2191,91 @@ void OtaService::setState(const ota_v2::State state,
                                  state == ota_v2::State::BinaryVerifying ||
                                  state == ota_v2::State::PartitionWriting);
   }
-  if (report && persist && state != ota_v2::State::Idle &&
+  if (report && persist && recoverySaved(persisted) &&
+      state != ota_v2::State::Idle &&
       state != ota_v2::State::ManifestUnavailable) {
     report_pending_.store(true, std::memory_order_release);
   }
-  PM_LOG_INFO("OTA", "STATE_CHANGED", "state=%s result=%s error=%s",
+  PM_LOG_INFO("OTA", "STATE_CHANGED",
+              "state=%s result=%s error=%s persistence=%s",
               ota_v2::stateName(state), result.c_str(),
-              error.empty() ? "none" : error.c_str());
+              error.empty() ? "none" : error.c_str(),
+              otaRecoveryStoreResultName(persisted));
+  return persisted;
 }
 
-std::string OtaService::reportJson(const char *report_state) const {
+bool OtaService::reportJson(
+    const char *report_state,
+    std::array<char, kOtaReportMaximumBytes> &output,
+    std::size_t &size) const {
+  output.fill('\0');
+  size = 0U;
   const OtaStatus snapshot = status();
   if (snapshot.deployment_id.empty() || snapshot.release_id.empty() ||
-      snapshot.attempt == 0U)
-    return {};
-  JsonDocument document;
-  document["device_id"] = config_.identity().device_id;
-  document["deployment_id"] = snapshot.deployment_id;
-  document["release_id"] = snapshot.release_id;
-  document["attempt"] = snapshot.attempt;
-  document["state"] = report_state;
-  document["current_firmware_version"] = version::FIRMWARE;
-  document["current_build_hash"] = runningBuildHash();
-  document["target_version"] = snapshot.target_version;
-  document["target_sha256"] = snapshot.target_sha256;
-  document["bytes_received"] = snapshot.bytes_received;
-  document["image_size"] = snapshot.image_size;
-  document["progress"] = snapshot.progress_percent;
-  document["boot_id"] = config_.identity().boot_id;
-  const std::string &failure_code = recovery_.failure_code;
-  if (failure_code.empty() ||
-      !ota_v2::reportStateAcceptsFailureEvidence(report_state)) {
-    document["failure_code"] = nullptr;
-    document["failure_summary"] = nullptr;
-  } else {
-    document["failure_code"] = failure_code;
-    document["failure_summary"] = failure_code;
+      snapshot.attempt == 0U || report_state == nullptr ||
+      report_state[0] == '\0') {
+    return false;
   }
-  std::string body;
-  serializeJson(document, body);
-  return body;
+  const DeviceIdentity identity = config_.identity();
+  const std::string current_build_hash = runningBuildHash();
+  const std::string &failure_code = recovery_.failure_code;
+  const bool include_failure =
+      !failure_code.empty() &&
+      ota_v2::reportStateAcceptsFailureEvidence(report_state);
+  BoundedJsonWriter writer(output.data(), output.size());
+  const bool written =
+      writer.literal("{\"device_id\":") &&
+      writer.string(BoundedTextView(identity.device_id.data(),
+                                    identity.device_id.size())) &&
+      writer.literal(",\"deployment_id\":") &&
+      writer.string(BoundedTextView(snapshot.deployment_id.data(),
+                                    snapshot.deployment_id.size())) &&
+      writer.literal(",\"release_id\":") &&
+      writer.string(BoundedTextView(snapshot.release_id.data(),
+                                    snapshot.release_id.size())) &&
+      writer.literal(",\"attempt\":") &&
+      writer.unsignedValue(snapshot.attempt) &&
+      writer.literal(",\"evidence_sequence\":") &&
+      writer.unsignedValue(recovery_.evidence_sequence) &&
+      writer.literal(",\"state\":") && writer.string(report_state) &&
+      writer.literal(",\"current_firmware_version\":") &&
+      writer.string(version::FIRMWARE) &&
+      writer.literal(",\"current_build_hash\":") &&
+      writer.string(BoundedTextView(current_build_hash.data(),
+                                    current_build_hash.size())) &&
+      writer.literal(",\"target_version\":") &&
+      writer.string(BoundedTextView(snapshot.target_version.data(),
+                                    snapshot.target_version.size())) &&
+      writer.literal(",\"target_sha256\":") &&
+      writer.string(BoundedTextView(snapshot.target_sha256.data(),
+                                    snapshot.target_sha256.size())) &&
+      writer.literal(",\"bytes_received\":") &&
+      writer.unsignedValue(snapshot.bytes_received) &&
+      writer.literal(",\"image_size\":") &&
+      writer.unsignedValue(snapshot.image_size) &&
+      writer.literal(",\"progress\":") &&
+      writer.unsignedValue(snapshot.progress_percent) &&
+      writer.literal(",\"boot_id\":") &&
+      writer.string(BoundedTextView(identity.boot_id.data(),
+                                    identity.boot_id.size())) &&
+      writer.literal(",\"failure_code\":") &&
+      (include_failure
+           ? writer.string(BoundedTextView(failure_code.data(),
+                                           failure_code.size()))
+           : writer.nullValue()) &&
+      writer.literal(",\"failure_summary\":") &&
+      (include_failure
+           ? writer.string(BoundedTextView(failure_code.data(),
+                                           failure_code.size()))
+           : writer.nullValue()) &&
+      writer.literal("}");
+  if (!written || !writer.ok() || writer.size() == 0U ||
+      writer.size() >= output.size()) {
+    output.fill('\0');
+    return false;
+  }
+  size = writer.size();
+  return true;
 }
 
 void OtaService::initializePartitionStatus() {

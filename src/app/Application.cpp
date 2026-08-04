@@ -273,6 +273,9 @@ bool Application::begin() {
   logger.markBootHealthy();
   return true;
 #endif
+  if (ota_.restrictedRecoveryMode()) {
+    return beginRestrictedRecovery();
+  }
   config_.recordBootStarted();
   clock_.begin();
   clock_.update();
@@ -350,26 +353,142 @@ bool Application::begin() {
   }
   http_->begin();
   if (ota_.runningImagePendingVerification()) {
-    const std::uint64_t deadline = millis() + 8000U;
-    while (millis() < deadline &&
-           (meter_progress_.load() == 0 || aggregation_progress_.load() == 0 ||
-            network_progress_.load() == 0 || sync_progress_.load() == 0)) {
-      delay(25);
+    constexpr std::uint64_t kMinimumObservationMs = 30'000U;
+    constexpr std::uint64_t kMaximumObservationMs = 60'000U;
+    const std::uint64_t observation_started_ms = millis();
+    ota_v2::PostBootHealthClass post_boot_health =
+        ota_v2::PostBootHealthClass::RetryableLocalInitialization;
+    ota_v2::PostBootHealthEvidence evidence;
+    bool retry_logged = false;
+    bool first_storage_retry_queued = false;
+    bool second_storage_retry_queued = false;
+    for (;;) {
+      const std::uint64_t now_ms = millis();
+      const std::uint64_t elapsed_ms = now_ms - observation_started_ms;
+      const NetworkStatus network = network_.status();
+      const HeapSnapshot heap = heap_telemetry_.snapshot();
+      const StorageHealth storage_health = storage_.health();
+      const MeterMetrics meter_health = meter_->metrics();
+      const bool queue_first_storage_retry =
+          !storage_health.writable && elapsed_ms >= 5'000U &&
+          !first_storage_retry_queued;
+      const bool queue_second_storage_retry =
+          !storage_health.writable && elapsed_ms >= 35'000U &&
+          !second_storage_retry_queued;
+      if (queue_first_storage_retry || queue_second_storage_retry) {
+        const bool queued = storage_coordinator_.queueRemount();
+        if (queue_first_storage_retry && queued) {
+          first_storage_retry_queued = true;
+        }
+        if (queue_second_storage_retry && queued) {
+          second_storage_retry_queued = true;
+        }
+        if (queued) {
+          PM_LOG_WARN(
+              "OTA", "POST_BOOT_STORAGE_RETRY_QUEUED",
+              "elapsed_ms=%llu attempt=%u format_attempted=false",
+              static_cast<unsigned long long>(elapsed_ms),
+              queue_second_storage_retry ? 2U : 1U);
+        }
+      }
+      evidence.core_primitives_ready =
+          sample_queue_ != nullptr && maintenance_queue_ != nullptr &&
+          meter_mutex_ != nullptr && sync_ != nullptr && http_ != nullptr &&
+          meter_task_ != nullptr && aggregation_task_ != nullptr &&
+          storage_task_ != nullptr && network_task_ != nullptr &&
+          sync_task_ != nullptr && health_task_ != nullptr &&
+          maintenance_task_ != nullptr && serial_command_task_ != nullptr;
+      evidence.heap_integrity_ok = heap.integrity_ok;
+      evidence.meter_task_progressed = meter_progress_.load() != 0U;
+      evidence.aggregation_task_progressed =
+          aggregation_progress_.load() != 0U;
+      evidence.network_task_progressed = network_progress_.load() != 0U;
+      evidence.sync_task_progressed = sync_progress_.load() != 0U;
+      evidence.observation_window_expired =
+          elapsed_ms >= kMaximumObservationMs;
+      evidence.storage_available = storage_health.writable;
+      evidence.meter_hardware_available = meter_health.successes > 0U;
+      evidence.network_initialized = network_started;
+      evidence.wifi_connected = network.station_connected;
+      evidence.time_trusted = network.time_synchronized;
+      evidence.server_reachable = network.server_reachable;
+      post_boot_health = ota_v2::classifyPostBootHealth(evidence);
+
+      const bool locally_healthy =
+          post_boot_health == ota_v2::PostBootHealthClass::Healthy ||
+          post_boot_health ==
+              ota_v2::PostBootHealthClass::HealthyExternalDegraded;
+      if (post_boot_health ==
+              ota_v2::PostBootHealthClass::FatalLocalRuntime ||
+          post_boot_health ==
+              ota_v2::PostBootHealthClass::LocalInitializationBlocked) {
+        break;
+      }
+      if (elapsed_ms >= kMinimumObservationMs && locally_healthy) {
+        break;
+      }
+      if (elapsed_ms >= kMinimumObservationMs && !retry_logged) {
+        retry_logged = true;
+        PM_LOG_WARN(
+            "OTA", "POST_BOOT_LOCAL_INIT_RETRY",
+            "health=%s elapsed_ms=%llu deadline_ms=%llu "
+            "external_conditions_do_not_invalidate=true",
+            ota_v2::postBootHealthClassName(post_boot_health),
+            static_cast<unsigned long long>(elapsed_ms),
+            static_cast<unsigned long long>(kMaximumObservationMs));
+      }
+      feedWatchdog();
+      delay(100U);
     }
-    const bool post_boot_healthy =
-        storage_started && storage_.health().writable && meter_started &&
-        network_started && meter_progress_.load() != 0 &&
-        aggregation_progress_.load() != 0 && network_progress_.load() != 0 &&
-        sync_progress_.load() != 0;
-    if (!ota_.checkRunningImage(post_boot_healthy)) {
-      PM_LOG_FATAL("OTA", "POST_BOOT_VALIDATION_FAILED",
-                   "error=PM-OTA-006 rollback=automatic");
-      delay(250);
-      ESP.restart();
+    const bool local_initialization_blocked =
+        post_boot_health ==
+        ota_v2::PostBootHealthClass::LocalInitializationBlocked;
+    const bool fatal_local_runtime =
+        post_boot_health == ota_v2::PostBootHealthClass::FatalLocalRuntime;
+    const char *const unavailable_local_state =
+        local_initialization_blocked
+            ? "local_initialization_blocked"
+            : (fatal_local_runtime ? "local_runtime_failed"
+                                   : "local_initialization_retry");
+    PM_LOG_INFO(
+        "OTA", "POST_BOOT_EVIDENCE",
+        "health=%s observation_ms=%llu heap_integrity=%s meter_task=%s "
+        "aggregation_task=%s network_task=%s sync_task=%s storage=%s "
+        "meter_hardware=%s network_initialization=%s wifi=%s time=%s "
+        "server=%s external_conditions_do_not_invalidate=true",
+        ota_v2::postBootHealthClassName(post_boot_health),
+        static_cast<unsigned long long>(millis() - observation_started_ms),
+        evidence.heap_integrity_ok ? "ready" : "failed",
+        evidence.meter_task_progressed ? "progressed" : "waiting",
+        evidence.aggregation_task_progressed ? "progressed" : "waiting",
+        evidence.network_task_progressed ? "progressed" : "waiting",
+        evidence.sync_task_progressed ? "progressed" : "waiting",
+        evidence.storage_available ? "available" : unavailable_local_state,
+        evidence.meter_hardware_available ? "available"
+                                          : unavailable_local_state,
+        evidence.network_initialized ? "initialized"
+                                     : unavailable_local_state,
+        evidence.wifi_connected ? "connected" : "external_degraded",
+        evidence.time_trusted ? "trusted" : "external_degraded",
+        evidence.server_reachable ? "reachable" : "external_degraded");
+    const ota_v2::RunningImageCheckResult validation_result =
+        ota_.checkRunningImage(post_boot_health);
+    if (validation_result != ota_v2::RunningImageCheckResult::Validated &&
+        validation_result != ota_v2::RunningImageCheckResult::NotPending) {
+      PM_LOG_FATAL(
+          "OTA", "POST_BOOT_VALIDATION_INCOMPLETE",
+          "error=PM-OTA-006 result=%s blind_restart=false "
+          "local_recovery_available=true",
+          ota_v2::runningImageCheckResultName(validation_result));
       return false;
     }
-  } else if (!ota_.checkRunningImage(true)) {
-    PM_LOG_WARN("OTA", "PARTITION_STATE_UNAVAILABLE", "error=PM-OTA-007");
+  } else {
+    const ota_v2::RunningImageCheckResult partition_result =
+        ota_.checkRunningImage(ota_v2::PostBootHealthClass::Healthy);
+    if (partition_result ==
+        ota_v2::RunningImageCheckResult::PartitionStateUnavailable) {
+      PM_LOG_WARN("OTA", "PARTITION_STATE_UNAVAILABLE", "error=PM-OTA-007");
+    }
   }
   config_.recordBootHealthy();
   logger.markBootHealthy();
@@ -386,6 +505,56 @@ bool Application::begin() {
       network_started ? "ready" : "degraded",
       config_.safeMode() ? "true" : "false",
       static_cast<unsigned long>(ESP.getFreeHeap()));
+  return true;
+}
+
+bool Application::beginRestrictedRecovery() {
+  // This path is intentionally smaller than safe mode.  The running image is
+  // still PENDING_VERIFY and its authenticated OTA identity was not usable,
+  // so neither measurement, durable reading creation, storage retention, nor
+  // server synchronization may start.  Only local recovery dependencies are
+  // initialized.
+  config_.recordBootStarted();
+  clock_.begin();
+  clock_.update();
+  const bool network_started = network_.begin();
+#if PM_SIMULATED_METER
+  meter_ = std::unique_ptr<IMeter>(new (std::nothrow) SimulatedMeter());
+#else
+  meter_ = std::unique_ptr<IMeter>(new (std::nothrow) PzemMeter(
+      pzem_serial_, config_.config().pzem_timeout_ms, 2));
+#endif
+  maintenance_queue_ =
+      xQueueCreate(build::ACTION_QUEUE_DEPTH, sizeof(MaintenanceMessage));
+  meter_mutex_ = xSemaphoreCreateMutex();
+  if (meter_ == nullptr || maintenance_queue_ == nullptr ||
+      meter_mutex_ == nullptr) {
+    PM_LOG_FATAL(
+        "OTA", "RESTRICTED_RECOVERY_PRIMITIVE_FAILED",
+        "error=PM-OTA-020 meter=%s action_queue=%s meter_mutex=%s",
+        meter_ == nullptr ? "failed" : "ready",
+        maintenance_queue_ == nullptr ? "failed" : "ready",
+        meter_mutex_ == nullptr ? "failed" : "ready");
+    return false;
+  }
+  http_ = std::unique_ptr<HttpApi>(new (std::nothrow) HttpApi(
+      config_, network_, clock_, storage_, storage_coordinator_, diagnostics_,
+      *meter_, ota_, maintenance_queue_));
+  if (http_ == nullptr || !createRestrictedRecoveryTasks()) {
+    PM_LOG_FATAL("OTA", "RESTRICTED_RECOVERY_START_FAILED",
+                 "error=PM-OTA-020 http=%s network=%s",
+                 http_ == nullptr ? "failed" : "ready",
+                 network_started ? "ready" : "degraded");
+    return false;
+  }
+  http_->begin();
+  PM_LOG_FATAL(
+      "OTA", "RESTRICTED_RECOVERY_READY",
+      "pending_image=true network=%s http=%s serial=ready diagnostics=ready "
+      "meter_task=disabled aggregation_task=disabled storage_task=disabled "
+      "server_sync_task=disabled image_validated=false",
+      network_started ? "ready" : "unavailable",
+      network_started ? "ready" : "registered_network_unavailable");
   return true;
 }
 
@@ -1340,7 +1509,7 @@ void Application::captureTaskDiagnostics() const {
        false},
       {"NetworkTask", network_task_, task_config::kNetworkStackBytes, 1,
        true},
-      {"ServerSyncTask", sync_task_, task_config::kServerSyncStackBytes, 0,
+      {"ServerSyncTask", sync_task_, task_config::kServerSyncStackBytes, 1,
        false},
       {"HealthTask", health_task_, task_config::kHealthStackBytes, 0, false},
       {"OtaMaintenanceTask", maintenance_task_,
@@ -1496,8 +1665,10 @@ void Application::executeMaintenance(const MaintenanceMessage &message) {
     break;
   case MaintenanceAction::TestServerTls:
   case MaintenanceAction::TestHeartbeat:
-    sync_->requestImmediateSync();
-    ok = true;
+    if (sync_ != nullptr) {
+      sync_->requestImmediateSync();
+      ok = true;
+    }
     break;
   case MaintenanceAction::Reboot:
     storage_coordinator_.enqueueEvent(
@@ -1527,8 +1698,9 @@ void Application::executeMaintenance(const MaintenanceMessage &message) {
     ota_.applyFromManifestUrl(message.argument);
     return;
   case MaintenanceAction::RollbackOta:
-    ota_.rollbackAndReboot();
-    return;
+    ok = ota_.rollbackAndReboot() == ota_v2::RollbackResult::Initiated;
+    code = "EVT_OTA_ROLLBACK_REQUESTED";
+    break;
   }
   storage_coordinator_.enqueueEvent(
       ok ? code : "EVT_MAINTENANCE_FAILED", ok ? "info" : "error",
@@ -1577,6 +1749,25 @@ bool Application::createTasks() {
       "result=%s count=8 sample_queue_capacity=8 action_queue_capacity=%u",
       created ? "success" : "failed",
       static_cast<unsigned>(build::ACTION_QUEUE_DEPTH));
+  return created;
+}
+
+bool Application::createRestrictedRecoveryTasks() {
+  BaseType_t ok = pdPASS;
+  ok &= xTaskCreatePinnedToCore(networkTaskEntry, "NetworkTask",
+                                task_config::kNetworkStackBytes, this, 2,
+                                &network_task_, 1);
+  ok &= xTaskCreatePinnedToCore(maintenanceTaskEntry, "OtaMaintenanceTask",
+                                task_config::kMaintenanceStackBytes, this, 2,
+                                &maintenance_task_, 0);
+  ok &= xTaskCreatePinnedToCore(serialCommandTaskEntry, "SerialCommandTask",
+                                task_config::kSerialCommandStackBytes, this, 1,
+                                &serial_command_task_, 0);
+  const bool created = ok == pdPASS;
+  PM_LOG_INFO(
+      "TASK", "RESTRICTED_RECOVERY_TASK_SET_CREATED",
+      "result=%s count=3 normal_measurement=false normal_sync=false",
+      created ? "success" : "failed");
   return created;
 }
 

@@ -56,6 +56,8 @@ private:
                                   std::uint32_t largest_internal);
   void executeMaintenance(const MaintenanceMessage &message);
   bool createTasks();
+  bool beginRestrictedRecovery();
+  bool createRestrictedRecoveryTasks();
 
   ConfigService config_;
   ClockService clock_;

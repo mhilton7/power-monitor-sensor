@@ -32,8 +32,14 @@ inline constexpr std::uint32_t kNetworkStackBytes = 8192U;
 // mbedTLS certificate verification and HTTP/HMAC framing share this task.
 // Production traces showed fewer than 1 KiB remaining during a heartbeat at
 // 16 KiB, which could corrupt the AsyncWebServer task instead of returning a
-// recoverable request error.
-inline constexpr std::uint32_t kServerSyncStackBytes = 24U * 1024U;
+// recoverable request error. A physical 1.0.15 trace of the later bounded
+// transport implementation measured 14,612 bytes unused from the 24 KiB
+// allocation at its deepest observed checkpoint. A 20 KiB allocation keeps
+// 10,516 bytes (51%) for the same measured path, safely above the mandatory
+// 25% margin, and returns 4 KiB of internal DRAM to the unchanged 64 KiB / 32
+// KiB TLS admission reserve. Do not reduce this bound without a new physical
+// maximum-payload and failure-path soak.
+inline constexpr std::uint32_t kServerSyncStackBytes = 20U * 1024U;
 // Physical 1.0.6 traces left only 516-724 bytes (8-11%) after the health
 // task captured task metrics and persisted the disconnect flight recorder.
 // Eight KiB keeps that measured path above the mandatory 25% margin without

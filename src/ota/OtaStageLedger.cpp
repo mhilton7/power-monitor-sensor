@@ -1,5 +1,6 @@
 #include "ota/OtaStageLedger.h"
 
+#include <atomic>
 #include <cstring>
 
 #include <Arduino.h>
@@ -13,7 +14,7 @@ namespace pm::ota_stage {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x504D4F54U; // "PMOT"
-constexpr std::uint16_t kVersion = 2U;
+constexpr std::uint16_t kVersion = 4U;
 
 struct RetainedRecord {
   std::uint32_t magic{0U};
@@ -25,6 +26,7 @@ struct RetainedRecord {
 
 RTC_NOINIT_ATTR RetainedRecord retained;
 Snapshot prior{};
+std::atomic<std::uint64_t> runtime_evidence_sequence{0U};
 
 std::uint32_t checksum(const RetainedRecord &source) {
   RetainedRecord copy = source;
@@ -80,7 +82,10 @@ const char *defaultContext(const Stage stage) {
   case Stage::ShaFinalized: return "tls_active";
   case Stage::Boot:
   case Stage::PostBootImageDetected:
+  case Stage::PostBootValidationRetryable:
   case Stage::PostBootValidated:
+  case Stage::RollbackMarkRequested:
+  case Stage::RollbackMarkFailed:
   case Stage::RollbackDetected: return "idle";
   default: return "ota_active";
   }
@@ -96,6 +101,7 @@ void commit() {
 void beginBoot(const char *boot_id, const char *firmware_version,
                const char *build_hash, const std::uint32_t boot_count,
                const std::uint32_t reset_reason_code) {
+  runtime_evidence_sequence.store(0U, std::memory_order_release);
   prior = valid(retained) ? retained.snapshot : Snapshot{};
   retained = RetainedRecord{};
   retained.magic = kMagic;
@@ -117,13 +123,31 @@ void beginBoot(const char *boot_id, const char *firmware_version,
   commit();
 }
 
-void bindDeployment(const char *deployment_id, const std::uint32_t attempt) {
+void bindDeployment(const char *deployment_id, const std::uint32_t attempt,
+                    const std::uint64_t evidence_sequence) {
+  runtime_evidence_sequence.store(evidence_sequence,
+                                  std::memory_order_release);
   if (!valid(retained)) {
     return;
   }
   copyText(retained.snapshot.deployment_id, deployment_id);
   retained.snapshot.attempt = attempt;
+  retained.snapshot.evidence_sequence = evidence_sequence;
   commit();
+}
+
+void setEvidenceSequence(const std::uint64_t evidence_sequence) {
+  runtime_evidence_sequence.store(evidence_sequence,
+                                  std::memory_order_release);
+  if (!valid(retained)) {
+    return;
+  }
+  retained.snapshot.evidence_sequence = evidence_sequence;
+  commit();
+}
+
+std::uint64_t currentEvidenceSequence() {
+  return runtime_evidence_sequence.load(std::memory_order_acquire);
 }
 
 void record(const Stage stage, const std::uint32_t bytes_received,
@@ -200,13 +224,22 @@ const char *stageName(const Stage stage) {
   case Stage::HttpTransportDestroyed: return "http_transport_destroyed";
   case Stage::UpdateEndBeginning: return "update_end_beginning";
   case Stage::UpdateEndCompleted: return "update_end_completed";
+  case Stage::BootPartitionVerification:
+    return "boot_partition_verification";
   case Stage::BootPartitionSelected: return "boot_partition_selected";
   case Stage::RecoveryRecordPersisted: return "recovery_record_persisted";
+  case Stage::RecoveryReadbackVerified:
+    return "recovery_readback_verified";
+  case Stage::BootPartitionRestored: return "boot_partition_restored";
   case Stage::PartitionWritten: return "partition_written";
   case Stage::RebootMilestoneReported: return "reboot_milestone_reported";
   case Stage::RebootScheduled: return "reboot_scheduled";
   case Stage::PostBootImageDetected: return "post_boot_image_detected";
+  case Stage::PostBootValidationRetryable:
+    return "post_boot_validation_retryable";
   case Stage::PostBootValidated: return "post_boot_validated";
+  case Stage::RollbackMarkRequested: return "rollback_mark_requested";
+  case Stage::RollbackMarkFailed: return "rollback_mark_failed";
   case Stage::RollbackDetected: return "rollback_detected";
   case Stage::FailurePersisted: return "failure_persisted";
   case Stage::Failed: return "failed";

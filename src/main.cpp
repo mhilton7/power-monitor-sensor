@@ -14,8 +14,10 @@ pm::Application application;
 
 void setup() {
   if (!application.begin()) {
-    // A failed runtime primitive/NVS initialization is the only terminal boot
-    // condition. Missing meter, card, Wi-Fi, time, or server remain degraded.
+    // Runtime primitive/NVS failures and a pending OTA candidate that exhausts
+    // its bounded local-initialization window stop setup here. Already-created
+    // tasks and the local recovery UI remain alive; this loop never performs a
+    // blind restart. External Wi-Fi, time, and server outages stay degraded.
     for (;;) {
       delay(1000);
     }

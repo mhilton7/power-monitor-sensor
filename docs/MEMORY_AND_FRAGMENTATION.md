@@ -302,10 +302,23 @@ part of this repair run.
 `native-sanitized` enables AddressSanitizer, UndefinedBehaviorSanitizer, and
 LeakSanitizer only on host toolchains that provide their runtimes. The
 repository's pinned Windows MinGW 5.1 package does not include those runtime
-libraries. On this Windows validation run the environment therefore used
-checked libstdc++ iterators and `-fstack-protector-all`; its build and native
-test executable passed. It was not an ASan, UBSan, or LeakSanitizer run, and no
-separate sanitizer-capable toolchain was run for this source revision.
+libraries. The Windows environment therefore uses checked libstdc++ iterators
+and `-fstack-protector-all`; that result must not be described as ASan or
+UBSan coverage.
+
+The current audit additionally ran the same deterministic native source set
+under genuine Linux ASan and UBSan. An isolated Debian Bookworm image used GCC
+12.2.0, `libasan.so.8`, and `libubsan.so.1`. The test container had no network,
+mounted this repository read-only, used a read-only root filesystem, and wrote
+the executable only to tmpfs. Compilation used
+`-fsanitize=address,undefined -fno-omit-frame-pointer
+-fno-sanitize-recover=all`; runtime used leak detection, abort-on-error ASan,
+and halt-on-error UBSan. The deterministic randomized suite completed 128
+sequences and 14,080 events, the complete native executable passed, and no
+ASan, UBSan, or leak diagnostic was emitted. `-Wmaybe-uninitialized` alone was
+suppressed because GCC reports it inside ArduinoJson 7.4.3's empty iterator;
+all other warnings remained fatal. Exact commands and limitations are retained
+in the server audit's `docs/benchmarks/SENSOR_STABILITY_PERFORMANCE.md`.
 
 Physical deployment validation remains a later step. It must use the exact
 binary and matching ELF hash, confirm real heap/stack telemetry, and must not

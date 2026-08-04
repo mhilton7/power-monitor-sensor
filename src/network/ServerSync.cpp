@@ -3133,15 +3133,25 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
       storage.sequence_reconciliation_in_progress
           ? "sequence_reconciling"
           : (storage_ok
-                 ? (storage.index_healthy ? storage.pressure_state.data()
-                                          : "history_integrity_degraded")
+                 ? (!storage.index_healthy
+                        ? "reading_index_integrity_degraded"
+                        : (!storage.event_log_healthy
+                               ? "event_log_integrity_degraded"
+                               : storage.pressure_state.data()))
                  : "storage_degraded");
   storage_json["error_count"] = storage.write_failures;
   JsonObject storage_details = storage_json["details"].to<JsonObject>();
   storage_details["present"] = storage.present;
   storage_details["mounted"] = storage.mounted;
   storage_details["writable"] = storage.writable;
+  // Preserve the legacy field while making its reading/index scope explicit.
   storage_details["history_integrity_verified"] = storage.index_healthy;
+  storage_details["reading_index_integrity_verified"] =
+      storage.index_healthy;
+  storage_details["event_log_integrity_verified"] =
+      storage.event_log_healthy;
+  storage_details["event_log_integrity_status"] =
+      storage.event_log_integrity_status.data();
   storage_details["sequence_floor_ready"] = storage.sequence_floor_ready;
   storage_details["sequence_reconciliation_in_progress"] =
       storage.sequence_reconciliation_in_progress;
@@ -3263,6 +3273,14 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
   const ota_stage::Snapshot ota_current = ota_stage::current();
   const ota_stage::Snapshot ota_previous = ota_stage::previousBoot();
   JsonObject ota_recovery = resources["ota_recovery"].to<JsonObject>();
+  if (ota_current.deployment_id[0] != '\0' && ota_current.attempt != 0U) {
+    ota_recovery["deployment_id"] = ota_current.deployment_id.data();
+    ota_recovery["attempt"] = ota_current.attempt;
+    // The recovery store is committed before this runtime mirror advances.
+    // Reading the atomic mirror avoids publishing a transient zero if the
+    // CRC-protected RTC diagnostics ledger is being updated concurrently.
+    ota_recovery["evidence_sequence"] = ota_stage::currentEvidenceSequence();
+  }
   ota_recovery["stage"] = ota_stage::stageName(ota_current.stage);
   ota_recovery["bytes_received"] = ota_current.bytes_received;
   ota_recovery["image_size"] = ota_current.image_size;
