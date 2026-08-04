@@ -58,7 +58,7 @@ Build the next unused semantic version first, then generate the reproducible
 existing-trust bundle. For firmware 1.0.16:
 
 ```sh
-python tools/generate_release.py --skip-build --version 1.0.16 --channel stable
+python tools/generate_release.py --skip-build --version 1.0.16 --channel canary
 ```
 
 The command fails if build provenance is missing or stale, required images
@@ -67,6 +67,10 @@ metadata is invalid, the application/ELF build hash differs, or packaged
 `boot_app0.bin` is not assigned to `0x11000`. Verify every `SHA256SUMS` line and
 review `firmware-metadata.json`, `flash-layout.json`,
 `build-provenance.json`, `size-margin.json`, and `dependencies.json`.
+Keep the bundle on the canary channel until the physical PZEM, microSD,
+stability, and managed-OTA gates pass. Generate stable metadata only as a
+separate promotion after those gates; never rebuild different bytes under the
+same semantic version.
 
 For the ordinary central-server path, upload only:
 

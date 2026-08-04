@@ -1,7 +1,7 @@
 {
   "schema_version": "pm-firmware-artifact/1",
   "version": "1.0.16",
-  "channel": "stable",
+  "channel": "canary",
   "project_name": "power-monitor-sensor",
   "hardware_target": "esp32-s3",
   "protocol_version": "pm-protocol/1.0.0",
@@ -12,5 +12,5 @@
   "build_date": "Aug  4 2026",
   "ota_authentication_mode": "existing_device_hmac",
   "ota_protocol_version": 2,
-  "release_notes": "Power Monitor Sensor Agent 1.0.16: pm-protocol/1.0.0 production release. Physical PZEM, microSD, enclosure, and device-authenticated HMAC OTA validation remain required on the target installation."
+  "release_notes": "Power Monitor Sensor Agent 1.0.16 canary for non-erasing USB bootstrap validation. Physical PZEM, microSD, enclosure, sensor stability, and device-authenticated HMAC OTA validation are required before stable promotion."
 }

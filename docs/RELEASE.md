@@ -13,12 +13,15 @@
 5. Generate the existing-trust bundle, for example:
 
    ```sh
-   python tools/generate_release.py --skip-build --version 1.0.16 --channel stable
+   python tools/generate_release.py --skip-build --version 1.0.16 --channel canary
    ```
 
    The generator verifies current source/build provenance and strict embedded
    ESP32-S3 application metadata. It writes `firmware-metadata.json` for audit;
    the central OTA workflow still accepts only `firmware.bin` from the user.
+   Keep hardware-sensitive candidates on `canary`; promote metadata to
+   `stable` only after the physical gates pass, without changing the verified
+   firmware bytes or reusing a version for a rebuild.
 6. Independently verify `SHA256SUMS`, `firmware-metadata.json`,
    `build-provenance.json`, `flash-layout.json`, `size-margin.json`,
    dependencies, target, project, protocol, semantic version, application/ELF
