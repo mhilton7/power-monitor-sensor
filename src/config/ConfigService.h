@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -131,6 +132,22 @@ struct CompactSensorStatusConfig {
   bool truncated{false};
 };
 
+// Non-secret evidence for a claimed enrollment whose credentials must remain
+// inactive until pre-enrollment reading data has been discarded and the SD
+// card has been rebound to the assigned device UUID.
+struct EnrollmentActivationInfo {
+  bool policy_bound{false};
+  bool pending{false};
+  std::string operation_id;
+  std::string device_id;
+  std::string source_card_device_id;
+  std::uint64_t source_card_generation{0U};
+  std::uint64_t source_data_generation{0U};
+  std::uint64_t target_data_generation{0U};
+  std::uint64_t reset_boundary{0U};
+  std::uint64_t sequence_floor{0U};
+};
+
 // Hot-path configuration snapshots intentionally exclude the CA, OTA key,
 // and unrelated strings. RuntimeConfig can contain several KiB of PEM data;
 // copying it from a 250 ms network loop or every meter sample needlessly
@@ -237,6 +254,15 @@ public:
                       const std::uint8_t *enrollment_secret,
                       std::size_t secret_length,
                       const std::string &ota_public_key);
+  bool stageEnrollmentActivation(
+      const std::string &device_id,
+      const std::uint8_t *enrollment_secret, std::size_t secret_length,
+      const std::string &ota_public_key,
+      std::uint64_t target_data_generation, std::uint64_t reset_boundary,
+      std::uint64_t source_card_generation,
+      const std::string &source_card_device_id);
+  EnrollmentActivationInfo pendingEnrollmentActivation() const;
+  bool activatePendingEnrollment(std::uint64_t sequence_floor);
   bool directionalKeys(crypto::Key32 &device_to_server,
                        crypto::Key32 &server_to_device) const;
   bool otaManifestKey(crypto::Key32 &server_to_device_ota) const;
@@ -273,6 +299,18 @@ public:
   bool setServerConfigVersion(std::uint32_t version);
   std::uint64_t energyOffsetWh() const;
   bool setEnergyOffsetWh(std::uint64_t offset);
+  bool setEnergyOffsetWhForDataResetDrain(std::uint64_t offset);
+  std::uint64_t energyBaselineAbsoluteWh() const;
+  bool setEnergyBaselineAbsoluteWh(std::uint64_t baseline);
+  std::uint64_t dataGeneration() const;
+  bool setDataGeneration(std::uint64_t generation);
+  std::uint64_t dataResetBoundary() const;
+  bool setDataResetBoundary(std::uint64_t boundary);
+  bool setDataResetFreeze(bool frozen);
+  bool dataResetFrozen() const;
+  // Returns only a keyed semantic digest. Secret configuration values are
+  // consumed locally and are never included in the returned value or logs.
+  bool configurationPreservationDigest(std::string &digest) const;
   bool recordBootStarted();
   bool recordBootHealthy();
   bool setDiagnosticLogLevel(std::uint8_t level);
@@ -300,6 +338,11 @@ private:
                               std::size_t secret_length,
                               const std::string &ota_public_key,
                               std::uint64_t reenrollment_generation);
+  bool commitEnrollmentActivationRecord(
+      const EnrollmentActivationInfo &activation,
+      const std::uint8_t *enrollment_secret, std::size_t secret_length,
+      const std::string &ota_public_key, bool active,
+      std::uint64_t reenrollment_generation);
   bool commitEnrollmentTombstone(std::uint64_t reenrollment_generation = 0);
   bool commitReenrollmentPending(const std::string &token,
                                  std::uint64_t reenrollment_generation);
@@ -308,7 +351,8 @@ private:
                             std::vector<std::uint8_t> &enrollment_secret,
                             std::string &ota_public_key,
                             std::string &pending_reenrollment_token,
-                            std::uint64_t &reenrollment_generation) const;
+                            std::uint64_t &reenrollment_generation,
+                            EnrollmentActivationInfo &activation) const;
   bool clearPersistentNamespace();
   bool
   prepareProvisioningTransaction(provisioning_transaction::Journal &journal);
@@ -335,7 +379,8 @@ private:
                          const std::vector<std::uint8_t> &enrollment_secret,
                          const std::string &ota_public_key,
                          const std::string &pending_reenrollment_token,
-                         std::uint64_t reenrollment_generation);
+                         std::uint64_t reenrollment_generation,
+                         const EnrollmentActivationInfo &activation = {});
 
   mutable Preferences preferences_;
   RuntimeConfig config_;
@@ -349,6 +394,7 @@ private:
   std::string ota_public_key_;
   std::string pending_reenrollment_token_;
   std::uint64_t reenrollment_generation_{0};
+  EnrollmentActivationInfo pending_enrollment_activation_{};
   std::uint64_t persistent_generation_{0};
   std::uint64_t server_ack_sequence_{0};
   std::uint64_t server_maximum_seen_sequence_{0};
@@ -356,6 +402,10 @@ private:
   std::uint64_t server_event_ack_sequence_{0};
   std::uint32_t server_config_version_{0};
   std::uint64_t energy_offset_wh_{0};
+  std::uint64_t energy_baseline_absolute_wh_{0};
+  std::uint64_t data_generation_{0};
+  std::uint64_t data_reset_boundary_{0};
+  std::atomic<bool> data_reset_frozen_{false};
   mutable SemaphoreHandle_t mutation_mutex_{nullptr};
   mutable SemaphoreHandle_t state_mutex_{nullptr};
 };

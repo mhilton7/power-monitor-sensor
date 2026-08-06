@@ -49,6 +49,7 @@ bool copyStorageText(std::array<char, Capacity> &target,
 // std::string allocation while a TLS or OTA operation owns internal DRAM.
 struct FixedIntervalRecord {
   std::uint32_t schema_version{1U};
+  std::uint64_t data_generation{0U};
   std::array<char, 40U> device_id{};
   std::array<char, 65U> friendly_name{};
   std::uint64_t sequence{0U};
@@ -91,6 +92,7 @@ struct FixedIntervalRecord {
       return false;
     }
     schema_version = source.schema_version;
+    data_generation = source.data_generation;
     sequence = source.sequence;
     start_utc_ms = source.start_utc_ms;
     end_utc_ms = source.end_utc_ms;
@@ -121,6 +123,7 @@ struct FixedIntervalRecord {
 
   void materialize(IntervalRecord &target) const {
     target.schema_version = schema_version;
+    target.data_generation = data_generation;
     target.device_id.assign(device_id.data());
     target.friendly_name.assign(friendly_name.data());
     target.sequence = sequence;
@@ -160,10 +163,15 @@ struct FixedEventData {
   std::array<char, 513U> detail{};
   std::array<char, 65U> boot_id{};
   std::uint64_t utc_ms{0U};
+  // Unique within boot_id and assigned before the event enters the queue.
+  // Reset cleanup carries this identity into its NVS journal and SD envelope
+  // so byte-identical events cannot consume one another across retries.
+  std::uint64_t source_event_id{0U};
 
   bool assign(const StringView source_code, const StringView source_severity,
               const StringView source_detail, const std::uint64_t source_utc,
-              const StringView source_boot_id) {
+              const StringView source_boot_id,
+              const std::uint64_t source_identity = 0U) {
     if (!copyStorageText(code, source_code) ||
         !copyStorageText(severity, source_severity) ||
         !copyStorageText(detail, source_detail) ||
@@ -171,6 +179,7 @@ struct FixedEventData {
       return false;
     }
     utc_ms = source_utc;
+    source_event_id = source_identity;
     return true;
   }
 };

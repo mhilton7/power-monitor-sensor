@@ -203,6 +203,16 @@ constexpr bool shouldScheduleEventIdleDelay(
     const bool operation_succeeded, const bool page_job_pending) {
   return operation_succeeded && !page_job_pending;
 }
+constexpr bool heartbeatLatestAllowed(
+    const bool has_latest, const bool latest_valid,
+    const bool data_reset_frozen, const std::uint64_t latest_generation,
+    const std::uint64_t heartbeat_generation) {
+  // Both conditions matter: the reset gate suppresses samples throughout
+  // baseline installation, and the generation comparison rejects any cached
+  // sample that raced with gate closure.
+  return has_latest && latest_valid && !data_reset_frozen &&
+         latest_generation == heartbeat_generation;
+}
 constexpr std::uint64_t manifestPollDeadline(
     const bool firmware_release_available,
     const std::uint64_t current_deadline_ms, const std::uint64_t now_ms) {

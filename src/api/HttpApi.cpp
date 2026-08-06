@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <limits>
 #include <new>
 #include <utility>
 #include <vector>
@@ -308,16 +309,148 @@ bool prefersAsync(AsyncWebServerRequest *request) {
          request->getHeader("Prefer")->value().indexOf("respond-async") >= 0;
 }
 
+bool parseUnsignedDecimal(const char *text, std::uint64_t &value) {
+  if (text == nullptr || *text == '\0') {
+    return false;
+  }
+  std::uint64_t parsed = 0U;
+  for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+    if (*cursor < '0' || *cursor > '9') {
+      return false;
+    }
+    const std::uint8_t digit = static_cast<std::uint8_t>(*cursor - '0');
+    if (parsed > (std::numeric_limits<std::uint64_t>::max() - digit) / 10U) {
+      return false;
+    }
+    parsed = parsed * 10U + digit;
+  }
+  value = parsed;
+  return true;
+}
+
+bool parseDataResetPrepare(const std::string &body,
+                           data_reset::PrepareRequest &output) {
+  JsonDocument document;
+  if (body.empty() || body.size() > 4096U ||
+      deserializeJson(document, body) || !document.is<JsonObject>() ||
+      document.size() != 14U || !document["protocol"].is<const char *>() ||
+      !document["operation_id"].is<const char *>() ||
+      !document["device_id"].is<const char *>() ||
+      !document["target_generation"].is<std::uint64_t>() ||
+      !document["reset_timestamp"].is<const char *>() ||
+      !document["plan_revision"].is<std::uint64_t>() ||
+      !document["plan_digest"].is<const char *>() ||
+      !document["categories"].is<JsonArray>() ||
+      !document["expected_boundary"].is<std::uint64_t>() ||
+      !document["server_highest_contiguous"].is<std::uint64_t>() ||
+      !document["server_maximum_seen"].is<std::uint64_t>() ||
+      !document["expected_firmware_version"].is<const char *>() ||
+      !document.containsKey("expected_build_hash") ||
+      !document.containsKey("expected_card_generation")) {
+    return false;
+  }
+  const JsonArray categories = document["categories"].as<JsonArray>();
+  if (categories.size() != 1U || !categories[0].is<const char *>()) {
+    return false;
+  }
+  output.protocol = document["protocol"].as<const char *>();
+  output.operation_id = document["operation_id"].as<const char *>();
+  output.device_id = document["device_id"].as<const char *>();
+  output.target_generation = document["target_generation"].as<std::uint64_t>();
+  output.reset_timestamp = document["reset_timestamp"].as<const char *>();
+  output.plan_revision = document["plan_revision"].as<std::uint64_t>();
+  output.plan_digest = document["plan_digest"].as<const char *>();
+  output.categories = {categories[0].as<const char *>()};
+  output.expected_boundary = document["expected_boundary"].as<std::uint64_t>();
+  output.server_highest_contiguous =
+      document["server_highest_contiguous"].as<std::uint64_t>();
+  output.server_maximum_seen =
+      document["server_maximum_seen"].as<std::uint64_t>();
+  output.expected_firmware_version =
+      document["expected_firmware_version"].as<const char *>();
+  if (!document["expected_build_hash"].isNull()) {
+    if (!document["expected_build_hash"].is<const char *>()) {
+      return false;
+    }
+    output.expected_build_hash_set = true;
+    output.expected_build_hash =
+        document["expected_build_hash"].as<const char *>();
+  }
+  if (!document["expected_card_generation"].isNull()) {
+    if (!document["expected_card_generation"].is<const char *>() ||
+        !parseUnsignedDecimal(
+            document["expected_card_generation"].as<const char *>(),
+            output.expected_card_generation) ||
+        output.expected_card_generation == 0U) {
+      return false;
+    }
+    output.expected_card_generation_set = true;
+  }
+  return data_reset::validPrepareRequest(output);
+}
+
+bool parseDataResetCommit(const std::string &body,
+                          data_reset::CommitRequest &output) {
+  JsonDocument document;
+  if (body.empty() || body.size() > 2048U ||
+      deserializeJson(document, body) || !document.is<JsonObject>() ||
+      document.size() != 8U || !document["protocol"].is<const char *>() ||
+      !document["operation_id"].is<const char *>() ||
+      !document["device_id"].is<const char *>() ||
+      !document["target_generation"].is<std::uint64_t>() ||
+      !document["plan_revision"].is<std::uint64_t>() ||
+      !document["plan_digest"].is<const char *>() ||
+      !document["approved_boundary"].is<std::uint64_t>() ||
+      !document["prepared_receipt_digest"].is<const char *>()) {
+    return false;
+  }
+  output.protocol = document["protocol"].as<const char *>();
+  output.operation_id = document["operation_id"].as<const char *>();
+  output.device_id = document["device_id"].as<const char *>();
+  output.target_generation = document["target_generation"].as<std::uint64_t>();
+  output.plan_revision = document["plan_revision"].as<std::uint64_t>();
+  output.plan_digest = document["plan_digest"].as<const char *>();
+  output.approved_boundary =
+      document["approved_boundary"].as<std::uint64_t>();
+  output.prepared_receipt_digest =
+      document["prepared_receipt_digest"].as<const char *>();
+  return data_reset::validCommitRequest(output);
+}
+
+bool parseDataResetCancel(const std::string &body,
+                          DataResetCancelRequest &output) {
+  JsonDocument document;
+  if (body.empty() || body.size() > 2048U ||
+      deserializeJson(document, body) || !document.is<JsonObject>() ||
+      document.size() != 6U || !document["protocol"].is<const char *>() ||
+      !document["operation_id"].is<const char *>() ||
+      !document["device_id"].is<const char *>() ||
+      !document["target_generation"].is<std::uint64_t>() ||
+      !document["plan_revision"].is<std::uint64_t>() ||
+      !document["plan_digest"].is<const char *>()) {
+    return false;
+  }
+  output.protocol = document["protocol"].as<const char *>();
+  output.operation_id = document["operation_id"].as<const char *>();
+  output.device_id = document["device_id"].as<const char *>();
+  output.target_generation = document["target_generation"].as<std::uint64_t>();
+  output.plan_revision = document["plan_revision"].as<std::uint64_t>();
+  output.plan_digest = document["plan_digest"].as<const char *>();
+  return true;
+}
+
 } // namespace
 
 HttpApi::HttpApi(ConfigService &config, NetworkService &network,
                  ClockService &clock, SdStorage &storage,
                  StorageCoordinator &coordinator, Diagnostics &diagnostics,
                  IMeter &meter, OtaService &ota,
-                 const QueueHandle_t maintenance_queue)
+                 const QueueHandle_t maintenance_queue,
+                 DataResetCoordinator *const data_reset)
     : config_(config), network_(network), clock_(clock), storage_(storage),
       coordinator_(coordinator), diagnostics_(diagnostics), meter_(meter),
-      ota_(ota), provisioning_(config), maintenance_queue_(maintenance_queue) {}
+      ota_(ota), data_reset_(data_reset), provisioning_(config),
+      maintenance_queue_(maintenance_queue) {}
 
 void HttpApi::begin() {
   password_job_queue_ =
@@ -1071,6 +1204,42 @@ bool HttpApi::applyNetworkSettings(const std::string &body, std::string &code,
 }
 
 void HttpApi::registerReadRoutes() {
+  server_.on(
+      "/api/v1/data-reset/status", HTTP_GET,
+      [this](AsyncWebServerRequest *request) {
+        if (!authorize(request, "", false, false)) {
+          return;
+        }
+        if (data_reset_ == nullptr || !request->hasParam("operation_id") ||
+            !request->hasParam("target_generation")) {
+          sendProblem(request, data_reset_ == nullptr ? 503 : 400,
+                      data_reset_ == nullptr ? "data_reset_unavailable"
+                                             : "data_reset_status_invalid",
+                      data_reset_ == nullptr
+                          ? "The reset coordinator is unavailable in recovery mode."
+                          : "Operation and target generation are required.");
+          return;
+        }
+        const std::string operation_id =
+            request->getParam("operation_id")->value().c_str();
+        const std::string generation_text =
+            request->getParam("target_generation")->value().c_str();
+        std::uint64_t generation = 0U;
+        if (!parseUnsignedDecimal(generation_text.c_str(), generation) ||
+            generation == 0U) {
+          sendProblem(request, 400, "data_reset_status_invalid",
+                      "Target generation must be a positive integer.");
+          return;
+        }
+        const DataResetApiResult result =
+            data_reset_->status(operation_id, generation);
+        if (!result.ok()) {
+          sendProblem(request, result.status, result.code.c_str(),
+                      result.detail.c_str());
+          return;
+        }
+        sendJson(request, result.status, result.body);
+      });
   server_.on(
       "/api/v1/auth/password-jobs", HTTP_GET,
       [this](AsyncWebServerRequest *request) {
@@ -1975,7 +2144,22 @@ void HttpApi::registerReadRoutes() {
              [this](AsyncWebServerRequest *request) {
                if (!authorize(request, "", false))
                  return;
+               const StorageCoordinator::DataResetPrepareProjection
+                   projection = coordinator_.dataResetPrepareProjection();
                const StorageHealth value = storage_.health();
+               const bool projection_matches_durable =
+                   projection.consistent &&
+                   projection.local_record_count ==
+                       value.local_record_count + projection.drain_records &&
+                   ((projection.drain_records == 0U &&
+                     !projection.drain_sequence_range_set &&
+                     projection.next_sequence == value.next_sequence &&
+                     projection.newest_sequence == value.newest_sequence &&
+                     projection.newest_syncable_sequence ==
+                         value.newest_syncable_sequence) ||
+                    (projection.drain_records > 0U &&
+                     projection.drain_sequence_range_set &&
+                     projection.drain_first_sequence == value.next_sequence));
                JsonDocument document;
                document["schema_version"] = 1;
                document["present"] = value.present;
@@ -1984,6 +2168,15 @@ void HttpApi::registerReadRoutes() {
                document["prepared_for_removal"] = value.prepared_for_removal;
                document["card_type"] = value.card_type;
                document["filesystem"] = value.filesystem;
+               if (value.card_generation == 0U) {
+                 document["card_generation"] = nullptr;
+               } else {
+                 document["card_generation"] =
+                     std::to_string(value.card_generation);
+               }
+               document["card_identity_status"] =
+                   value.card_identity_status;
+               document["data_generation"] = config_.dataGeneration();
                document["capacity_bytes"] = value.capacity_bytes;
                document["used_bytes"] = value.used_bytes;
                document["free_bytes"] = value.free_bytes;
@@ -1998,8 +2191,43 @@ void HttpApi::registerReadRoutes() {
                document["repair_count"] = value.repair_count;
                document["oldest_sequence"] = value.oldest_sequence;
                document["newest_sequence"] = value.newest_sequence;
+               document["sequence_floor"] = value.sequence_floor;
+               document["next_sequence"] = value.next_sequence;
                document["newest_syncable_sequence"] =
                    value.newest_syncable_sequence;
+               document["local_record_count"] = value.local_record_count;
+               document["prepare_projection_consistent"] =
+                   projection_matches_durable;
+               document["prepare_projection_local_record_count"] =
+                   projection_matches_durable
+                       ? projection.local_record_count
+                       : value.local_record_count;
+               document["prepare_projection_next_sequence"] =
+                   projection_matches_durable ? projection.next_sequence
+                                               : value.next_sequence;
+               document["prepare_projection_newest_sequence"] =
+                   projection_matches_durable ? projection.newest_sequence
+                                               : value.newest_sequence;
+               document["prepare_projection_newest_syncable_sequence"] =
+                   projection_matches_durable
+                       ? projection.newest_syncable_sequence
+                       : value.newest_syncable_sequence;
+               document["prepare_drain_records_projected"] =
+                   projection_matches_durable ? projection.drain_records : 0U;
+               if (projection_matches_durable &&
+                   projection.drain_sequence_range_set) {
+                 document["prepare_drain_first_sequence_projected"] =
+                     projection.drain_first_sequence;
+                 document["prepare_drain_last_sequence_projected"] =
+                     projection.drain_last_sequence;
+               } else {
+                 document["prepare_drain_first_sequence_projected"] = nullptr;
+                 document["prepare_drain_last_sequence_projected"] = nullptr;
+               }
+               document["prepare_drain_syncable_records_projected"] =
+                   projection_matches_durable
+                       ? projection.drain_syncable_records
+                       : 0U;
                document["server_ack_sequence"] = config_.serverAckSequence();
                document["event_ack_sequence"] =
                    config_.serverEventAckSequence();
@@ -2186,6 +2414,87 @@ void HttpApi::registerReadRoutes() {
 }
 
 void HttpApi::registerMutationRoutes() {
+  registerBodyRoute(
+      "/api/v1/data-reset/prepare", HTTP_POST,
+      [this](AsyncWebServerRequest *request) {
+        const std::string body = takeBody(request);
+        if (!authorize(request, body, true, false)) {
+          return;
+        }
+        if (data_reset_ == nullptr) {
+          sendProblem(request, 503, "data_reset_unavailable",
+                      "The reset coordinator is unavailable in recovery mode.");
+          return;
+        }
+        data_reset::PrepareRequest reset_request;
+        if (!parseDataResetPrepare(body, reset_request)) {
+          sendProblem(request, 422, "data_reset_request_invalid",
+                      "The reset prepare document is invalid.");
+          return;
+        }
+        const DataResetApiResult result =
+            data_reset_->requestPrepare(reset_request);
+        if (!result.ok()) {
+          sendProblem(request, result.status, result.code.c_str(),
+                      result.detail.c_str());
+          return;
+        }
+        sendJson(request, result.status, result.body);
+      });
+  registerBodyRoute(
+      "/api/v1/data-reset/commit", HTTP_POST,
+      [this](AsyncWebServerRequest *request) {
+        const std::string body = takeBody(request);
+        if (!authorize(request, body, true, false)) {
+          return;
+        }
+        if (data_reset_ == nullptr) {
+          sendProblem(request, 503, "data_reset_unavailable",
+                      "The reset coordinator is unavailable in recovery mode.");
+          return;
+        }
+        data_reset::CommitRequest reset_request;
+        if (!parseDataResetCommit(body, reset_request)) {
+          sendProblem(request, 422, "data_reset_request_invalid",
+                      "The reset commit document is invalid.");
+          return;
+        }
+        const DataResetApiResult result =
+            data_reset_->requestCommit(reset_request);
+        if (!result.ok()) {
+          sendProblem(request, result.status, result.code.c_str(),
+                      result.detail.c_str());
+          return;
+        }
+        sendJson(request, result.status, result.body);
+      });
+  registerBodyRoute(
+      "/api/v1/data-reset/cancel", HTTP_POST,
+      [this](AsyncWebServerRequest *request) {
+        const std::string body = takeBody(request);
+        if (!authorize(request, body, true, false)) {
+          return;
+        }
+        if (data_reset_ == nullptr) {
+          sendProblem(request, 503, "data_reset_unavailable",
+                      "The reset coordinator is unavailable in recovery mode.");
+          return;
+        }
+        DataResetCancelRequest reset_request;
+        if (!parseDataResetCancel(body, reset_request)) {
+          sendProblem(request, 422, "data_reset_request_invalid",
+                      "The reset cancel document is invalid.");
+          return;
+        }
+        const DataResetApiResult result =
+            data_reset_->requestCancel(reset_request);
+        if (!result.ok()) {
+          sendProblem(request, result.status, result.code.c_str(),
+                      result.detail.c_str());
+          return;
+        }
+        sendJson(request, result.status, result.body);
+      });
   registerBodyRoute("/api/v1/auth/session", HTTP_POST,
                     [this](AsyncWebServerRequest *request) {
                       network_.touchSetupActivity();
@@ -2571,6 +2880,13 @@ bool HttpApi::authorize(AsyncWebServerRequest *request,
   const bool restricted_mutation_rejected =
       mutation && ota_.restrictedRecoveryMode() &&
       !restricted_mutation_allowed;
+  const bool data_reset_mutation_allowed =
+      request_path == "/api/v1/data-reset/prepare" ||
+      request_path == "/api/v1/data-reset/commit" ||
+      request_path == "/api/v1/data-reset/cancel";
+  const bool data_reset_mutation_rejected =
+      mutation && data_reset_ != nullptr && data_reset_->active() &&
+      !data_reset_mutation_allowed;
   PM_LOG_DEBUG("AUTH", "AUTH_MODE_CLASSIFIED",
                "route=%s method=%s mode=%s cookie_present=%s",
                request->url().c_str(), request->methodToString(),
@@ -2714,6 +3030,11 @@ bool HttpApi::authorize(AsyncWebServerRequest *request,
           "mutations remain disabled until rollback or a verified update.");
       return false;
     }
+    if (data_reset_mutation_rejected) {
+      sendProblem(request, 409, "data_reset_active",
+                  "This mutation is frozen while a coordinated data reset is active.");
+      return false;
+    }
     return true;
   }
 
@@ -2826,6 +3147,11 @@ bool HttpApi::authorize(AsyncWebServerRequest *request,
         request, 409, "ota_restricted_recovery_active",
         "This unverifiable pending image accepts only local recovery "
         "operations until rollback or a verified update.");
+    return false;
+  }
+  if (data_reset_mutation_rejected) {
+    sendProblem(request, 409, "data_reset_active",
+                "This mutation is frozen while a coordinated data reset is active.");
     return false;
   }
   return true;

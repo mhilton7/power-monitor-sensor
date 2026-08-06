@@ -19,6 +19,7 @@
 #include "network/NetworkService.h"
 #include "ota/OtaService.h"
 #include "provisioning/ProvisioningService.h"
+#include "reset/DataResetCoordinator.h"
 #include "security/AuthService.h"
 #include "storage/SdStorage.h"
 #include "storage/StorageCoordinator.h"
@@ -42,7 +43,8 @@ public:
   HttpApi(ConfigService &config, NetworkService &network, ClockService &clock,
           SdStorage &storage, StorageCoordinator &coordinator,
           Diagnostics &diagnostics, IMeter &meter, OtaService &ota,
-          QueueHandle_t maintenance_queue);
+          QueueHandle_t maintenance_queue,
+          DataResetCoordinator *data_reset = nullptr);
   void begin();
 
 private:
@@ -162,6 +164,7 @@ private:
   Diagnostics &diagnostics_;
   IMeter &meter_;
   OtaService &ota_;
+  DataResetCoordinator *data_reset_{nullptr};
   ProvisioningService provisioning_;
   QueueHandle_t maintenance_queue_;
   QueueHandle_t password_job_queue_{nullptr};

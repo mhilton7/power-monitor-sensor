@@ -25,14 +25,17 @@ struct EnergyResult {
 
 class EnergyNormalizer {
 public:
-  explicit EnergyNormalizer(std::uint64_t persisted_offset_wh = 0);
+  explicit EnergyNormalizer(std::uint64_t persisted_offset_wh = 0,
+                            std::uint64_t baseline_absolute_wh = 0);
   EnergyResult update(std::uint64_t raw_start_wh, std::uint64_t raw_end_wh,
                       bool raw_start_valid, bool raw_end_valid,
                       double integrated_power_wh, bool integration_complete);
   std::uint64_t offsetWh() const;
+  std::uint64_t baselineAbsoluteWh() const;
 
 private:
   std::uint64_t offset_wh_;
+  std::uint64_t baseline_absolute_wh_;
   std::uint64_t last_lifetime_wh_{0};
   double unreconciled_integrated_wh_{0.0};
 };
@@ -44,6 +47,7 @@ public:
   void reset(std::uint64_t start_utc_ms, std::uint64_t start_monotonic_ms);
   void add(const MeasurementSnapshot &sample);
   bool hasSamples() const;
+  bool wouldProduceSyncableRecord() const;
   IntervalRecord
   finish(const std::string &device_id, const std::string &friendly_name,
          const std::string &boot_id, const std::string &firmware_version,
@@ -79,6 +83,7 @@ private:
   bool all_times_trusted_{true};
   bool last_sample_seen_{false};
   std::uint64_t last_sample_monotonic_ms_{0};
+  std::uint64_t last_sample_utc_ms_{0};
 };
 
 } // namespace pm

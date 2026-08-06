@@ -20,6 +20,29 @@ std::uint64_t segmentBytes(const SegmentMetadata &segment) {
 
 } // namespace
 
+bool resetCardBindingMatches(const std::uint64_t actual_generation,
+                             const std::string &actual_device_id,
+                             const std::uint64_t expected_generation,
+                             const std::string &expected_device_id) {
+  return expected_generation != 0U && !expected_device_id.empty() &&
+         actual_generation == expected_generation &&
+         actual_device_id == expected_device_id;
+}
+
+bool resetManifestBindingMatches(
+    const std::uint32_t schema_version,
+    const std::uint64_t actual_generation,
+    const std::string &actual_device_id,
+    const std::string &actual_hardware_fingerprint,
+    const std::uint64_t expected_generation,
+    const std::string &expected_device_id,
+    const std::string &expected_hardware_fingerprint) {
+  return schema_version == 2U && !expected_hardware_fingerprint.empty() &&
+         actual_hardware_fingerprint == expected_hardware_fingerprint &&
+         resetCardBindingMatches(actual_generation, actual_device_id,
+                                 expected_generation, expected_device_id);
+}
+
 StoragePolicyValidation validateStoragePolicy(const StoragePolicy &policy) {
   if (policy.notice_percent > 50U || policy.emergency_percent < 1U ||
       !(policy.notice_percent > policy.warning_percent &&

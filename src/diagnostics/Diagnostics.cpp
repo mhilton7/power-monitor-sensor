@@ -68,8 +68,48 @@ Diagnostics::Diagnostics() {
 
 void Diagnostics::setLatest(const MeasurementSnapshot &sample) {
   if (lock()) {
-    latest_ = sample;
-    has_latest_ = true;
+    if (latest_freshness_.eligible(sample.data_generation)) {
+      latest_ = sample;
+      has_latest_ = true;
+    }
+    unlock();
+  }
+}
+
+void Diagnostics::clearLatest() {
+  if (lock()) {
+    latest_ = {};
+    has_latest_ = false;
+    unlock();
+  }
+}
+
+void Diagnostics::suspendLatestForDataReset() {
+  if (lock()) {
+    latest_freshness_.suspend();
+    latest_ = {};
+    has_latest_ = false;
+    unlock();
+  }
+}
+
+void Diagnostics::markLatestBaselineInstalled(
+    const std::uint64_t generation) {
+  if (lock()) {
+    latest_freshness_.markBaselineInstalled(generation);
+    latest_ = {};
+    has_latest_ = false;
+    unlock();
+  }
+}
+
+void Diagnostics::resumeLatestForGeneration(const std::uint64_t generation) {
+  if (lock()) {
+    // Clear immediately before reopening. Even if an old cache somehow
+    // survived a prior brownout path, it cannot cross this baseline epoch.
+    latest_ = {};
+    has_latest_ = false;
+    latest_freshness_.resume(generation);
     unlock();
   }
 }

@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <new>
 
 #include <Arduino.h>
@@ -279,16 +280,57 @@ bool Application::begin() {
   config_.recordBootStarted();
   clock_.begin();
   clock_.update();
-  const DeviceIdentity storage_identity = config_.identity();
+  data_reset::Record boot_reset_record;
+  const DataResetStoreResult boot_reset_result =
+      DataResetStore{}.load(boot_reset_record);
+  if (boot_reset_result != DataResetStoreResult::Loaded &&
+      boot_reset_result != DataResetStoreResult::NotFound) {
+    PM_LOG_FATAL("RESET", "RESET_STATE_BOOT_READ_FAILED",
+                 "error=%s producers_started=false fail_closed=true",
+                 dataResetStoreResultName(boot_reset_result));
+    return false;
+  }
+  const bool boot_reset_present =
+      boot_reset_result == DataResetStoreResult::Loaded;
+  const EnrollmentActivationInfo enrollment_activation =
+      config_.pendingEnrollmentActivation();
+  if (enrollment_activation.pending && boot_reset_present &&
+      data_reset::readingGateRequired(boot_reset_record.state,
+                                      boot_reset_record.checkpoint)) {
+    PM_LOG_FATAL("ENROLL", "ENROLLMENT_ACTIVATION_CONFLICT",
+                 "reason=active_durable_data_reset producers_started=false "
+                 "credentials_active=false");
+    return false;
+  }
+  if (boot_reset_present && data_reset::readingGateRequired(
+                                boot_reset_record.state,
+                                boot_reset_record.checkpoint)) {
+    config_.setDataResetFreeze(true);
+    storage_coordinator_.setRecordWritesEnabled(false);
+  }
+  DeviceIdentity storage_identity = config_.identity();
   const std::uint64_t required_sequence_floor =
       std::max({config_.serverAckSequence(),
                 config_.serverMaximumSeenSequence(),
-                config_.preparedRemovalSequence()});
+                config_.preparedRemovalSequence(),
+                config_.dataResetBoundary(),
+                boot_reset_present && boot_reset_record.approved_boundary_set
+                    ? boot_reset_record.approved_boundary
+                    : 0U,
+                enrollment_activation.pending
+                    ? enrollment_activation.reset_boundary
+                    : 0U});
+  const std::string storage_device_id =
+      enrollment_activation.pending
+          ? enrollment_activation.device_id
+          : (storage_identity.device_id.empty() ? storage_identity.hardware_id
+                                                : storage_identity.device_id);
   bool storage_started = storage_.begin(
-      config_.config().sd_spi_hz,
-      storage_identity.device_id.empty() ? storage_identity.hardware_id
-                                         : storage_identity.device_id,
-      storage_identity.hardware_id, required_sequence_floor);
+      config_.config().sd_spi_hz, storage_device_id,
+      storage_identity.hardware_id, required_sequence_floor,
+      enrollment_activation.pending
+          ? enrollment_activation.source_card_device_id
+          : std::string{});
   if (!storage_started) {
     // A firmware upload or watchdog reset does not power-cycle the card. The
     // first complete recovery ladder can therefore encounter a card that is
@@ -305,6 +347,136 @@ bool Application::begin() {
     PM_LOG_FATAL("STORAGE", "QUEUE_INIT_FAILED",
                  "error=PM-STORAGE-001 depth=%u",
                  static_cast<unsigned>(build::STORAGE_QUEUE_DEPTH));
+    return false;
+  }
+  if (enrollment_activation.pending) {
+    if (!config_.setDataResetFreeze(true)) {
+      PM_LOG_FATAL("ENROLL", "ENROLLMENT_ACTIVATION_GATE_FAILED",
+                   "producers_started=false credentials_active=false");
+      return false;
+    }
+    storage_coordinator_.setRecordWritesEnabled(false);
+    const StorageHealth pre_activation_health = storage_.health();
+    const bool source_manifest =
+        pre_activation_health.card_device_id ==
+        enrollment_activation.source_card_device_id;
+    const bool assigned_manifest =
+        pre_activation_health.card_device_id == enrollment_activation.device_id;
+    const std::uint64_t observed_local_floor =
+        pre_activation_health.next_sequence > 0U
+            ? pre_activation_health.next_sequence - 1U
+            : pre_activation_health.sequence_floor;
+    const std::uint64_t activation_floor =
+        std::max({enrollment_activation.reset_boundary,
+                  observed_local_floor, pre_activation_health.sequence_floor,
+                  config_.serverAckSequence(),
+                  config_.serverMaximumSeenSequence(),
+                  config_.preparedRemovalSequence()});
+    std::string activation_error;
+    const std::string active_manifest_device =
+        source_manifest ? enrollment_activation.source_card_device_id
+                        : enrollment_activation.device_id;
+    const bool activation_storage_bound =
+        pre_activation_health.mounted && pre_activation_health.writable &&
+        pre_activation_health.card_generation ==
+            enrollment_activation.source_card_generation &&
+        (source_manifest || assigned_manifest);
+    const bool old_readings_cleared =
+        activation_storage_bound &&
+        storage_.clearPreEnrollmentReadingData(
+            enrollment_activation.source_card_generation,
+            active_manifest_device, activation_error);
+    const bool sequence_advanced =
+        old_readings_cleared &&
+        storage_.advanceSequenceFloor(
+            activation_floor,
+            enrollment_activation.source_card_generation,
+            active_manifest_device);
+    const bool card_rebound =
+        sequence_advanced &&
+        storage_.rebindCardForEnrollment(
+            enrollment_activation.source_card_generation,
+            active_manifest_device, enrollment_activation.device_id);
+    const bool credentials_activated =
+        card_rebound && config_.activatePendingEnrollment(activation_floor);
+    const bool final_binding_verified =
+        credentials_activated &&
+        storage_.verifyDataResetCardBinding(
+            enrollment_activation.source_card_generation,
+            enrollment_activation.device_id) &&
+        config_.identity().enrolled &&
+        config_.identity().device_id == enrollment_activation.device_id &&
+        config_.dataGeneration() ==
+            enrollment_activation.target_data_generation &&
+        config_.dataResetBoundary() == enrollment_activation.reset_boundary &&
+        config_.serverAckSequence() == activation_floor &&
+        config_.serverMaximumSeenSequence() == activation_floor;
+    if (!final_binding_verified) {
+      PM_LOG_FATAL(
+          "ENROLL", "ENROLLMENT_ACTIVATION_FAILED",
+          "reason=%s producers_started=false credentials_active=%s "
+          "card_bound=%s",
+          activation_error.empty() ? "durable_handoff_failed"
+                                   : activation_error.c_str(),
+          config_.identity().enrolled ? "true" : "false",
+          card_rebound ? "true" : "false");
+      return false;
+    }
+    if (!config_.setDataResetFreeze(false)) {
+      PM_LOG_FATAL("ENROLL", "ENROLLMENT_ACTIVATION_GATE_RELEASE_FAILED",
+                   "producers_started=false credentials_active=true");
+      return false;
+    }
+    storage_coordinator_.setRecordWritesEnabled(true);
+    storage_identity = config_.identity();
+    PM_LOG_INFO(
+        "ENROLL", "ENROLLMENT_ACTIVATION_COMPLETE",
+        "generation=%llu reset_boundary=%llu sequence_floor=%llu "
+        "old_readings=cleared card_identity=rebound credentials_active=true",
+        static_cast<unsigned long long>(config_.dataGeneration()),
+        static_cast<unsigned long long>(config_.dataResetBoundary()),
+        static_cast<unsigned long long>(activation_floor));
+  }
+  std::uint64_t orphan_energy_offset_wh = 0U;
+  bool orphan_recovered = false;
+  std::string orphan_error;
+  // No producer task exists yet, but offset installation deliberately
+  // requires the live reset freeze/admission invariant. Acquire a narrowly
+  // scoped boot-recovery admission, and release only the ownership acquired
+  // by this call before DataResetCoordinator rebuilds any durable barrier.
+  bool orphan_admission_newly_acquired = false;
+  const bool orphan_admission_ok =
+      data_reset::claimResetAdmission(orphan_admission_newly_acquired) &&
+      orphan_admission_newly_acquired;
+  const bool orphan_freeze_ok =
+      orphan_admission_ok && config_.setDataResetFreeze(true);
+  const bool orphan_recovery_ok =
+      orphan_freeze_ok && storage_coordinator_.recoverOrphanedDataResetDrain(
+          boot_reset_present ? &boot_reset_record : nullptr,
+          storage_identity.device_id.empty() ? storage_identity.hardware_id
+                                             : storage_identity.device_id,
+          config_.dataGeneration(), storage_.health().card_generation,
+          orphan_energy_offset_wh, orphan_recovered, orphan_error);
+  const bool orphan_offset_ok =
+      orphan_recovery_ok &&
+      (!orphan_recovered ||
+       (config_.setEnergyOffsetWhForDataResetDrain(orphan_energy_offset_wh) &&
+        config_.energyOffsetWh() == orphan_energy_offset_wh));
+  if (orphan_admission_newly_acquired) {
+    data_reset::releaseResetAdmission();
+  }
+  const bool durable_gate_required =
+      boot_reset_present && data_reset::readingGateRequired(
+                                boot_reset_record.state,
+                                boot_reset_record.checkpoint);
+  const bool orphan_freeze_release_ok =
+      durable_gate_required || config_.setDataResetFreeze(false);
+  if (!orphan_recovery_ok || !orphan_offset_ok ||
+      !orphan_freeze_release_ok) {
+    PM_LOG_FATAL("RESET", "RESET_ORPHAN_DRAIN_RECOVERY_FAILED",
+                 "error=%s producers_started=false fail_closed=true",
+                 orphan_error.empty() ? "data_reset_orphan_offset_failed"
+                                      : orphan_error.c_str());
     return false;
   }
 #if PM_SIMULATED_METER
@@ -337,13 +509,22 @@ bool Application::begin() {
         meter_mutex_ == nullptr ? "failed" : "ready");
     return false;
   }
+  data_reset_ = std::unique_ptr<DataResetCoordinator>(
+      new (std::nothrow) DataResetCoordinator(
+          config_, clock_, storage_, storage_coordinator_, diagnostics_,
+          *meter_, ota_, meter_mutex_));
+  if (data_reset_ == nullptr || !data_reset_->begin()) {
+    PM_LOG_FATAL("RESET", "RESET_COORDINATOR_INIT_FAILED",
+                 "producers_started=false fail_closed=true");
+    return false;
+  }
   sync_ = std::unique_ptr<ServerSync>(
       new (std::nothrow) ServerSync(config_, network_, clock_, storage_,
                                     storage_coordinator_, diagnostics_, *meter_,
-                                    maintenance_queue_));
+                                    maintenance_queue_, *data_reset_));
   http_ = std::unique_ptr<HttpApi>(new (std::nothrow) HttpApi(
       config_, network_, clock_, storage_, storage_coordinator_, diagnostics_,
-      *meter_, ota_, maintenance_queue_));
+      *meter_, ota_, maintenance_queue_, data_reset_.get()));
   if (sync_ == nullptr || http_ == nullptr || !createTasks()) {
     PM_LOG_FATAL("TASK", "RUNTIME_START_FAILED",
                  "error=PM-TASK-001 sync=%s http=%s",
@@ -539,7 +720,7 @@ bool Application::beginRestrictedRecovery() {
   }
   http_ = std::unique_ptr<HttpApi>(new (std::nothrow) HttpApi(
       config_, network_, clock_, storage_, storage_coordinator_, diagnostics_,
-      *meter_, ota_, maintenance_queue_));
+      *meter_, ota_, maintenance_queue_, nullptr));
   if (http_ == nullptr || !createRestrictedRecoveryTasks()) {
     PM_LOG_FATAL("OTA", "RESTRICTED_RECOVERY_START_FAILED",
                  "error=PM-OTA-020 http=%s network=%s",
@@ -599,7 +780,28 @@ void Application::meterTask() {
       static_cast<unsigned long>(task_config::kMeterStackBytes));
   TickType_t last_wake = xTaskGetTickCount();
   for (;;) {
+    if (config_.dataResetFrozen()) {
+      // The poll admitted immediately before freeze is covered by the latch
+      // below and drained into the boundary interval. Do not start additional
+      // polls during the prepared window: they cannot be part of the signed
+      // deletion plan and silently discarding them would make cancellation
+      // appear lossless when it was not.
+      ++meter_progress_;
+      feedWatchdog();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    // Cover the entire generation-capture/poll/publication transaction. A
+    // reset that freezes while the UART poll is blocked must wait for this
+    // producer before the aggregation task closes its durable boundary.
+    storage_coordinator_.markDataResetMeterProjectionActivity();
+    sample_enqueues_in_flight_.fetch_add(1U, std::memory_order_seq_cst);
+    const std::uint64_t sampled_generation = config_.dataGeneration();
+    const bool admitted_before_poll = !config_.dataResetFrozen();
     MeasurementSnapshot sample;
+    // Capture the generation before the potentially blocking PZEM poll. A
+    // reset that completes while UART work is in flight must not retag that
+    // pre-reset measurement with the newly active generation.
     if (takeSemaphoreWithWatchdog(meter_mutex_, 5000)) {
       sample = meter_->poll(clock_.utcMs(), clock_.monotonicMs(),
                             clock_.synchronized(), feedWatchdog);
@@ -609,16 +811,46 @@ void Application::meterTask() {
       sample.error = MeterError::UartFailure;
       sample.quality_flags = MeterGap;
     }
+    // poll() returns a new snapshot value, so apply the pre-poll generation
+    // afterwards for both successful and error samples.
+    sample.data_generation = sampled_generation;
     const MeasurementRuntimeConfig measurement_config =
         config_.measurementRuntimeConfig();
     const Limits limits = measurementLimits(measurement_config);
+    // Generation remains evidence for every sample, including invalid/PZEM-
+    // error samples that carry gap and quality information.
     if (sample.error == MeterError::None) {
       validateMeasurement(sample, limits);
+      const std::uint64_t offset = config_.energyOffsetWh();
+      const std::uint64_t absolute =
+          sample.raw_energy_wh >
+                  std::numeric_limits<std::uint64_t>::max() - offset
+              ? std::numeric_limits<std::uint64_t>::max()
+              : offset + sample.raw_energy_wh;
+      const std::uint64_t baseline = config_.energyBaselineAbsoluteWh();
       sample.device_lifetime_energy_wh =
-          config_.energyOffsetWh() + sample.raw_energy_wh;
+          absolute > baseline ? absolute - baseline : 0U;
     }
-    diagnostics_.setLatest(sample);
-    if (xQueueSend(sample_queue_, &sample, 0) != pdTRUE) {
+    if (!config_.dataResetFrozen()) {
+      diagnostics_.setLatest(sample);
+      if (config_.dataResetFrozen()) {
+        // If admission raced the publication itself, the gate-side clear may
+        // have happened first. The trailing check makes the invalidation win.
+        diagnostics_.clearLatest();
+      }
+    } else {
+      // applyGates() clears immediately; this second guard closes the race
+      // where a poll began just before admission and completed just after it.
+      diagnostics_.clearLatest();
+    }
+    // A poll admitted before freeze belongs to the boundary interval. The
+    // aggregation task waits for this producer latch before taking its queue
+    // snapshot, so publishing it while frozen is safe and lossless. A reset
+    // that already advanced the generation still rejects the stale sample.
+    const bool sample_allowed =
+        admitted_before_poll &&
+        sample.data_generation == config_.dataGeneration();
+    if (sample_allowed && xQueueSend(sample_queue_, &sample, 0) != pdTRUE) {
       ++sample_dropped_;
       if (diag::SerialLogger::instance().allow("sample_queue_full", 30'000U)) {
         PM_LOG_WARN(
@@ -628,6 +860,8 @@ void Application::meterTask() {
             static_cast<unsigned>(uxQueueMessagesWaiting(sample_queue_)));
       }
     }
+    sample_enqueues_in_flight_.fetch_sub(1U, std::memory_order_seq_cst);
+    storage_coordinator_.markDataResetMeterProjectionActivity();
     ++meter_progress_;
     feedWatchdog();
     delayUntilWithWatchdog(
@@ -645,12 +879,185 @@ void Application::aggregationTask() {
       static_cast<unsigned long>(task_config::kAggregationStackBytes));
   Limits limits = measurementLimits(config_.measurementRuntimeConfig());
   IntervalAggregator aggregator(limits);
-  EnergyNormalizer energy(config_.energyOffsetWh());
+  EnergyNormalizer energy(config_.energyOffsetWh(),
+                          config_.energyBaselineAbsoluteWh());
   bool started = false;
+  bool reset_gate_observed = false;
+  bool reset_drain_complete = false;
+  std::uint64_t reset_boundary_record_count = 0U;
+  std::uint64_t reset_paused_generation = 0U;
+  std::uint64_t reset_boundary_offset_wh = 0U;
+  std::array<IntervalRecord, 2U> reset_boundary_records{};
   std::uint64_t interval_started_ms = 0;
   MeasurementSnapshot sample;
+  MeasurementSnapshot last_interval_sample;
+  bool last_interval_sample_set = false;
   for (;;) {
-    if (xQueueReceive(sample_queue_, &sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    const std::uint64_t projection_meter_epoch_before =
+        storage_coordinator_.dataResetMeterProjectionEpoch();
+    const bool projection_ingress_idle =
+        sample_enqueues_in_flight_.load(std::memory_order_seq_cst) == 0U &&
+        uxQueueMessagesWaiting(sample_queue_) == 0U;
+    const std::uint64_t projected_drain_records =
+        started && aggregator.hasSamples() ? 1U : 0U;
+    const std::uint64_t projected_syncable_records =
+        projected_drain_records > 0U &&
+                aggregator.wouldProduceSyncableRecord()
+            ? 1U
+            : 0U;
+    const std::uint64_t projection_meter_epoch_after =
+        storage_coordinator_.dataResetMeterProjectionEpoch();
+    storage_coordinator_.publishDataResetAggregationProjection(
+        projection_ingress_idle && !config_.dataResetFrozen() &&
+            reset_boundary_record_count == 0U &&
+            projection_meter_epoch_before == projection_meter_epoch_after &&
+            (projection_meter_epoch_after & 1U) == 0U,
+        projected_drain_records, projected_syncable_records, true,
+        projection_meter_epoch_after);
+    if (config_.dataResetFrozen()) {
+      if (!reset_gate_observed) {
+        reset_gate_observed = true;
+        reset_drain_complete = false;
+        reset_paused_generation = config_.dataGeneration();
+      }
+      // A meter poll that won immediately before freeze may still be between
+      // its final gate check and queue send. Wait for that bounded producer
+      // section, then the zero-timeout drain below is a complete snapshot.
+      if (sample_enqueues_in_flight_.load(std::memory_order_seq_cst) != 0U) {
+        ++aggregation_progress_;
+        feedWatchdog();
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      const MeasurementRuntimeConfig measurement_config =
+          config_.measurementRuntimeConfig();
+      limits = measurementLimits(measurement_config);
+      aggregator.setLimits(limits);
+      while (xQueueReceive(sample_queue_, &sample, 0) == pdTRUE) {
+        if (sample.data_generation != reset_paused_generation) {
+          PM_LOG_WARN(
+              "RESET", "STALE_SAMPLE_DISCARDED",
+              "sample_generation=%llu active_generation=%llu durable=false",
+              static_cast<unsigned long long>(sample.data_generation),
+              static_cast<unsigned long long>(reset_paused_generation));
+          continue;
+        }
+        if (!started) {
+          aggregator.reset(sample.utc_ms, sample.monotonic_ms);
+          interval_started_ms = sample.monotonic_ms;
+          started = true;
+        }
+        aggregator.add(sample);
+        last_interval_sample = sample;
+        last_interval_sample_set = true;
+      }
+      if (started && aggregator.hasSamples() && last_interval_sample_set) {
+        if (reset_boundary_record_count >= reset_boundary_records.size()) {
+          PM_LOG_ERROR("RESET", "RESET_DRAIN_BATCH_OVERFLOW",
+                       "error=data_reset_drain_batch_overflow max_records=2");
+          ++aggregation_progress_;
+          feedWatchdog();
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        const DeviceIdentity identity = config_.identity();
+        IntervalRecord &reset_boundary_record =
+            reset_boundary_records[reset_boundary_record_count++];
+        reset_boundary_record = aggregator.finish(
+            identity.device_id.empty() ? identity.local_instance_id
+                                       : identity.device_id,
+            measurement_config.friendly_name, identity.boot_id,
+            version::FIRMWARE, last_interval_sample.utc_ms,
+            last_interval_sample.monotonic_ms, energy);
+        reset_boundary_record.data_generation = reset_paused_generation;
+        reset_boundary_offset_wh = energy.offsetWh();
+        started = false;
+        last_interval_sample_set = false;
+        ++aggregation_progress_;
+        feedWatchdog();
+        continue;
+      }
+      if (reset_boundary_record_count > 0U) {
+        if (!storage_coordinator_.stageRecordsForDataReset(
+                reset_boundary_records, reset_boundary_record_count,
+                reset_boundary_offset_wh)) {
+          ++aggregation_progress_;
+          feedWatchdog();
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        PM_LOG_INFO(
+            "RESET", "PARTIAL_INTERVAL_DRAINED",
+            "generation=%llu records=%llu durable_journal=true",
+            static_cast<unsigned long long>(reset_paused_generation),
+            static_cast<unsigned long long>(reset_boundary_record_count));
+        reset_boundary_record_count = 0U;
+      }
+      storage_coordinator_.markDataResetProducerQuiesced();
+      reset_drain_complete = true;
+      ++aggregation_progress_;
+      feedWatchdog();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    if (reset_gate_observed) {
+      // A Preparing-record persistence failure can reopen the gate before the
+      // producer drain finishes. Preserve the already closed record through
+      // the ordinary path before resuming the same generation.
+      if (reset_boundary_record_count > 0U) {
+        bool queued = config_.dataGeneration() == reset_paused_generation &&
+                      config_.setEnergyOffsetWh(reset_boundary_offset_wh);
+        while (queued && reset_boundary_record_count > 0U) {
+          queued = storage_coordinator_.enqueueRecord(
+              reset_boundary_records[0]);
+          if (queued) {
+            reset_boundary_records[0] =
+                std::move(reset_boundary_records[1]);
+            reset_boundary_records[1] = {};
+            --reset_boundary_record_count;
+          }
+        }
+        if (!queued) {
+          ++aggregation_progress_;
+          feedWatchdog();
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+      }
+      const bool generation_advanced =
+          config_.dataGeneration() != reset_paused_generation;
+      if (generation_advanced || reset_drain_complete) {
+        started = false;
+        last_interval_sample_set = false;
+        energy = EnergyNormalizer(config_.energyOffsetWh(),
+                                  config_.energyBaselineAbsoluteWh());
+      }
+      reset_gate_observed = false;
+      reset_drain_complete = false;
+      PM_LOG_INFO("RESET", "AGGREGATION_RESUMED",
+                  "generation=%llu boundary=%llu",
+                  static_cast<unsigned long long>(config_.dataGeneration()),
+                  static_cast<unsigned long long>(config_.dataResetBoundary()));
+    }
+    if (xQueueReceive(sample_queue_, &sample, pdMS_TO_TICKS(250)) == pdTRUE) {
+      const std::uint64_t active_generation = config_.dataGeneration();
+      if (!data_reset::sampleForGenerationAllowed(
+              config_.dataResetFrozen(), sample.data_generation,
+              active_generation)) {
+        // Consume only the stale entry. Do not reset the whole queue here: a
+        // post-reset producer may already have queued valid current-generation
+        // quality evidence.
+        started = false;
+        last_interval_sample_set = false;
+        PM_LOG_WARN(
+            "RESET", "STALE_SAMPLE_DISCARDED",
+            "sample_generation=%llu active_generation=%llu durable=false",
+            static_cast<unsigned long long>(sample.data_generation),
+            static_cast<unsigned long long>(active_generation));
+        ++aggregation_progress_;
+        feedWatchdog();
+        continue;
+      }
       const MeasurementRuntimeConfig measurement_config =
           config_.measurementRuntimeConfig();
       limits = measurementLimits(measurement_config);
@@ -661,6 +1068,8 @@ void Application::aggregationTask() {
         started = true;
       }
       aggregator.add(sample);
+      last_interval_sample = sample;
+      last_interval_sample_set = true;
       const std::uint64_t interval_ms =
           static_cast<std::uint64_t>(
               measurement_config.durable_log_interval_seconds) *
@@ -673,10 +1082,31 @@ void Application::aggregationTask() {
                 : config_.identity().device_id,
             measurement_config.friendly_name, config_.identity().boot_id,
             version::FIRMWARE, sample.utc_ms, sample.monotonic_ms, energy);
-        if (!storage_coordinator_.enqueueRecord(record)) {
+        record.data_generation = config_.dataGeneration();
+        if (config_.dataResetFrozen() ||
+            !storage_coordinator_.recordWritesEnabled()) {
+          if (reset_boundary_record_count >= reset_boundary_records.size()) {
+            PM_LOG_ERROR("RESET", "RESET_DRAIN_BATCH_OVERFLOW",
+                         "error=data_reset_drain_batch_overflow max_records=2");
+            ++sample_dropped_;
+          } else {
+            reset_boundary_records[reset_boundary_record_count++] =
+                std::move(record);
+          }
+          reset_boundary_offset_wh = energy.offsetWh();
+          reset_paused_generation = sample.data_generation;
+          started = false;
+          last_interval_sample_set = false;
+          PM_LOG_WARN("RESET", "INTERVAL_RETAINED_AT_GATE",
+                      "generation=%llu durable_queue=pending",
+                      static_cast<unsigned long long>(
+                          reset_paused_generation));
+        } else if (!storage_coordinator_.enqueueRecord(record)) {
           ++sample_dropped_;
         }
-        config_.setEnergyOffsetWh(energy.offsetWh());
+        if (!config_.dataResetFrozen()) {
+          config_.setEnergyOffsetWh(energy.offsetWh());
+        }
         aggregator.reset(sample.utc_ms, sample.monotonic_ms);
         interval_started_ms = sample.monotonic_ms;
       }
@@ -923,6 +1353,13 @@ void Application::healthTask() {
                   static_cast<unsigned long>(
                       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     }
+    if (config_.dataResetFrozen()) {
+      // Reset owns the reading inventory and sequence barrier. Diagnostic
+      // events continue above, but retention/removal jobs must not race the
+      // classified reset cleanup.
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
     const StorageHealth retention_health = storage_.health();
     if (retention_health.pressure_state != last_storage_pressure_state_) {
       const std::string previous = last_storage_pressure_state_.empty()
@@ -1055,7 +1492,10 @@ void Application::maintenanceTask() {
               static_cast<unsigned long>(task_config::kMaintenanceStackBytes));
   MaintenanceMessage message;
   for (;;) {
-    if (xQueueReceive(maintenance_queue_, &message, pdMS_TO_TICKS(1000)) ==
+    if (data_reset_ != nullptr) {
+      data_reset_->tick();
+    }
+    if (xQueueReceive(maintenance_queue_, &message, pdMS_TO_TICKS(100)) ==
         pdTRUE) {
       executeMaintenance(message);
     }
@@ -1607,6 +2047,47 @@ void Application::executeMaintenance(const MaintenanceMessage &message) {
   bool ok = false;
   const char *code = "EVT_MAINTENANCE_COMPLETE";
   const std::uint64_t started_ms = clock_.monotonicMs();
+  const bool safe_during_reset =
+      message.action == MaintenanceAction::TestPzem ||
+      message.action == MaintenanceAction::TestDns ||
+      message.action == MaintenanceAction::TestNtp ||
+      message.action == MaintenanceAction::TestServerTls ||
+      message.action == MaintenanceAction::TestHeartbeat;
+  const bool service_owns_admission =
+      message.action == MaintenanceAction::ApplyOta ||
+      message.action == MaintenanceAction::RollbackOta;
+  const bool disruptive_claimed =
+      safe_during_reset || service_owns_admission
+          ? false
+          : data_reset::claimDisruptiveAdmission();
+  struct DisruptiveAdmissionRelease final {
+    bool claimed{false};
+    ~DisruptiveAdmissionRelease() {
+      if (claimed)
+        data_reset::releaseDisruptiveAdmission();
+    }
+  } admission_release{disruptive_claimed};
+  if (!safe_during_reset && !service_owns_admission &&
+      !disruptive_claimed) {
+    PM_LOG_WARN("RESET", "MAINTENANCE_ACTION_GATED",
+                "action=%u reason=data_reset_admission_active",
+                static_cast<unsigned>(message.action));
+    storage_coordinator_.enqueueEvent(
+        "EVT_MAINTENANCE_FAILED", "warning",
+        "Maintenance mutation lost admission to a coordinated data reset.",
+        clock_.utcMs(), config_.identity().boot_id);
+    return;
+  }
+  if (config_.dataResetFrozen() && !safe_during_reset) {
+    PM_LOG_WARN("RESET", "MAINTENANCE_ACTION_GATED",
+                "action=%u reason=data_reset_active",
+                static_cast<unsigned>(message.action));
+    storage_coordinator_.enqueueEvent(
+        "EVT_MAINTENANCE_FAILED", "warning",
+        "Maintenance mutation rejected while coordinated data reset is active.",
+        clock_.utcMs(), config_.identity().boot_id);
+    return;
+  }
   PM_LOG_INFO("MAINTENANCE", "ACTION_BEGIN",
               "action=%u argument=redacted heap_free=%lu",
               static_cast<unsigned>(message.action),
@@ -1680,6 +2161,22 @@ void Application::executeMaintenance(const MaintenanceMessage &message) {
     delay(1000);
     ESP.restart();
     return;
+  case MaintenanceAction::EnrollmentActivationReboot:
+    storage_coordinator_.enqueueEvent(
+        "EVT_ENROLLMENT_ACTIVATION_PENDING", "info",
+        "Enrollment credentials staged; rebooting for data-generation handoff.",
+        clock_.utcMs(), config_.identity().boot_id);
+    // Stop both producers before reboot. Any already durable pre-enrollment
+    // records are removed by the boot-time activation transaction; volatile
+    // partial intervals are intentionally never relabeled.
+    ok = config_.setDataResetFreeze(true);
+    storage_coordinator_.setRecordWritesEnabled(false);
+    if (ok) {
+      delay(250U);
+      ESP.restart();
+      return;
+    }
+    break;
   case MaintenanceAction::NetworkReset:
     ok = config_.networkReset();
     if (ok) {

@@ -2,7 +2,8 @@ openapi: 3.1.0
 info:
   title: Power Monitor Sensor Agent device API
   version: 1.0.0
-  description: Authenticated local API for pm-protocol/1.0.0. Unknown JSON fields are ignored; required omissions return RFC 9457 problem details.
+  description: Authenticated local API for pm-protocol/1.0.0. Unknown JSON fields are ignored unless a schema explicitly closes the object; required omissions return RFC 9457 problem details.
+  x-data-reset-protocol: data-reset/1.0.0
 servers:
   - url: http://power-monitor-device.local
 paths:
@@ -99,7 +100,7 @@ paths:
       operationId: getStorage
       security: [{deviceHmac: []}, {localSession: []}]
       responses:
-        '200': {description: Authoritative microSD health and range, content: {application/json: {schema: {type: object}}}}
+        '200': {description: Authoritative microSD health and exact reset-planning inventory, content: {application/json: {schema: {$ref: '#/components/schemas/StorageStatus'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/sync-status:
     get:
@@ -220,6 +221,51 @@ paths:
         '202': {description: Bounded persistence job queued because the `respond-async` preference was requested, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordJob'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+  /api/v1/data-reset/prepare:
+    post:
+      operationId: prepareDataReset
+      description: Freezes unsafe mutations and reading production, drains durable writes, captures preservation evidence, and returns a durable redacted receipt. Identical retries are idempotent.
+      security: [{deviceHmac: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetPrepareRequest'}}}}
+      responses:
+        '200': {description: Idempotent durable prepared receipt, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '202': {description: Durable preparation is still in progress, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '409': {description: Conflicting, stale, or unsafe reset request, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+        '422': {$ref: '#/components/responses/Problem'}
+  /api/v1/data-reset/commit:
+    post:
+      operationId: commitDataReset
+      description: Durably authorizes the prepared operation before clearing classified reading data, advancing generation and cursors, and installing the software energy baseline.
+      security: [{deviceHmac: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetCommitRequest'}}}}
+      responses:
+        '200': {description: Idempotent durable completion receipt, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '202': {description: Durable commit is still in progress, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '409': {description: Conflicting, stale, or unsafe reset request, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+        '422': {$ref: '#/components/responses/Problem'}
+  /api/v1/data-reset/status:
+    get:
+      operationId: getDataResetStatus
+      description: Returns the durable checkpoint and redacted stored receipts for one exact operation and generation.
+      security: [{deviceHmac: []}]
+      parameters:
+        - {name: operation_id, in: query, required: true, schema: {type: string, format: uuid}}
+        - {name: target_generation, in: query, required: true, schema: {type: integer, minimum: 1}}
+      responses:
+        '200': {description: Durable reset checkpoint and stored receipts, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '202': {description: Durable reset is complete or cancelled but live gates are still reopening, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '404': {description: Reset operation is unknown, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+  /api/v1/data-reset/cancel:
+    post:
+      operationId: cancelDataReset
+      description: Cancels the exact prepared operation before commit authorization, without changing readings, cursors, generation, or energy baseline.
+      security: [{deviceHmac: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetCancelRequest'}}}}
+      responses:
+        '200': {description: Prepared reset cancelled without deleting data, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '202': {description: Cancellation is durable but live gates are still reopening, content: {application/json: {schema: {$ref: '#/components/schemas/DataResetReceipt'}}}}
+        '409': {description: Cancellation is no longer safe, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+        '422': {$ref: '#/components/responses/Problem'}
   /api/v1/enrollment/reenroll:
     post:
       operationId: beginReenrollment
@@ -367,6 +413,97 @@ components:
       description: RFC 9457 problem details
       content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
   schemas:
+    Sha256:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+    DataResetPrepareRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol, operation_id, device_id, target_generation, reset_timestamp, plan_revision, plan_digest, categories, expected_boundary, server_highest_contiguous, server_maximum_seen, expected_firmware_version, expected_build_hash, expected_card_generation]
+      properties:
+        protocol: {const: data-reset/1.0.0}
+        operation_id: {type: string, format: uuid}
+        device_id: {type: string, format: uuid}
+        target_generation: {type: integer, minimum: 1}
+        reset_timestamp: {type: string, format: date-time, pattern: 'Z$'}
+        plan_revision: {type: integer, minimum: 1}
+        plan_digest: {$ref: '#/components/schemas/Sha256'}
+        categories:
+          type: array
+          minItems: 1
+          maxItems: 1
+          uniqueItems: true
+          items: {const: measurement_history}
+        expected_boundary: {type: integer, minimum: 0, maximum: 9223372036854775805}
+        server_highest_contiguous: {type: integer, minimum: 0, maximum: 9223372036854775805}
+        server_maximum_seen: {type: integer, minimum: 0, maximum: 9223372036854775805}
+        expected_firmware_version: {type: string, minLength: 1, maxLength: 32}
+        expected_build_hash: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$', minLength: 64, maxLength: 64}
+        expected_card_generation: {type: [string, 'null'], pattern: '^[1-9][0-9]*$', maxLength: 20}
+    DataResetCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol, operation_id, device_id, target_generation, plan_revision, plan_digest, approved_boundary, prepared_receipt_digest]
+      properties:
+        protocol: {const: data-reset/1.0.0}
+        operation_id: {type: string, format: uuid}
+        device_id: {type: string, format: uuid}
+        target_generation: {type: integer, minimum: 1}
+        plan_revision: {type: integer, minimum: 1}
+        plan_digest: {$ref: '#/components/schemas/Sha256'}
+        approved_boundary: {type: integer, minimum: 0, maximum: 9223372036854775805}
+        prepared_receipt_digest: {$ref: '#/components/schemas/Sha256'}
+    DataResetCancelRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol, operation_id, device_id, target_generation, plan_revision, plan_digest]
+      properties:
+        protocol: {const: data-reset/1.0.0}
+        operation_id: {type: string, format: uuid}
+        device_id: {type: string, format: uuid}
+        target_generation: {type: integer, minimum: 1}
+        plan_revision: {type: integer, minimum: 1}
+        plan_digest: {$ref: '#/components/schemas/Sha256'}
+    DataResetReceipt:
+      type: object
+      description: Authenticated durable status containing only canonical redacted receipt text and digests.
+      additionalProperties: false
+      required: [protocol, operation_id, device_id, target_generation, state, checkpoint]
+      properties:
+        protocol: {const: data-reset/1.0.0}
+        operation_id: {type: string, format: uuid}
+        device_id: {type: string, format: uuid}
+        target_generation: {type: integer, minimum: 1}
+        state: {type: string, enum: [preparing, prepared, commit_authorized, sequence_advanced, cursors_advanced, readings_cleared, baseline_installed, verified, completed, attention_required, cancelled]}
+        checkpoint: {type: string, enum: [preparing, prepared, commit_authorized, sequence_advanced, cursors_advanced, readings_cleared, baseline_installed, verified, completed, attention_required, cancelled]}
+        failure_code: {type: [string, 'null'], maxLength: 80, pattern: '^[a-z0-9][a-z0-9_]{0,79}$'}
+        prepared_receipt: {type: string, maxLength: 16384, description: Canonical JSON containing only safe receipt evidence.}
+        prepared_receipt_digest: {$ref: '#/components/schemas/Sha256'}
+        commit_receipt: {type: string, maxLength: 16384, description: Canonical JSON containing only safe receipt evidence.}
+        commit_receipt_digest: {$ref: '#/components/schemas/Sha256'}
+        configuration_preservation_digest_before: {$ref: '#/components/schemas/Sha256'}
+        configuration_preservation_digest_after: {$ref: '#/components/schemas/Sha256'}
+    StorageStatus:
+      type: object
+      required: [schema_version, local_record_count, card_generation, card_identity_status, data_generation, sequence_floor, next_sequence, prepare_projection_consistent, prepare_projection_local_record_count, prepare_projection_next_sequence, prepare_projection_newest_sequence, prepare_projection_newest_syncable_sequence, prepare_drain_records_projected, prepare_drain_first_sequence_projected, prepare_drain_last_sequence_projected, prepare_drain_syncable_records_projected]
+      additionalProperties: true
+      properties:
+        schema_version: {const: 1}
+        local_record_count: {type: integer, minimum: 0}
+        card_generation: {type: [string, 'null'], pattern: '^[1-9][0-9]*$', maxLength: 20}
+        card_identity_status: {type: string, minLength: 1, maxLength: 32}
+        data_generation: {type: integer, minimum: 0}
+        sequence_floor: {type: integer, minimum: 0}
+        next_sequence: {type: integer, minimum: 1}
+        prepare_projection_consistent: {type: boolean, description: True only for a coherent producer-and-storage snapshot; false asks the server to retry without planning.}
+        prepare_projection_local_record_count: {type: integer, minimum: 0}
+        prepare_projection_next_sequence: {type: integer, minimum: 1}
+        prepare_projection_newest_sequence: {type: integer, minimum: 0}
+        prepare_projection_newest_syncable_sequence: {type: integer, minimum: 0}
+        prepare_drain_records_projected: {type: integer, minimum: 0, maximum: 2}
+        prepare_drain_first_sequence_projected: {type: [integer, 'null'], minimum: 1}
+        prepare_drain_last_sequence_projected: {type: [integer, 'null'], minimum: 1}
+        prepare_drain_syncable_records_projected: {type: integer, minimum: 0, maximum: 2}
     Problem:
       type: object
       required: [type, title, status, detail, instance]

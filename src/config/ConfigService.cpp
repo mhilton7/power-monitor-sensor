@@ -11,6 +11,7 @@
 #include <ArduinoJson.h>
 #include <ESP.h>
 #include <mbedtls/x509_crt.h>
+#include <nvs.h>
 #include <nvs_flash.h>
 
 #include "build_config.h"
@@ -18,6 +19,7 @@
 #include "config/ConfigValidationHelpers.h"
 #include "diagnostics/DiagnosticCore.h"
 #include "diagnostics/SerialLogger.h"
+#include "reset/DataResetPolicy.h"
 
 namespace pm {
 namespace {
@@ -444,6 +446,10 @@ bool ConfigService::begin() {
     server_event_ack_sequence_ = preferences_.getULong64("event_ack", 0);
     server_config_version_ = preferences_.getUInt("server_cfg", 0);
     energy_offset_wh_ = preferences_.getULong64("energy_off", 0);
+    energy_baseline_absolute_wh_ =
+        preferences_.getULong64("energy_base", 0);
+    data_generation_ = preferences_.getULong64("data_gen", 0);
+    data_reset_boundary_ = preferences_.getULong64("reset_floor", 0);
   }
   if (preferences_.putBool("pmcfg_init", true) != sizeof(bool) ||
       !preferences_.getBool("pmcfg_init", false)) {
@@ -842,7 +848,7 @@ bool ConfigService::commitCandidate(const RuntimeConfig &candidate,
                                     std::uint64_t &committed_generation) {
   committed_generation = 0;
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   RuntimeConfig normalized = candidate;
   normalized.server_ca_pem =
@@ -906,7 +912,7 @@ bool ConfigService::rollbackToPrevious(
   if (expected_current_generation == 0U)
     return false;
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   const std::uint64_t current_generation = persistentGeneration();
   if (current_generation != expected_current_generation) {
@@ -977,6 +983,11 @@ bool ConfigService::updateFromJson(const std::string &json, const bool dry_run,
     result = {false, "config_busy", "Configuration is busy."};
     return false;
   }
+  if (dataResetFrozen()) {
+    result = {false, "data_reset_active",
+              "Configuration is frozen by a coordinated data reset."};
+    return false;
+  }
   RuntimeConfig candidate = config_;
   if (!parseConfig(json, candidate, result)) {
     return false;
@@ -1043,7 +1054,7 @@ std::string ConfigService::wifiPassword() const {
 bool ConfigService::setWifiCredentials(const std::string &ssid,
                                        const std::string &password) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   if (ssid.empty() || ssid.size() > 32 || password.size() < 8 ||
       password.size() > 63) {
@@ -1068,6 +1079,11 @@ bool ConfigService::updateNetworkSettings(const RuntimeConfig &candidate,
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
   if (!mutation) {
     result = {false, "config_busy", "Configuration is busy."};
+    return false;
+  }
+  if (dataResetFrozen()) {
+    result = {false, "data_reset_active",
+              "Network configuration is frozen by a coordinated data reset."};
     return false;
   }
   PM_LOG_INFO("CONFIG", "NETWORK_SETTINGS_COMMIT_BEGIN",
@@ -1159,7 +1175,7 @@ std::string ConfigService::enrollmentToken() const {
 
 bool ConfigService::setEnrollmentToken(const std::string &token) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   return token.size() >= 32 && token.size() <= 256 &&
          writeBytesChecked(preferences_, "enroll_tok",
@@ -1169,7 +1185,8 @@ bool ConfigService::setEnrollmentToken(const std::string &token) {
 
 bool ConfigService::clearEnrollmentToken() {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
-  return mutation && erasePreferenceChecked(preferences_, "enroll_tok");
+  return mutation && !dataResetFrozen() &&
+         erasePreferenceChecked(preferences_, "enroll_tok");
 }
 
 bool ConfigService::saveEnrollment(const std::string &device_id,
@@ -1177,7 +1194,7 @@ bool ConfigService::saveEnrollment(const std::string &device_id,
                                    const std::size_t secret_length,
                                    const std::string &ota_public_key) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   if (device_id.size() != 36 || secret_length < 32 || secret_length > 64 ||
       enrollment_secret == nullptr || ota_public_key.size() > 4096) {
@@ -1248,6 +1265,172 @@ bool ConfigService::saveEnrollment(const std::string &device_id,
   return true;
 }
 
+bool ConfigService::stageEnrollmentActivation(
+    const std::string &device_id, const std::uint8_t *enrollment_secret,
+    const std::size_t secret_length, const std::string &ota_public_key,
+    const std::uint64_t target_data_generation,
+    const std::uint64_t reset_boundary,
+    const std::uint64_t source_card_generation,
+    const std::string &source_card_device_id) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
+  if (!mutation || dataResetFrozen() || enrollment_secret == nullptr ||
+      secret_length < 32U || secret_length > 64U ||
+      ota_public_key.size() > 4096U || source_card_generation == 0U ||
+      source_card_device_id.empty() || source_card_device_id.size() > 64U ||
+      target_data_generation > data_reset::kMaximumResetBoundary ||
+      reset_boundary > data_reset::kMaximumResetBoundary) {
+    return false;
+  }
+  std::string canonical_device_id = device_id;
+  if (!canonicalizeLowercaseUuid(canonical_device_id) ||
+      canonical_device_id != device_id) {
+    return false;
+  }
+  for (const unsigned char character : source_card_device_id) {
+    if (character < 0x20U || character > 0x7eU)
+      return false;
+  }
+
+  const std::uint64_t source_generation = dataGeneration();
+  if (target_data_generation < source_generation ||
+      reset_boundary < dataResetBoundary()) {
+    return false;
+  }
+  EnrollmentActivationInfo activation;
+  activation.policy_bound = true;
+  activation.pending = true;
+  activation.operation_id = crypto::uuidV4();
+  activation.device_id = device_id;
+  activation.source_card_device_id = source_card_device_id;
+  activation.source_card_generation = source_card_generation;
+  activation.source_data_generation = source_generation;
+  activation.target_data_generation = target_data_generation;
+  activation.reset_boundary = reset_boundary;
+  activation.sequence_floor = 0U;
+  const std::uint64_t reenrollment_generation = reenrollmentGeneration();
+  if (!commitEnrollmentActivationRecord(
+          activation, enrollment_secret, secret_length, ota_public_key, false,
+          reenrollment_generation)) {
+    return false;
+  }
+
+  DeviceIdentity inactive_identity = identityUnsafe();
+  inactive_identity.device_id.clear();
+  inactive_identity.enrolled = false;
+  const std::vector<std::uint8_t> secret(enrollment_secret,
+                                         enrollment_secret + secret_length);
+  if (!publishEnrollment(inactive_identity, secret, ota_public_key, {},
+                         reenrollment_generation, activation)) {
+    return false;
+  }
+  if (!erasePreferenceChecked(preferences_, "enroll_tok")) {
+    PM_LOG_WARN("CONFIG", "ENROLLMENT_TOKEN_CLEANUP_DEFERRED",
+                "error=PM-CONFIG-024 activation_pending=true");
+  }
+  PM_LOG_INFO(
+      "CONFIG", "ENROLLMENT_ACTIVATION_STAGED",
+      "credentials_active=false generation=%llu reset_boundary=%llu "
+      "card_generation=%llu",
+      static_cast<unsigned long long>(target_data_generation),
+      static_cast<unsigned long long>(reset_boundary),
+      static_cast<unsigned long long>(source_card_generation));
+  return true;
+}
+
+EnrollmentActivationInfo ConfigService::pendingEnrollmentActivation() const {
+  RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+  return state ? pending_enrollment_activation_ : EnrollmentActivationInfo{};
+}
+
+bool ConfigService::activatePendingEnrollment(
+    const std::uint64_t sequence_floor) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(10000));
+  if (!mutation || sequence_floor > data_reset::kMaximumResetBoundary) {
+    return false;
+  }
+  EnrollmentActivationInfo activation;
+  std::vector<std::uint8_t> secret;
+  std::string ota_public_key;
+  std::uint64_t reenrollment_generation = 0U;
+  DeviceIdentity activated_identity;
+  {
+    RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+    if (!state || !pending_enrollment_activation_.pending ||
+        identity_.enrolled || enrollment_secret_.size() < 32U ||
+        enrollment_secret_.size() > 64U) {
+      return false;
+    }
+    activation = pending_enrollment_activation_;
+    secret = enrollment_secret_;
+    ota_public_key = ota_public_key_;
+    reenrollment_generation = reenrollment_generation_;
+    activated_identity = identity_;
+  }
+  if (sequence_floor < activation.reset_boundary ||
+      dataGeneration() > activation.target_data_generation ||
+      dataResetBoundary() > activation.reset_boundary ||
+      serverAckSequence() > sequence_floor ||
+      serverMaximumSeenSequence() > sequence_floor ||
+      preparedRemovalSequence() > sequence_floor) {
+    std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+    return false;
+  }
+
+  const bool cursors_persisted =
+      writeULong64Checked(preferences_, "server_ack", sequence_floor) &&
+      writeULong64Checked(preferences_, "server_max", sequence_floor) &&
+      writeULong64Checked(preferences_, "remove_seq", sequence_floor) &&
+      writeULong64Checked(preferences_, "event_ack", 0U) &&
+      writeUIntChecked(preferences_, "server_cfg", 0U) &&
+      writeULong64Checked(preferences_, "data_gen",
+                          activation.target_data_generation) &&
+      writeULong64Checked(preferences_, "reset_floor",
+                          activation.reset_boundary);
+  if (!cursors_persisted) {
+    std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+    return false;
+  }
+
+  activation.pending = false;
+  activation.sequence_floor = sequence_floor;
+  if (!commitEnrollmentActivationRecord(
+          activation, secret.data(), secret.size(), ota_public_key, true,
+          reenrollment_generation)) {
+    std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+    return false;
+  }
+  activated_identity.device_id = activation.device_id;
+  activated_identity.enrolled = true;
+  {
+    RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+    if (!state) {
+      std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+      return false;
+    }
+    std::fill(enrollment_secret_.begin(), enrollment_secret_.end(),
+              std::uint8_t{0});
+    std::fill(pending_reenrollment_token_.begin(),
+              pending_reenrollment_token_.end(), '\0');
+    identity_ = activated_identity;
+    enrollment_secret_ = secret;
+    ota_public_key_ = ota_public_key;
+    pending_reenrollment_token_.clear();
+    pending_enrollment_activation_ = {};
+    reenrollment_generation_ = reenrollment_generation;
+    server_ack_sequence_ = sequence_floor;
+    server_maximum_seen_sequence_ = sequence_floor;
+    prepared_removal_sequence_ = sequence_floor;
+    server_event_ack_sequence_ = 0U;
+    server_config_version_ = 0U;
+    data_generation_ = activation.target_data_generation;
+    data_reset_boundary_ = activation.reset_boundary;
+  }
+  const bool token_removed =
+      erasePreferenceChecked(preferences_, "enroll_tok");
+  std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+  return token_removed;
+}
+
 bool ConfigService::directionalKeys(crypto::Key32 &device_to_server,
                                     crypto::Key32 &server_to_device) const {
   std::vector<std::uint8_t> secret;
@@ -1305,9 +1488,9 @@ std::string ConfigService::otaPublicKey() const {
   RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
   if (!state)
     return {};
-  return config_.ota_signing_public_key_pem.empty()
-             ? ota_public_key_
-             : config_.ota_signing_public_key_pem;
+  if (!config_.ota_signing_public_key_pem.empty())
+    return config_.ota_signing_public_key_pem;
+  return identity_.enrolled ? ota_public_key_ : std::string{};
 }
 
 std::string ConfigService::ensureSetupPassword() {
@@ -1371,7 +1554,7 @@ bool ConfigService::setSetupPassword(const std::string &password) {
     return false;
   }
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
-  if (!mutation) {
+  if (!mutation || dataResetFrozen()) {
     return false;
   }
   if (preferences_.putBytes("setup_next", password.data(), password.size()) !=
@@ -1435,7 +1618,7 @@ bool ConfigService::verifySetupPassword(const std::string &password) const {
 
 bool ConfigService::persistAdminVerifier(const std::string &password) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   if (password.size() < 12 || password.size() > 128) {
     return false;
@@ -1463,7 +1646,7 @@ ConfigService::replaceAdminPasswordForPhysicalRecovery(
     return AdminPasswordRecoveryResult::RejectedPreserved;
   }
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(30'000));
-  if (!mutation) {
+  if (!mutation || dataResetFrozen()) {
     return AdminPasswordRecoveryResult::RejectedPreserved;
   }
 
@@ -1516,7 +1699,7 @@ bool ConfigService::commitProvisioning(const RuntimeConfig &candidate,
                                        const std::string &enrollment_token,
                                        const std::string &admin_password) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(15000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   RuntimeConfig normalized = candidate;
   normalized.server_ca_pem =
@@ -1604,7 +1787,7 @@ bool ConfigService::verifyAdminPassword(const std::string &password) const {
 
 bool ConfigService::networkReset() {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   RuntimeConfig reset = config_;
   reset.wifi_ssid.clear();
@@ -1651,7 +1834,8 @@ bool ConfigService::networkReset() {
 
 bool ConfigService::beginReenrollment(const std::string &token) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
-  if (!mutation || token.size() < 32 || token.size() > 256) {
+  if (!mutation || dataResetFrozen() || token.size() < 32 ||
+      token.size() > 256) {
     return false;
   }
   const std::uint64_t current_generation = reenrollmentGeneration();
@@ -1721,7 +1905,8 @@ std::uint64_t ConfigService::reenrollmentGeneration() const {
 
 bool ConfigService::factoryReset() {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(10000));
-  if (!mutation || !clearPersistentNamespace() || !preferences_.clear()) {
+  if (!mutation || dataResetFrozen() || !clearPersistentNamespace() ||
+      !preferences_.clear()) {
     return false;
   }
   initializeIdentity();
@@ -1748,6 +1933,7 @@ bool ConfigService::factoryReset() {
               pending_reenrollment_token_.end(), '\0');
     pending_reenrollment_token_.clear();
     reenrollment_generation_ = 0;
+    pending_enrollment_activation_ = {};
     persistent_generation_ = generation;
     admin_password_configured_ = false;
     server_ack_sequence_ = 0;
@@ -1756,6 +1942,9 @@ bool ConfigService::factoryReset() {
     server_event_ack_sequence_ = 0;
     server_config_version_ = 0;
     energy_offset_wh_ = 0;
+    energy_baseline_absolute_wh_ = 0;
+    data_generation_ = 0;
+    data_reset_boundary_ = 0;
     safe_mode_ = false;
     safe_mode_reason_.clear();
   }
@@ -1895,7 +2084,11 @@ std::uint64_t ConfigService::energyOffsetWh() const {
 
 bool ConfigService::setEnergyOffsetWh(const std::uint64_t offset) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
-  if (!mutation)
+  // setDataResetFreeze() uses the same mutation mutex. Whichever operation
+  // wins is therefore linearized: a rollover already being persisted finishes
+  // before baseline capture, while a reset that wins first rejects the stale
+  // aggregation update after it obtains this lock.
+  if (!mutation || dataResetFrozen())
     return false;
   const std::uint64_t current = energyOffsetWh();
   if (offset < current)
@@ -1910,6 +2103,398 @@ bool ConfigService::setEnergyOffsetWh(const std::uint64_t offset) {
     return false;
   energy_offset_wh_ = offset;
   return true;
+}
+
+bool ConfigService::setEnergyOffsetWhForDataResetDrain(
+    const std::uint64_t offset) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
+  if (!mutation || !dataResetFrozen() ||
+      !data_reset::resetAdmissionActive()) {
+    return false;
+  }
+  const std::uint64_t current = energyOffsetWh();
+  if (offset < current)
+    return false;
+  if (offset == current)
+    return true;
+  if (preferences_.putULong64("energy_off", offset) != sizeof(offset)) {
+    return false;
+  }
+  RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+  if (!state)
+    return false;
+  energy_offset_wh_ = offset;
+  return true;
+}
+
+std::uint64_t ConfigService::energyBaselineAbsoluteWh() const {
+  RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+  return state ? energy_baseline_absolute_wh_ : 0U;
+}
+
+bool ConfigService::setEnergyBaselineAbsoluteWh(const std::uint64_t baseline) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
+  if (!mutation)
+    return false;
+  const std::uint64_t current = energyBaselineAbsoluteWh();
+  if (baseline < current)
+    return false;
+  if (baseline == current)
+    return true;
+  if (!writeULong64Checked(preferences_, "energy_base", baseline))
+    return false;
+  RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+  if (!state)
+    return false;
+  energy_baseline_absolute_wh_ = baseline;
+  return true;
+}
+
+std::uint64_t ConfigService::dataGeneration() const {
+  RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+  return state ? data_generation_ : 0U;
+}
+
+bool ConfigService::setDataGeneration(const std::uint64_t generation) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
+  if (!mutation)
+    return false;
+  const std::uint64_t current = dataGeneration();
+  if (generation < current)
+    return false;
+  if (generation == current)
+    return true;
+  if (!writeULong64Checked(preferences_, "data_gen", generation))
+    return false;
+  RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+  if (!state)
+    return false;
+  data_generation_ = generation;
+  return true;
+}
+
+std::uint64_t ConfigService::dataResetBoundary() const {
+  RecursiveMutexGuard state(state_mutex_, kStateReadTimeout);
+  return state ? data_reset_boundary_ : 0U;
+}
+
+bool ConfigService::setDataResetBoundary(const std::uint64_t boundary) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(2000));
+  if (!mutation)
+    return false;
+  const std::uint64_t current = dataResetBoundary();
+  if (boundary < current)
+    return false;
+  if (boundary == current)
+    return true;
+  if (boundary == std::numeric_limits<std::uint64_t>::max() ||
+      !writeULong64Checked(preferences_, "reset_floor", boundary)) {
+    return false;
+  }
+  RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+  if (!state)
+    return false;
+  data_reset_boundary_ = boundary;
+  return true;
+}
+
+bool ConfigService::setDataResetFreeze(const bool frozen) {
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
+  if (!mutation)
+    return false;
+  data_reset_frozen_.store(frozen, std::memory_order_release);
+  return true;
+}
+
+bool ConfigService::dataResetFrozen() const {
+  return data_reset_frozen_.load(std::memory_order_acquire);
+}
+
+bool ConfigService::configurationPreservationDigest(std::string &digest) const {
+  digest.clear();
+  RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
+  if (!mutation)
+    return false;
+
+  RuntimeConfig snapshot;
+  DeviceIdentity identity;
+  std::string snapshot_wifi_password;
+  std::string snapshot_ota_key;
+  std::string snapshot_pending_token;
+  std::vector<std::uint8_t> snapshot_secret;
+  std::uint64_t snapshot_config_generation = 0U;
+  std::uint64_t snapshot_reenrollment_generation = 0U;
+  bool snapshot_admin_configured = false;
+  {
+    RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
+    if (!state || !identity_.enrolled || identity_.device_id.size() != 36U ||
+        enrollment_secret_.size() < 32U || enrollment_secret_.size() > 64U) {
+      return false;
+    }
+    snapshot = config_;
+    identity = identity_;
+    snapshot_wifi_password = wifi_password_;
+    snapshot_ota_key = ota_public_key_;
+    snapshot_pending_token = pending_reenrollment_token_;
+    snapshot_secret = enrollment_secret_;
+    snapshot_config_generation = persistent_generation_;
+    snapshot_reenrollment_generation = reenrollment_generation_;
+    snapshot_admin_configured = admin_password_configured_;
+    if (!snapshot_pending_token.empty() ||
+        pending_enrollment_activation_.pending) {
+      std::fill(snapshot_wifi_password.begin(), snapshot_wifi_password.end(),
+                '\0');
+      std::fill(snapshot_pending_token.begin(), snapshot_pending_token.end(),
+                '\0');
+      std::fill(snapshot_secret.begin(), snapshot_secret.end(),
+                std::uint8_t{0});
+      return false;
+    }
+  }
+
+  std::string device_id = identity.device_id;
+  if (!canonicalizeLowercaseUuid(device_id)) {
+    std::fill(snapshot_wifi_password.begin(), snapshot_wifi_password.end(),
+              '\0');
+    std::fill(snapshot_pending_token.begin(), snapshot_pending_token.end(),
+              '\0');
+    std::fill(snapshot_secret.begin(), snapshot_secret.end(),
+              std::uint8_t{0});
+    return false;
+  }
+
+  persistence::LoadResult durable_config_record;
+  persistence::LoadResult durable_enrollment_record;
+  RuntimeConfig durable_config;
+  ConfigValidation durable_config_validation;
+  std::string durable_wifi_password;
+  std::string durable_device_id;
+  std::string durable_ota_key;
+  std::string durable_pending_token;
+  std::vector<std::uint8_t> durable_secret;
+  std::uint64_t durable_reenrollment_generation = 0U;
+  EnrollmentActivationInfo durable_activation;
+  std::vector<std::uint8_t> admin_salt;
+  std::vector<std::uint8_t> admin_hash;
+  std::vector<std::uint8_t> setup_salt;
+  std::vector<std::uint8_t> setup_hash;
+  std::string snapshot_secret_hex;
+  std::string durable_secret_hex;
+  std::string admin_salt_hex;
+  std::string admin_hash_hex;
+  std::string setup_salt_hex;
+  std::string setup_hash_hex;
+  std::string canonical;
+  crypto::Key32 key{};
+
+  const auto scrub_string = [](std::string &value) {
+    std::fill(value.begin(), value.end(), '\0');
+    value.clear();
+  };
+  const auto scrub_bytes = [](std::vector<std::uint8_t> &value) {
+    std::fill(value.begin(), value.end(), std::uint8_t{0});
+    value.clear();
+  };
+  const auto scrub = [&]() {
+    scrub_string(snapshot_wifi_password);
+    scrub_string(snapshot_pending_token);
+    scrub_bytes(snapshot_secret);
+    scrub_string(durable_wifi_password);
+    scrub_string(durable_pending_token);
+    scrub_bytes(durable_secret);
+    scrub_bytes(durable_config_record.payload);
+    scrub_bytes(durable_enrollment_record.payload);
+    scrub_bytes(admin_salt);
+    scrub_bytes(admin_hash);
+    scrub_bytes(setup_salt);
+    scrub_bytes(setup_hash);
+    scrub_string(snapshot_secret_hex);
+    scrub_string(durable_secret_hex);
+    scrub_string(admin_salt_hex);
+    scrub_string(admin_hash_hex);
+    scrub_string(setup_salt_hex);
+    scrub_string(setup_hash_hex);
+    scrub_string(canonical);
+    key.fill(std::uint8_t{0});
+  };
+  const auto fail_closed = [&]() {
+    scrub();
+    digest.clear();
+    return false;
+  };
+
+  PreferencesBlobStore store;
+  if (!persistence::loadActive(store, kConfigSlots, durable_config_record) ||
+      durable_config_record.recovered_fallback ||
+      durable_config_record.payload.empty()) {
+    return fail_closed();
+  }
+  std::string durable_config_payload(durable_config_record.payload.begin(),
+                                     durable_config_record.payload.end());
+  if (!parsePersistentConfig(durable_config_payload, durable_config,
+                             durable_wifi_password,
+                             durable_config_validation)) {
+    scrub_string(durable_config_payload);
+    return fail_closed();
+  }
+  scrub_string(durable_config_payload);
+
+  if (!persistence::loadActive(store, kEnrollmentSlots,
+                               durable_enrollment_record) ||
+      durable_enrollment_record.recovered_fallback ||
+      durable_enrollment_record.payload.empty() ||
+      !loadEnrollmentRecord(
+          durable_enrollment_record.payload, durable_device_id,
+          durable_secret, durable_ota_key, durable_pending_token,
+          durable_reenrollment_generation, durable_activation)) {
+    return fail_closed();
+  }
+
+  nvs_handle_t credential_store = 0;
+  if (nvs_open_from_partition("nvs", kLegacyNamespace, NVS_READONLY,
+                              &credential_store) != ESP_OK) {
+    return fail_closed();
+  }
+  const auto read_credential = [credential_store](
+                                   const char *name,
+                                   const std::size_t expected_length,
+                                   std::vector<std::uint8_t> &value,
+                                   bool &present) {
+    value.clear();
+    present = false;
+    std::size_t length = 0U;
+    const esp_err_t length_result =
+        nvs_get_blob(credential_store, name, nullptr, &length);
+    if (length_result == ESP_ERR_NVS_NOT_FOUND)
+      return true;
+    if (length_result != ESP_OK || length != expected_length)
+      return false;
+    present = true;
+    value.resize(expected_length);
+    const esp_err_t read_result =
+        nvs_get_blob(credential_store, name, value.data(), &length);
+    if (read_result != ESP_OK || length != expected_length) {
+      std::fill(value.begin(), value.end(), std::uint8_t{0});
+      value.clear();
+      return false;
+    }
+    return true;
+  };
+  bool admin_salt_present = false;
+  bool admin_hash_present = false;
+  bool setup_salt_present = false;
+  bool setup_hash_present = false;
+  const bool credentials_read =
+      read_credential("admin_salt", 16U, admin_salt,
+                      admin_salt_present) &&
+      read_credential("admin_hash", crypto::Key32{}.size(), admin_hash,
+                      admin_hash_present) &&
+      read_credential("setup_salt", 16U, setup_salt,
+                      setup_salt_present) &&
+      read_credential("setup_hash", crypto::Key32{}.size(), setup_hash,
+                      setup_hash_present);
+  nvs_close(credential_store);
+  if (!credentials_read ||
+      admin_salt_present != admin_hash_present ||
+      setup_salt_present != setup_hash_present ||
+      snapshot_admin_configured != admin_salt_present) {
+    return fail_closed();
+  }
+
+  std::string durable_canonical_device_id = durable_device_id;
+  const std::string durable_config_semantic =
+      serializePersistentConfig(durable_config, {});
+  const std::string snapshot_config_semantic =
+      serializePersistentConfig(snapshot, {});
+  snapshot_secret_hex =
+      crypto::hexEncode(snapshot_secret.data(), snapshot_secret.size());
+  durable_secret_hex =
+      crypto::hexEncode(durable_secret.data(), durable_secret.size());
+  const std::string durable_local_instance_id =
+      std::string(preferences_.getString("local_id", "").c_str());
+  const std::uint64_t efuse_mac = ESP.getEfuseMac();
+  const auto *efuse_bytes =
+      reinterpret_cast<const std::uint8_t *>(&efuse_mac);
+  const std::string hardware_material =
+      crypto::hexEncode(efuse_bytes, sizeof(efuse_mac)) + "pm-hardware-v1";
+  const std::string durable_hardware_id =
+      "esp32s3-" +
+      crypto::sha256Hex(
+          reinterpret_cast<const std::uint8_t *>(hardware_material.data()),
+          hardware_material.size())
+          .substr(0, 20);
+  if (durable_config_record.generation != snapshot_config_generation ||
+      durable_config_semantic.empty() ||
+      durable_config_semantic != snapshot_config_semantic ||
+      !crypto::constantTimeEqual(durable_wifi_password,
+                                 snapshot_wifi_password) ||
+      !canonicalizeLowercaseUuid(durable_canonical_device_id) ||
+      durable_canonical_device_id != device_id ||
+      durable_device_id != identity.device_id || durable_secret.empty() ||
+      !crypto::constantTimeEqual(durable_secret_hex, snapshot_secret_hex) ||
+      durable_ota_key != snapshot_ota_key || !durable_pending_token.empty() ||
+      durable_reenrollment_generation != snapshot_reenrollment_generation ||
+      durable_activation.pending || durable_local_instance_id.empty() ||
+      durable_local_instance_id != identity.local_instance_id ||
+      durable_hardware_id != identity.hardware_id) {
+    return fail_closed();
+  }
+
+  key = crypto::hkdfSha256(
+      durable_secret.data(), durable_secret.size(),
+      reinterpret_cast<const std::uint8_t *>(device_id.data()),
+      device_id.size(), "pm-data-reset-config-preservation-v1");
+
+  admin_salt_hex = admin_salt.empty()
+                       ? std::string{}
+                       : crypto::hexEncode(admin_salt.data(), admin_salt.size());
+  admin_hash_hex = admin_hash.empty()
+                       ? std::string{}
+                       : crypto::hexEncode(admin_hash.data(), admin_hash.size());
+  setup_salt_hex = setup_salt.empty()
+                       ? std::string{}
+                       : crypto::hexEncode(setup_salt.data(), setup_salt.size());
+  setup_hash_hex = setup_hash.empty()
+                       ? std::string{}
+                       : crypto::hexEncode(setup_hash.data(), setup_hash.size());
+  const std::string durable_config_payload_digest = crypto::sha256Hex(
+      durable_config_record.payload.data(), durable_config_record.payload.size());
+  const std::string durable_enrollment_payload_digest = crypto::sha256Hex(
+      durable_enrollment_record.payload.data(),
+      durable_enrollment_record.payload.size());
+
+  canonical = "pm-config-preservation/1\n";
+  const auto append = [&canonical](const char *name, const std::string &value) {
+    canonical += name;
+    canonical.push_back('=');
+    canonical += std::to_string(value.size());
+    canonical.push_back(':');
+    canonical += value;
+    canonical.push_back('\n');
+  };
+  append("persistent_config_generation",
+         std::to_string(durable_config_record.generation));
+  append("persistent_config_payload_sha256", durable_config_payload_digest);
+  append("hardware_id", identity.hardware_id);
+  append("local_instance_id", identity.local_instance_id);
+  append("device_id", device_id);
+  append("enrolled", identity.enrolled ? "1" : "0");
+  append("enrollment_record_generation",
+         std::to_string(durable_enrollment_record.generation));
+  append("enrollment_record_payload_sha256",
+         durable_enrollment_payload_digest);
+  append("enrollment_ota_key", durable_ota_key);
+  append("admin_salt", admin_salt_hex);
+  append("admin_hash", admin_hash_hex);
+  append("setup_salt", setup_salt_hex);
+  append("setup_hash", setup_hash_hex);
+
+  digest = crypto::hmacSha256Hex(key.data(), key.size(), canonical);
+  const bool valid_digest = digest.size() == 64U;
+  scrub();
+  if (!valid_digest)
+    digest.clear();
+  return valid_digest;
 }
 
 bool ConfigService::recordBootStarted() {
@@ -1940,7 +2525,7 @@ bool ConfigService::recordBootHealthy() {
 
 bool ConfigService::setDiagnosticLogLevel(const std::uint8_t level) {
   RecursiveMutexGuard mutation(mutation_mutex_, pdMS_TO_TICKS(5000));
-  if (!mutation)
+  if (!mutation || dataResetFrozen())
     return false;
   if (level > 5 || config_.diagnostic_log_level == level) {
     return level <= 5;
@@ -1965,7 +2550,8 @@ bool ConfigService::loadEnrollmentRecord(
     const std::vector<std::uint8_t> &payload, std::string &device_id,
     std::vector<std::uint8_t> &enrollment_secret, std::string &ota_public_key,
     std::string &pending_reenrollment_token,
-    std::uint64_t &reenrollment_generation) const {
+    std::uint64_t &reenrollment_generation,
+    EnrollmentActivationInfo &activation) const {
   device_id.clear();
   std::fill(enrollment_secret.begin(), enrollment_secret.end(),
             std::uint8_t{0});
@@ -1975,10 +2561,14 @@ bool ConfigService::loadEnrollmentRecord(
             pending_reenrollment_token.end(), '\0');
   pending_reenrollment_token.clear();
   reenrollment_generation = 0;
+  activation = {};
   JsonDocument document;
   const DeserializationError error =
       deserializeJson(document, payload.data(), payload.size());
-  if (error || (document["record_schema_version"] | 0U) != 1U ||
+  const std::uint32_t record_schema_version =
+      document["record_schema_version"] | 0U;
+  if (error ||
+      (record_schema_version != 1U && record_schema_version != 2U) ||
       !document["enrolled"].is<bool>()) {
     return false;
   }
@@ -1988,6 +2578,88 @@ bool ConfigService::loadEnrollmentRecord(
     }
     reenrollment_generation =
         document["reenrollment_generation"].as<std::uint64_t>();
+  }
+  const bool activation_pending =
+      record_schema_version == 2U &&
+      (document["activation_pending"] | false);
+  const auto parse_activation = [&document, &activation](const bool pending) {
+    if (!(document["activation_policy_bound"] | false) ||
+        !document["activation_operation_id"].is<const char *>() ||
+        !document["device_id"].is<const char *>() ||
+        !document["source_card_device_id"].is<const char *>() ||
+        !document["source_card_generation"].is<std::uint64_t>() ||
+        !document["source_data_generation"].is<std::uint64_t>() ||
+        !document["target_data_generation"].is<std::uint64_t>() ||
+        !document["reset_boundary"].is<std::uint64_t>() ||
+        !document["sequence_floor"].is<std::uint64_t>()) {
+      return false;
+    }
+    activation.policy_bound = true;
+    activation.pending = pending;
+    activation.operation_id =
+        document["activation_operation_id"].as<const char *>();
+    activation.device_id = document["device_id"].as<const char *>();
+    activation.source_card_device_id =
+        document["source_card_device_id"].as<const char *>();
+    activation.source_card_generation =
+        document["source_card_generation"].as<std::uint64_t>();
+    activation.source_data_generation =
+        document["source_data_generation"].as<std::uint64_t>();
+    activation.target_data_generation =
+        document["target_data_generation"].as<std::uint64_t>();
+    activation.reset_boundary =
+        document["reset_boundary"].as<std::uint64_t>();
+    activation.sequence_floor =
+        document["sequence_floor"].as<std::uint64_t>();
+    std::string operation_id = activation.operation_id;
+    std::string assigned_device_id = activation.device_id;
+    bool source_identity_valid =
+        !activation.source_card_device_id.empty() &&
+        activation.source_card_device_id.size() <= 64U;
+    for (const unsigned char character : activation.source_card_device_id) {
+      source_identity_valid = source_identity_valid && character >= 0x20U &&
+                              character <= 0x7eU;
+    }
+    return canonicalizeLowercaseUuid(operation_id) &&
+           operation_id == activation.operation_id &&
+           canonicalizeLowercaseUuid(assigned_device_id) &&
+           assigned_device_id == activation.device_id &&
+           source_identity_valid && activation.source_card_generation > 0U &&
+           activation.target_data_generation >=
+               activation.source_data_generation &&
+           activation.target_data_generation <=
+               data_reset::kMaximumResetBoundary &&
+           activation.reset_boundary <= data_reset::kMaximumResetBoundary &&
+           (pending ? activation.sequence_floor == 0U
+                    : activation.sequence_floor >=
+                          activation.reset_boundary);
+  };
+  if (activation_pending) {
+    if (document["enrolled"].as<bool>() ||
+        !document["pending_reenrollment_token"].isNull() ||
+        !document["secret_hex"].is<const char *>() ||
+        !document["ota_public_key"].is<const char *>() ||
+        !parse_activation(true)) {
+      activation = {};
+      return false;
+    }
+    device_id = document["device_id"].as<const char *>();
+    std::string secret_hex = document["secret_hex"].as<const char *>();
+    ota_public_key = document["ota_public_key"].as<const char *>();
+    const bool secret_valid =
+        crypto::hexDecode(secret_hex, enrollment_secret) &&
+        enrollment_secret.size() >= 32U && enrollment_secret.size() <= 64U;
+    std::fill(secret_hex.begin(), secret_hex.end(), '\0');
+    if (!secret_valid || ota_public_key.size() > 4096U) {
+      device_id.clear();
+      std::fill(enrollment_secret.begin(), enrollment_secret.end(),
+                std::uint8_t{0});
+      enrollment_secret.clear();
+      ota_public_key.clear();
+      activation = {};
+      return false;
+    }
+    return true;
   }
   if (!document["enrolled"].as<bool>()) {
     if (!document["pending_reenrollment_token"].isNull()) {
@@ -2017,11 +2689,13 @@ bool ConfigService::loadEnrollmentRecord(
     return false;
   }
   device_id = document["device_id"].as<const char *>();
-  const std::string secret_hex = document["secret_hex"].as<const char *>();
+  std::string secret_hex = document["secret_hex"].as<const char *>();
   ota_public_key = document["ota_public_key"].as<const char *>();
-  if (device_id.size() != 36 ||
-      !crypto::hexDecode(secret_hex, enrollment_secret) ||
-      enrollment_secret.size() < 32 || enrollment_secret.size() > 64 ||
+  const bool secret_valid =
+      crypto::hexDecode(secret_hex, enrollment_secret) &&
+      enrollment_secret.size() >= 32U && enrollment_secret.size() <= 64U;
+  std::fill(secret_hex.begin(), secret_hex.end(), '\0');
+  if (device_id.size() != 36 || !secret_valid ||
       ota_public_key.size() > 4096) {
     device_id.clear();
     std::fill(enrollment_secret.begin(), enrollment_secret.end(),
@@ -2029,6 +2703,19 @@ bool ConfigService::loadEnrollmentRecord(
     enrollment_secret.clear();
     ota_public_key.clear();
     return false;
+  }
+  if (record_schema_version == 2U &&
+      (document["activation_policy_bound"] | false)) {
+    if ((document["activation_pending"] | false) ||
+        !parse_activation(false) || activation.device_id != device_id) {
+      device_id.clear();
+      std::fill(enrollment_secret.begin(), enrollment_secret.end(),
+                std::uint8_t{0});
+      enrollment_secret.clear();
+      ota_public_key.clear();
+      activation = {};
+      return false;
+    }
   }
   return true;
 }
@@ -2067,12 +2754,14 @@ bool ConfigService::commitEnrollmentRecord(
   std::string verified_key;
   std::string verified_pending_token;
   std::uint64_t verified_reenrollment_generation = 0;
+  EnrollmentActivationInfo verified_activation;
   std::string verified_secret_hex;
   std::string expected_secret_hex;
   const bool valid =
       loadEnrollmentRecord(verified.payload, verified_device, verified_secret,
                            verified_key, verified_pending_token,
-                           verified_reenrollment_generation) &&
+                           verified_reenrollment_generation,
+                           verified_activation) &&
       verified_device == device_id && verified_key == ota_public_key &&
       verified_pending_token.empty() &&
       verified_reenrollment_generation == reenrollment_generation &&
@@ -2089,6 +2778,95 @@ bool ConfigService::commitEnrollmentRecord(
   std::fill(verified_secret_hex.begin(), verified_secret_hex.end(), '\0');
   std::fill(expected_secret_hex.begin(), expected_secret_hex.end(), '\0');
   return valid && secret_matches;
+}
+
+bool ConfigService::commitEnrollmentActivationRecord(
+    const EnrollmentActivationInfo &activation,
+    const std::uint8_t *enrollment_secret,
+    const std::size_t secret_length, const std::string &ota_public_key,
+    const bool active, const std::uint64_t reenrollment_generation) {
+  if (!activation.policy_bound || activation.pending == active ||
+      activation.device_id.size() != 36U ||
+      activation.operation_id.size() != 36U ||
+      activation.source_card_device_id.empty() ||
+      activation.source_card_device_id.size() > 64U ||
+      activation.source_card_generation == 0U ||
+      activation.target_data_generation < activation.source_data_generation ||
+      activation.target_data_generation > data_reset::kMaximumResetBoundary ||
+      activation.reset_boundary > data_reset::kMaximumResetBoundary ||
+      (active && activation.sequence_floor < activation.reset_boundary) ||
+      (!active && activation.sequence_floor != 0U) ||
+      enrollment_secret == nullptr || secret_length < 32U ||
+      secret_length > 64U || ota_public_key.size() > 4096U) {
+    return false;
+  }
+  JsonDocument document;
+  document["record_schema_version"] = 2U;
+  document["enrolled"] = active;
+  document["activation_pending"] = !active;
+  document["activation_policy_bound"] = true;
+  document["activation_operation_id"] = activation.operation_id;
+  document["device_id"] = activation.device_id;
+  document["secret_hex"] =
+      crypto::hexEncode(enrollment_secret, secret_length);
+  document["ota_public_key"] = ota_public_key;
+  document["reenrollment_generation"] = reenrollment_generation;
+  document["source_card_device_id"] = activation.source_card_device_id;
+  document["source_card_generation"] = activation.source_card_generation;
+  document["source_data_generation"] = activation.source_data_generation;
+  document["target_data_generation"] = activation.target_data_generation;
+  document["reset_boundary"] = activation.reset_boundary;
+  document["sequence_floor"] = activation.sequence_floor;
+  std::string serialized;
+  serializeJson(document, serialized);
+  const std::vector<std::uint8_t> payload(serialized.begin(), serialized.end());
+  PreferencesBlobStore store;
+  persistence::CommitResult committed;
+  if (!persistence::commit(store, kEnrollmentSlots, payload, committed) ||
+      !committed.committed) {
+    return false;
+  }
+
+  persistence::LoadResult verified;
+  std::string verified_device;
+  std::vector<std::uint8_t> verified_secret;
+  std::string verified_key;
+  std::string verified_pending_token;
+  std::uint64_t verified_reenrollment_generation = 0U;
+  EnrollmentActivationInfo verified_activation;
+  const bool decoded =
+      persistence::loadActive(store, kEnrollmentSlots, verified) &&
+      verified.generation == committed.generation &&
+      loadEnrollmentRecord(
+          verified.payload, verified_device, verified_secret, verified_key,
+          verified_pending_token, verified_reenrollment_generation,
+          verified_activation);
+  const std::string expected_secret_hex =
+      crypto::hexEncode(enrollment_secret, secret_length);
+  const std::string verified_secret_hex =
+      verified_secret.empty()
+          ? std::string{}
+          : crypto::hexEncode(verified_secret.data(), verified_secret.size());
+  const bool matches =
+      decoded && verified_device == activation.device_id &&
+      verified_key == ota_public_key && verified_pending_token.empty() &&
+      verified_reenrollment_generation == reenrollment_generation &&
+      verified_activation.policy_bound &&
+      verified_activation.pending == !active &&
+      verified_activation.operation_id == activation.operation_id &&
+      verified_activation.source_card_device_id ==
+          activation.source_card_device_id &&
+      verified_activation.source_card_generation ==
+          activation.source_card_generation &&
+      verified_activation.source_data_generation ==
+          activation.source_data_generation &&
+      verified_activation.target_data_generation ==
+          activation.target_data_generation &&
+      verified_activation.reset_boundary == activation.reset_boundary &&
+      verified_activation.sequence_floor == activation.sequence_floor &&
+      crypto::constantTimeEqual(expected_secret_hex, verified_secret_hex);
+  std::fill(verified_secret.begin(), verified_secret.end(), std::uint8_t{0});
+  return matches;
 }
 
 bool ConfigService::commitEnrollmentTombstone(
@@ -2111,11 +2889,13 @@ bool ConfigService::commitEnrollmentTombstone(
   std::string public_key;
   std::string pending_token;
   std::uint64_t verified_reenrollment_generation = 0;
+  EnrollmentActivationInfo activation;
   return persistence::loadActive(store, kEnrollmentSlots, verified) &&
          verified.generation == committed.generation &&
          loadEnrollmentRecord(verified.payload, device_id, secret, public_key,
                               pending_token,
-                              verified_reenrollment_generation) &&
+                              verified_reenrollment_generation,
+                              activation) &&
          device_id.empty() && secret.empty() && public_key.empty() &&
          pending_token.empty() &&
          verified_reenrollment_generation == reenrollment_generation;
@@ -2147,11 +2927,13 @@ bool ConfigService::commitReenrollmentPending(
   std::string public_key;
   std::string verified_token;
   std::uint64_t verified_reenrollment_generation = 0;
+  EnrollmentActivationInfo activation;
   const bool valid =
       persistence::loadActive(store, kEnrollmentSlots, verified) &&
       verified.generation == committed.generation &&
       loadEnrollmentRecord(verified.payload, device_id, secret, public_key,
-                           verified_token, verified_reenrollment_generation) &&
+                           verified_token, verified_reenrollment_generation,
+                           activation) &&
       device_id.empty() && secret.empty() && public_key.empty() &&
       verified_reenrollment_generation == reenrollment_generation &&
       crypto::constantTimeEqual(verified_token, token);
@@ -2168,15 +2950,18 @@ bool ConfigService::loadOrMigrateEnrollment() {
   std::string public_key;
   std::string pending_token;
   std::uint64_t reenrollment_generation = 0;
+  EnrollmentActivationInfo activation;
   if (loaded_atomic &&
       !loadEnrollmentRecord(loaded.payload, device_id, secret, public_key,
-                            pending_token, reenrollment_generation)) {
+                            pending_token, reenrollment_generation,
+                            activation)) {
     persistence::LoadResult previous;
     loaded_atomic =
         persistence::loadPrevious(store, kEnrollmentSlots, loaded.generation,
                                   previous) &&
         loadEnrollmentRecord(previous.payload, device_id, secret, public_key,
-                             pending_token, reenrollment_generation);
+                             pending_token, reenrollment_generation,
+                             activation);
     if (loaded_atomic) {
       persistence::LoadResult activated;
       loaded_atomic =
@@ -2212,11 +2997,25 @@ bool ConfigService::loadOrMigrateEnrollment() {
         return false;
       }
     }
+    if (activation.policy_bound && !activation.pending &&
+        (preferences_.getULong64("data_gen", 0U) <
+             activation.target_data_generation ||
+         preferences_.getULong64("reset_floor", 0U) <
+             activation.reset_boundary ||
+         preferences_.getULong64("server_ack", 0U) <
+             activation.sequence_floor ||
+         preferences_.getULong64("server_max", 0U) <
+             activation.sequence_floor ||
+         preferences_.getULong64("remove_seq", 0U) <
+             activation.sequence_floor)) {
+      std::fill(secret.begin(), secret.end(), std::uint8_t{0});
+      return false;
+    }
     DeviceIdentity identity = identityUnsafe();
-    identity.device_id = device_id;
-    identity.enrolled = !device_id.empty();
+    identity.device_id = activation.pending ? std::string{} : device_id;
+    identity.enrolled = !activation.pending && !device_id.empty();
     if (!publishEnrollment(identity, secret, public_key, pending_token,
-                           reenrollment_generation)) {
+                           reenrollment_generation, activation)) {
       std::fill(pending_token.begin(), pending_token.end(), '\0');
       std::fill(secret.begin(), secret.end(), std::uint8_t{0});
       return false;
@@ -2238,7 +3037,8 @@ bool ConfigService::loadOrMigrateEnrollment() {
             "error=PM-CONFIG-027 reenrollment_pending=true generation=%llu",
             static_cast<unsigned long long>(reenrollment_generation));
       }
-    } else if (identity.enrolled && !clearEnrollmentToken()) {
+    } else if ((identity.enrolled || activation.pending) &&
+               !clearEnrollmentToken()) {
       PM_LOG_FATAL("CONFIG", "ENROLLMENT_TOKEN_CLEANUP_FAILED",
                    "error=PM-CONFIG-024 atomic_enrollment_retained=true "
                    "retry_on_boot=true");
@@ -3140,7 +3940,8 @@ bool ConfigService::publishEnrollment(
     const std::vector<std::uint8_t> &enrollment_secret,
     const std::string &ota_public_key,
     const std::string &pending_reenrollment_token,
-    const std::uint64_t reenrollment_generation) {
+    const std::uint64_t reenrollment_generation,
+    const EnrollmentActivationInfo &activation) {
   RecursiveMutexGuard state(state_mutex_, pdMS_TO_TICKS(2000));
   if (!state)
     return false;
@@ -3153,6 +3954,8 @@ bool ConfigService::publishEnrollment(
   ota_public_key_ = ota_public_key;
   pending_reenrollment_token_ = pending_reenrollment_token;
   reenrollment_generation_ = reenrollment_generation;
+  pending_enrollment_activation_ =
+      activation.pending ? activation : EnrollmentActivationInfo{};
   return true;
 }
 

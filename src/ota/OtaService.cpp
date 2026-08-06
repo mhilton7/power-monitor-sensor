@@ -27,6 +27,7 @@
 #include "ota/OtaFaultInjection.h"
 #include "ota/OtaStageLedger.h"
 #include "ota/OtaUpdatePolicy.h"
+#include "reset/DataResetPolicy.h"
 #include "security/Crypto.h"
 #include "version.h"
 
@@ -812,6 +813,26 @@ ota_v2::RunningImageCheckResult OtaService::checkRunningImage(
 }
 
 bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
+  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(5000));
+  if (!workflow_lock) {
+    PM_LOG_ERROR("OTA", "WORKFLOW_LOCK_UNAVAILABLE",
+                 "operation=install install=false");
+    return false;
+  }
+  ota_stage::record(ota_stage::Stage::WorkflowLockAcquired);
+  if (config_.dataResetFrozen()) {
+    PM_LOG_WARN("OTA", "UPDATE_REJECTED",
+                "error=PM-OTA-002 reason=data_reset_active");
+    return false;
+  }
+  if (!data_reset::claimDisruptiveAdmission()) {
+    PM_LOG_WARN("OTA", "UPDATE_REJECTED",
+                "error=PM-OTA-002 reason=data_reset_admission_active");
+    return false;
+  }
+  struct AdmissionRelease final {
+    ~AdmissionRelease() { data_reset::releaseDisruptiveAdmission(); }
+  } admission_release;
   if (in_progress_.exchange(true, std::memory_order_acq_rel)) {
     PM_LOG_WARN("OTA", "UPDATE_REJECTED",
                 "error=PM-OTA-002 reason=already_in_progress");
@@ -821,14 +842,11 @@ bool OtaService::applyFromManifestUrl(const std::string &manifest_url) {
     std::atomic<bool> &flag;
     ~ProgressRelease() { flag.store(false, std::memory_order_release); }
   } progress_release{in_progress_};
-  OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(5000));
-  if (!workflow_lock) {
-    PM_LOG_ERROR("OTA", "WORKFLOW_LOCK_UNAVAILABLE",
-                 "operation=install install=false");
+  if (config_.dataResetFrozen()) {
+    PM_LOG_WARN("OTA", "UPDATE_REJECTED",
+                "error=PM-OTA-002 reason=data_reset_admission_race");
     return false;
   }
-  ota_stage::record(ota_stage::Stage::WorkflowLockAcquired);
-
   const RuntimeConfig active_config = config_.config();
   if (config_.safeMode()) {
     setState(ota_v2::State::Failed, "rejected", "ota_disabled_in_safe_mode",
@@ -1168,8 +1186,17 @@ CompactOtaStatus OtaService::compactStatus() const {
 }
 
 ota_v2::RollbackResult OtaService::rollbackAndReboot() {
+  if (config_.dataResetFrozen())
+    return ota_v2::RollbackResult::RecoveryCheckpointFailed;
+  if (!data_reset::claimDisruptiveAdmission())
+    return ota_v2::RollbackResult::RecoveryCheckpointFailed;
+  struct AdmissionRelease final {
+    ~AdmissionRelease() { data_reset::releaseDisruptiveAdmission(); }
+  } admission_release;
   OtaWorkflowLock workflow_lock(workflow_mutex_, pdMS_TO_TICKS(5000));
   if (!workflow_lock)
+    return ota_v2::RollbackResult::RecoveryCheckpointFailed;
+  if (config_.dataResetFrozen())
     return ota_v2::RollbackResult::RecoveryCheckpointFailed;
   const bool possible = esp_ota_check_rollback_is_possible();
   if (!possible)

@@ -218,6 +218,62 @@ class ProtocolContractTests(unittest.TestCase):
                 "sensor and server exact-wire heartbeat fixtures diverged",
             )
 
+    def test_data_reset_contracts_are_cross_repo_exact_and_bounded(self) -> None:
+        sensor_device = yaml.safe_load(
+            (ROOT / "shared/openapi/device-api.yaml").read_text(encoding="utf-8")
+        )
+        server_device_path = ROOT.parent / "power-monitor/shared/openapi/device-api.yaml"
+        self.assertTrue(server_device_path.exists())
+        server_device = yaml.safe_load(server_device_path.read_text(encoding="utf-8"))
+        reset_schemas = (
+            "DataResetPrepareRequest",
+            "DataResetCommitRequest",
+            "DataResetCancelRequest",
+            "DataResetReceipt",
+        )
+        for schema_name in reset_schemas:
+            self.assertEqual(
+                sensor_device["components"]["schemas"][schema_name],
+                server_device["components"]["schemas"][schema_name],
+                f"cross-repo reset schema drift: {schema_name}",
+            )
+
+        maximum_boundary = 9_223_372_036_854_775_805
+        prepare = sensor_device["components"]["schemas"][
+            "DataResetPrepareRequest"
+        ]
+        self.assertEqual(
+            prepare["properties"]["reset_timestamp"]["pattern"], "Z$"
+        )
+        self.assertTrue(
+            {"expected_build_hash", "expected_card_generation"}.issubset(
+                prepare["required"]
+            )
+        )
+        for field in (
+            "expected_boundary",
+            "server_highest_contiguous",
+            "server_maximum_seen",
+        ):
+            self.assertEqual(
+                prepare["properties"][field]["maximum"], maximum_boundary
+            )
+        commit = sensor_device["components"]["schemas"][
+            "DataResetCommitRequest"
+        ]
+        self.assertEqual(
+            commit["properties"]["approved_boundary"]["maximum"],
+            maximum_boundary,
+        )
+        failure_code = sensor_device["components"]["schemas"][
+            "DataResetReceipt"
+        ]["properties"]["failure_code"]
+        self.assertEqual(failure_code["type"], ["string", "null"])
+        self.assertEqual(failure_code["maxLength"], 80)
+        self.assertEqual(
+            failure_code["pattern"], "^[a-z0-9][a-z0-9_]{0,79}$"
+        )
+
     def test_openapi_documents_and_path_item_references(self) -> None:
         for path in (ROOT / "shared/openapi").glob("*.yaml"):
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -1176,7 +1232,7 @@ class ProtocolContractTests(unittest.TestCase):
 
         enrollment_start = firmware_source.index("bool ServerSync::enroll")
         enrollment_credentials = firmware_source.index(
-            "config_.saveEnrollment(", enrollment_start
+            "config_.stageEnrollmentActivation(", enrollment_start
         )
         enrollment_metadata = firmware_source.index(
             "config_.commitCandidate(assigned", enrollment_start
@@ -1184,8 +1240,16 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertLess(
             enrollment_credentials,
             enrollment_metadata,
-            "consumed one-time enrollment tokens require credentials to become durable first",
+            "consumed one-time enrollment tokens require inactive credentials to become durable first",
         )
+        enrollment_end = firmware_source.index(
+            "bool ServerSync::heartbeat", enrollment_start
+        )
+        enrollment_flow = firmware_source[enrollment_start:enrollment_end]
+        self.assertIn('result["sync_policy"]["data_generation"]', enrollment_flow)
+        self.assertIn('result["sync_policy"]["reset_boundary"]', enrollment_flow)
+        self.assertIn("queueEnrollmentActivationReboot()", enrollment_flow)
+        self.assertNotIn("return heartbeat(retry_after_ms)", enrollment_flow)
 
         readings_start = firmware_source.index("bool ServerSync::pushReadings")
         readings_rejected = firmware_source.index(

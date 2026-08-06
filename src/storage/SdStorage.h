@@ -215,18 +215,34 @@ struct HistoryPage {
   std::vector<SequenceRange> unavailable_sequence_ranges;
 };
 
+struct DataResetCleanupResult {
+  bool ok{false};
+  std::uint64_t reading_files_removed{0};
+  std::uint64_t index_files_removed{0};
+  std::uint64_t export_files_removed{0};
+  std::uint64_t metadata_files_removed{0};
+  std::uint64_t bytes_removed{0};
+  std::string error_code;
+};
+
 class SdStorage {
 public:
   SdStorage();
   bool begin(std::uint32_t spi_hz, const std::string &device_id,
              const std::string &hardware_fingerprint,
-             std::uint64_t required_sequence_floor);
+             std::uint64_t required_sequence_floor,
+             const std::string &accepted_previous_device_id = {});
   bool remount(std::uint32_t spi_hz);
   bool remountPreferred();
-  bool append(IntervalRecord &record);
+  bool append(IntervalRecord &record,
+              std::uint64_t expected_card_generation = 0U,
+              const std::string &expected_card_device_id = {});
   bool appendEvent(const std::string &code, const std::string &severity,
                    const std::string &detail, std::uint64_t utc_ms,
-                   const std::string &boot_id);
+                   const std::string &boot_id,
+                   std::uint64_t expected_card_generation = 0U,
+                   const std::string &expected_card_device_id = {},
+                   std::uint64_t source_event_id = 0U);
   HistoryPage readPage(const HistoryQuery &query);
   HistoryPage readEvents(const HistoryQuery &query);
   bool selfTest();
@@ -240,7 +256,9 @@ public:
   bool prepareRemoval();
   bool reserveUnavailableIntervals(std::uint64_t count,
                                    std::uint64_t first_utc_ms,
-                                   std::uint64_t last_utc_ms);
+                                   std::uint64_t last_utc_ms,
+                                   std::uint64_t expected_card_generation = 0U,
+                                   const std::string &expected_card_device_id = {});
   StorageHealth health() const;
   CompactStorageHealth compactHealth() const;
   HeartbeatStorageHealth heartbeatHealth() const;
@@ -248,12 +266,49 @@ public:
                               std::uint64_t persisted_server_max_seen,
                               std::uint64_t prepared_removal_high_water) const;
   std::uint64_t nextSequence() const;
-  bool advanceSequenceFloor(std::uint64_t acknowledged_sequence);
+  bool advanceSequenceFloor(
+      std::uint64_t acknowledged_sequence,
+      std::uint64_t expected_card_generation = 0U,
+      const std::string &expected_card_device_id = {});
+  bool containsDataResetDrainRecord(const IntervalRecord &record,
+                                    std::uint64_t assigned_sequence,
+                                    std::uint64_t expected_card_generation = 0U,
+                                    const std::string &expected_card_device_id = {}) const;
+  bool countExactEvents(const std::string &code,
+                        const std::string &severity,
+                        const std::string &detail, std::uint64_t utc_ms,
+                        const std::string &boot_id,
+                        std::uint64_t expected_card_generation,
+                        const std::string &expected_card_device_id,
+                        std::uint64_t source_event_id,
+                        std::uint64_t &occurrences) const;
+  bool verifyDataResetCardBinding(
+      std::uint64_t expected_card_generation,
+      const std::string &expected_card_device_id) const;
+  // Deletes only positively classified reading artifacts. The card manifest,
+  // event store, event cursor, and unknown recovery evidence are never
+  // removed. Classification completes before the first deletion.
+  DataResetCleanupResult
+  clearReadingDataForReset(const std::string &operation_id,
+                           std::uint64_t source_generation,
+                           std::uint64_t target_generation,
+                           std::uint64_t expected_card_generation,
+                           const std::string &expected_card_device_id);
+  bool clearPreEnrollmentReadingData(
+      std::uint64_t expected_card_generation,
+      const std::string &expected_card_device_id,
+      std::string &error_code);
+  bool rebindCardForEnrollment(std::uint64_t expected_card_generation,
+                               const std::string &source_card_device_id,
+                               const std::string &assigned_device_id);
 
 private:
   bool initializeLayout();
   bool recover();
   bool recoverCleanupJournal();
+  bool currentCardManifestMatchesReset(
+      std::uint64_t expected_card_generation,
+      const std::string &expected_card_device_id) const;
   bool recoverFile(const std::string &path, std::uint64_t &maximum_sequence);
   bool writeManifest();
   bool loadSequenceJournal(const char *path, std::uint64_t &value) const;
@@ -266,6 +321,8 @@ private:
   std::string serializeRecord(const IntervalRecord &record) const;
   void collectFiles(const std::string &directory, const char *suffix,
                     std::vector<std::string> &output) const;
+  bool collectFilesStrict(const std::string &directory, const char *suffix,
+                          std::vector<std::string> &output) const;
   HistoryPage readEnvelopeFiles(const std::vector<std::string> &paths,
                                 const HistoryQuery &query,
                                 const char *sequence_field);
@@ -305,6 +362,7 @@ private:
   std::uint64_t next_event_sequence_{1};
   std::uint64_t required_sequence_floor_{0};
   std::string device_id_;
+  std::string accepted_previous_device_id_;
   std::string hardware_fingerprint_;
   std::uint32_t preferred_spi_hz_{0};
   StoragePolicy active_policy_{};

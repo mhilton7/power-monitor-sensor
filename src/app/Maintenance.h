@@ -15,6 +15,7 @@ enum class MaintenanceAction : std::uint8_t {
   TestServerTls,
   TestHeartbeat,
   Reboot,
+  EnrollmentActivationReboot,
   NetworkReset,
   FactoryReset,
   ApplyOta,

@@ -32,6 +32,12 @@
     "boot_id": {"type": "string", "format": "uuid"},
     "firmware_version": {"type": "string"},
     "firmware_build_hash": {"type": "string"},
+    "data_generation": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Additive data-only-reset epoch; omission means generation zero for legacy sensors."
+    },
     "ota": {"$ref": "#/$defs/ota_capability"},
     "uptime_seconds": {"type": "integer", "minimum": 0},
     "reboot_reason": {"type": "string"},
@@ -50,16 +56,17 @@
     },
     "pzem": {"$ref": "#/$defs/subsystem_health"},
     "sd": {"$ref": "#/$defs/storage_health"},
-    "oldest_stored_sequence": {"type": "integer", "minimum": 0},
+    "oldest_stored_sequence": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
     "oldest_syncable_sequence": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9223372036854775807,
       "description": "Oldest retained durable interval with trustworthy UTC bounds that can be synchronized."
     },
-    "newest_syncable_sequence": {"type": "integer", "minimum": 0},
-    "newest_stored_sequence": {"type": "integer", "minimum": 0},
-    "server_ack_sequence": {"type": "integer", "minimum": 0},
-    "server_maximum_seen_sequence": {"type": "integer", "minimum": 0},
+    "newest_syncable_sequence": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "newest_stored_sequence": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "server_ack_sequence": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "server_maximum_seen_sequence": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
     "backlog_estimate": {"type": "integer", "minimum": 0},
     "configuration_version": {"type": "integer", "minimum": 0},
     "time": {"$ref": "#/$defs/time_health"},
@@ -71,9 +78,25 @@
       },
       "additionalProperties": true
     },
-    "queue": {"type": "object"}
+    "queue": {"type": "object"},
+    "data_reset": {"$ref": "#/$defs/data_reset_status"}
   },
   "$defs": {
+    "data_reset_status": {
+      "type": "object",
+      "required": ["protocol", "state", "checkpoint"],
+      "properties": {
+        "protocol": {"const": "data-reset/1.0.0"},
+        "state": {"type": "string", "minLength": 1, "maxLength": 48},
+        "checkpoint": {"type": "string", "minLength": 1, "maxLength": 48},
+        "failure_code": {"type": ["string", "null"], "maxLength": 80, "pattern": "^[a-z0-9][a-z0-9_]{0,79}$"},
+        "operation_id": {"type": ["string", "null"], "format": "uuid"},
+        "target_generation": {"type": ["integer", "null"], "minimum": 1},
+        "reset_boundary": {"type": ["integer", "null"], "minimum": 0, "maximum": 9223372036854775805},
+        "reset_required": {"type": "boolean", "default": false}
+      },
+      "additionalProperties": true
+    },
     "ota_capability": {
       "type": "object",
       "additionalProperties": false,

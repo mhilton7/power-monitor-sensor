@@ -35,6 +35,7 @@ enum QualityFlag : std::uint32_t {
 };
 
 struct MeasurementSnapshot {
+  std::uint64_t data_generation{0};
   std::uint64_t utc_ms{0};
   std::uint64_t monotonic_ms{0};
   std::uint64_t raw_energy_wh{0};
@@ -64,6 +65,7 @@ struct Limits {
 
 struct IntervalRecord {
   std::uint32_t schema_version{1};
+  std::uint64_t data_generation{0};
   std::string device_id;
   std::string friendly_name;
   std::uint64_t sequence{0};

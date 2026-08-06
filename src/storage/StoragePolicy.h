@@ -49,6 +49,18 @@ struct StoragePolicyValidation {
   const char *code{"storage_policy_invalid"};
 };
 
+bool resetCardBindingMatches(std::uint64_t actual_generation,
+                             const std::string &actual_device_id,
+                             std::uint64_t expected_generation,
+                             const std::string &expected_device_id);
+bool resetManifestBindingMatches(
+    std::uint32_t schema_version, std::uint64_t actual_generation,
+    const std::string &actual_device_id,
+    const std::string &actual_hardware_fingerprint,
+    std::uint64_t expected_generation,
+    const std::string &expected_device_id,
+    const std::string &expected_hardware_fingerprint);
+
 struct SegmentMetadata {
   std::string record_path;
   std::string index_path;

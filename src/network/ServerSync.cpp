@@ -51,6 +51,20 @@ constexpr std::uint32_t kResponseReadPollMs = 10U;
 constexpr std::size_t kReadingBatchRecordLimit = 8U;
 constexpr std::size_t kEventBatchRecordLimit = 24U;
 
+class ReadingSyncLease final {
+public:
+  ReadingSyncLease() : acquired_(data_reset::tryBeginReadingSync()) {}
+  ~ReadingSyncLease() {
+    if (acquired_) {
+      data_reset::finishReadingSync();
+    }
+  }
+  [[nodiscard]] bool acquired() const { return acquired_; }
+
+private:
+  bool acquired_{false};
+};
+
 int printLength(const StringView value) {
   return static_cast<int>(std::min<std::size_t>(
       value.size(), static_cast<std::size_t>(std::numeric_limits<int>::max())));
@@ -722,11 +736,12 @@ ServerSync::ServerSync(ConfigService &config, NetworkService &network,
                        ClockService &clock, SdStorage &storage,
                        StorageCoordinator &storage_coordinator,
                        Diagnostics &diagnostics, IMeter &meter,
-                       QueueHandle_t maintenance_queue)
+                       QueueHandle_t maintenance_queue,
+                       DataResetCoordinator &data_reset)
     : config_(config), network_(network), clock_(clock), storage_(storage),
       storage_coordinator_(storage_coordinator), diagnostics_(diagnostics),
       meter_(meter),
-      maintenance_queue_(maintenance_queue),
+      maintenance_queue_(maintenance_queue), data_reset_(data_reset),
       event_cursor_(config.serverEventAckSequence()) {
   metrics_.last_heartbeat_result.reserve(32U);
   metrics_.last_local_deferral_reason.reserve(64U);
@@ -832,6 +847,35 @@ void ServerSync::tick() {
     logTaskCheckpoint("TASK_START");
   }
   const std::uint64_t now = clock_.monotonicMs();
+  if (config_.pendingEnrollmentActivation().pending) {
+    if (!enrollment_activation_reboot_queued_ ||
+        now >= next_enrollment_activation_reboot_ms_) {
+      enrollment_activation_reboot_queued_ =
+          queueEnrollmentActivationReboot();
+      next_enrollment_activation_reboot_ms_ = now + 5000U;
+    }
+    metrics_.last_error = enrollment_activation_reboot_queued_
+                              ? "enrollment_activation_reboot_pending"
+                              : "enrollment_activation_reboot_queue_failed";
+    diagnostics_.setSyncMetrics(metrics_);
+    return;
+  }
+  const bool data_reset_active = config_.dataResetFrozen();
+  if (data_reset_active && !data_reset_gate_observed_) {
+    data_reset_gate_observed_ = true;
+    reading_page_job_id_.clear();
+    (void)storage_coordinator_.clearReadingHistoryResults();
+    metrics_.primary_storage_pending = !event_page_job_id_.empty();
+    PM_LOG_WARN("RESET", "READING_SYNC_GATED",
+                "protocol=data-reset/1.0.0 heartbeat_allowed=true");
+  } else if (!data_reset_active && data_reset_gate_observed_) {
+    data_reset_gate_observed_ = false;
+    next_reading_push_ms_ = 0U;
+    PM_LOG_INFO("RESET", "READING_SYNC_RESUMED",
+                "generation=%llu boundary=%llu",
+                static_cast<unsigned long long>(config_.dataGeneration()),
+                static_cast<unsigned long long>(config_.dataResetBoundary()));
+  }
   const CompactStorageHealth storage_health = storage_.compactHealth();
   metrics_.durable_reading_backlog =
       config_.serverAckSequence() <
@@ -884,52 +928,54 @@ void ServerSync::tick() {
   // configuration is offline. Keeping this state behind the normal online
   // gate would strand the device forever on an unusable network.
   if (pending_config_validation_) {
-    const std::uint64_t current_generation = config_.persistentGeneration();
-    if (current_generation != pending_config_generation_) {
-      PM_LOG_WARN("CONFIG", "REMOTE_NETWORK_UPDATE_SUPERSEDED",
-                  "version=%lu staged_generation=%llu current_generation=%llu "
-                  "rollback_skipped=true",
-                  static_cast<unsigned long>(pending_config_version_),
-                  static_cast<unsigned long long>(pending_config_generation_),
-                  static_cast<unsigned long long>(current_generation));
-      pending_config_validation_ = false;
-      pending_config_generation_ = 0;
-      pending_config_rollback_report_ = true;
-      pending_config_report_detail_ = "superseded_by_newer_configuration";
-      next_config_validation_attempt_ms_ = now;
-    } else if (network.station_connected && clock_.synchronized() &&
-               now >= next_config_validation_attempt_ms_ &&
-               now - pending_config_started_ms_ >= 2000U &&
-               reportConfiguration(pending_config_version_, "applied",
-                                   "post_apply_connectivity_validated")) {
-      pending_config_validation_ = false;
-      pending_config_generation_ = 0;
-    } else if (now - pending_config_started_ms_ >= 30'000U) {
-      std::uint64_t restored_generation = 0;
-      const bool restored = config_.rollbackToPrevious(
+    if (!data_reset_active) {
+      const std::uint64_t current_generation = config_.persistentGeneration();
+      if (current_generation != pending_config_generation_) {
+        PM_LOG_WARN("CONFIG", "REMOTE_NETWORK_UPDATE_SUPERSEDED",
+                    "version=%lu staged_generation=%llu current_generation=%llu "
+                    "rollback_skipped=true",
+                    static_cast<unsigned long>(pending_config_version_),
+                    static_cast<unsigned long long>(pending_config_generation_),
+                    static_cast<unsigned long long>(current_generation));
+        pending_config_validation_ = false;
+        pending_config_generation_ = 0;
+        pending_config_rollback_report_ = true;
+        pending_config_report_detail_ = "superseded_by_newer_configuration";
+        next_config_validation_attempt_ms_ = now;
+      } else if (network.station_connected && clock_.synchronized() &&
+                 now >= next_config_validation_attempt_ms_ &&
+                 now - pending_config_started_ms_ >= 2000U &&
+                 reportConfiguration(pending_config_version_, "applied",
+                                     "post_apply_connectivity_validated")) {
+        pending_config_validation_ = false;
+        pending_config_generation_ = 0;
+      } else if (now - pending_config_started_ms_ >= 30'000U) {
+        std::uint64_t restored_generation = 0;
+        const bool restored = config_.rollbackToPrevious(
           pending_config_generation_, &restored_generation);
-      pending_config_validation_ = false;
-      pending_config_generation_ = 0;
-      pending_config_rollback_report_ = restored;
-      pending_config_report_detail_ = restored
-                                          ? "post_apply_connectivity_failed"
-                                          : "configuration_rollback_conflict";
-      metrics_.last_error = restored ? "network_config_rolled_back"
-                                     : "network_config_rollback_failed";
-      PM_LOG_WARN("CONFIG", "REMOTE_NETWORK_VALIDATION_EXPIRED",
-                  "version=%lu restored=%s restored_generation=%llu",
-                  static_cast<unsigned long>(pending_config_version_),
-                  restored ? "true" : "false",
-                  static_cast<unsigned long long>(restored_generation));
-      if (restored)
-        network_.requestConfigurationApply(0);
-    } else if (now >= next_config_validation_attempt_ms_) {
-      next_config_validation_attempt_ms_ = now + 2000U;
-    }
-    diagnostics_.setSyncMetrics(metrics_);
-    if (pending_config_validation_ || !network.station_connected ||
-        !clock_.synchronized()) {
-      return;
+        pending_config_validation_ = false;
+        pending_config_generation_ = 0;
+        pending_config_rollback_report_ = restored;
+        pending_config_report_detail_ =
+            restored ? "post_apply_connectivity_failed"
+                     : "configuration_rollback_conflict";
+        metrics_.last_error = restored ? "network_config_rolled_back"
+                                       : "network_config_rollback_failed";
+        PM_LOG_WARN("CONFIG", "REMOTE_NETWORK_VALIDATION_EXPIRED",
+                    "version=%lu restored=%s restored_generation=%llu",
+                    static_cast<unsigned long>(pending_config_version_),
+                    restored ? "true" : "false",
+                    static_cast<unsigned long long>(restored_generation));
+        if (restored)
+          network_.requestConfigurationApply(0);
+      } else if (now >= next_config_validation_attempt_ms_) {
+        next_config_validation_attempt_ms_ = now + 2000U;
+      }
+      diagnostics_.setSyncMetrics(metrics_);
+      if (pending_config_validation_ || !network.station_connected ||
+          !clock_.synchronized()) {
+        return;
+      }
     }
   }
 
@@ -1037,6 +1083,12 @@ void ServerSync::tick() {
     diagnostics_.setSyncMetrics(metrics_);
     return;
   }
+  if (data_reset_active) {
+    metrics_.durable_reading_backlog = false;
+    metrics_.primary_storage_pending = !event_page_job_id_.empty();
+    diagnostics_.setSyncMetrics(metrics_);
+    return;
+  }
   const bool durable_reading_backlog = metrics_.durable_reading_backlog;
   if (now >= next_reading_push_ms_ && durable_reading_backlog) {
     immediate_sync_ = !pushReadings();
@@ -1095,6 +1147,21 @@ void ServerSync::tick() {
   diagnostics_.setSyncMetrics(metrics_);
 }
 
+bool ServerSync::queueEnrollmentActivationReboot() {
+  if (maintenance_queue_ == nullptr)
+    return false;
+  MaintenanceMessage message;
+  message.action = MaintenanceAction::EnrollmentActivationReboot;
+  const bool queued =
+      xQueueSend(maintenance_queue_, &message, 0U) == pdTRUE;
+  PM_LOG_INFO("ENROLL",
+              queued ? "ENROLLMENT_ACTIVATION_REBOOT_QUEUED"
+                     : "ENROLLMENT_ACTIVATION_REBOOT_DEFERRED",
+              "credentials_active=false queue_result=%s",
+              queued ? "queued" : "full_or_unavailable");
+  return queued;
+}
+
 void ServerSync::requestImmediateSync() {
   const sync_policy::QueueResult disposition = single_flight_.queue();
   PM_LOG_INFO("SYNC",
@@ -1143,6 +1210,7 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
   capabilities["pzem_model"] = "PZEM-004T V4";
   capabilities["sd_present"] = storage_ready;
   capabilities["sd_required"] = true;
+  capabilities["data_reset_protocol"] = "data-reset/1.0.0";
   JsonObject ota = capabilities["ota"].to<JsonObject>();
   ota["supported"] = true;
   ota["protocol_version"] = ota_v2::kProtocolVersion;
@@ -1155,6 +1223,10 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
   endpoints.add("/api/v1/readings");
   endpoints.add("/api/v1/config");
   endpoints.add("/api/v1/firmware");
+  endpoints.add("/api/v1/data-reset/prepare");
+  endpoints.add("/api/v1/data-reset/commit");
+  endpoints.add("/api/v1/data-reset/status");
+  endpoints.add("/api/v1/data-reset/cancel");
   std::string body;
   serializeJson(document, body);
   const HttpResult response = request("POST", "/api/v1/device-enrollment/claim",
@@ -1197,6 +1269,12 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
       !result["effective_metadata"].is<JsonObject>() ||
       !result["heartbeat_policy"].is<JsonObject>() ||
       !result["sync_policy"].is<JsonObject>() ||
+      !result["sync_policy"]["maximum_batch_records"]
+           .is<std::uint32_t>() ||
+      !result["sync_policy"]["durable_interval_seconds"]
+           .is<std::uint32_t>() ||
+      !result["sync_policy"]["data_generation"].is<std::uint64_t>() ||
+      !result["sync_policy"]["reset_boundary"].is<std::uint64_t>() ||
       std::string(result["protocol_version"].as<const char *>()) !=
           version::PROTOCOL) {
     metrics_.last_error = "enrollment_response_invalid";
@@ -1209,13 +1287,21 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
   const std::string encoded_secret = result["enrollment_secret"] | "";
   const std::string credential_fingerprint =
       result["credential_fingerprint"] | "";
+  const std::uint64_t assigned_data_generation =
+      result["sync_policy"]["data_generation"].as<std::uint64_t>();
+  const std::uint64_t assigned_reset_boundary =
+      result["sync_policy"]["reset_boundary"].as<std::uint64_t>();
   std::string ota_public_key = result["server_ota_signing_public_key"] | "";
   if (ota_public_key.empty()) {
     ota_public_key = result["ota_signing_public_key"] | "";
   }
   if (!lowercaseUuid(device_id) || !urlSafeSecret(encoded_secret) ||
       credential_fingerprint.empty() || credential_fingerprint.size() > 128U ||
-      ota_public_key.size() > 4096U) {
+      ota_public_key.size() > 4096U ||
+      assigned_data_generation > data_reset::kMaximumResetBoundary ||
+      assigned_reset_boundary > data_reset::kMaximumResetBoundary ||
+      assigned_data_generation < config_.dataGeneration() ||
+      assigned_reset_boundary < config_.dataResetBoundary()) {
     metrics_.last_error = "enrollment_credentials_invalid";
     PM_LOG_ERROR("ENROLL", "RESPONSE_INVALID",
                  "error=PM-ENROLL-002 protocol_match=true contract_shape=true "
@@ -1287,34 +1373,52 @@ bool ServerSync::enroll(std::uint32_t &retry_after_ms) {
   std::array<std::uint8_t, 64> secret{};
   const std::size_t secret_length = encoded_secret.size();
   std::memcpy(secret.data(), encoded_secret.data(), secret_length);
-  if (!config_.saveEnrollment(device_id, secret.data(), secret_length,
-                              ota_public_key)) {
+  const StorageHealth activation_storage = storage_.health();
+  if (!activation_storage.mounted || !activation_storage.writable ||
+      activation_storage.card_identity_status != "verified" ||
+      activation_storage.card_generation == 0U ||
+      activation_storage.card_device_id.empty() ||
+      !config_.stageEnrollmentActivation(
+          device_id, secret.data(), secret_length, ota_public_key,
+          assigned_data_generation, assigned_reset_boundary,
+          activation_storage.card_generation,
+          activation_storage.card_device_id)) {
     std::fill(secret.begin(), secret.end(), 0U);
     metrics_.last_error = "enrollment_credentials_invalid";
     PM_LOG_ERROR("ENROLL", "CREDENTIAL_SAVE_FAILED",
-                 "error=PM-ENROLL-004 credentials=redacted");
+                 "error=PM-ENROLL-004 credentials=redacted "
+                 "activation_staged=false");
     return false;
   }
   std::fill(secret.begin(), secret.end(), 0U);
   std::uint64_t assigned_generation = 0;
   if (!config_.commitCandidate(assigned, true, assigned_generation)) {
-    // The one-time token has already been consumed. Keep the atomically saved
-    // credentials active and continue with the heartbeat; the effective
-    // configuration poll can reconcile metadata on the next successful sync.
+    // The one-time token has already been consumed, but credentials remain
+    // inactive in the durable activation record. Boot-time catch-up can still
+    // complete safely and the next configuration poll can reconcile metadata.
     PM_LOG_WARN(
         "ENROLL", "ASSIGNMENT_SAVE_DEFERRED",
-        "error=PM-ENROLL-006 credentials_stored=true metadata_deferred=true");
+        "error=PM-ENROLL-006 credentials_active=false metadata_deferred=true");
   }
-  network_.setServerStatus(true, true);
-  PM_LOG_INFO("ENROLL", "ENROLLMENT_COMPLETE",
+  enrollment_activation_reboot_queued_ =
+      queueEnrollmentActivationReboot();
+  next_enrollment_activation_reboot_ms_ = clock_.monotonicMs() + 5000U;
+  network_.setServerStatus(true, false);
+  PM_LOG_INFO("ENROLL", "ENROLLMENT_CLAIM_STAGED",
               "device=%s friendly_name=%s config_version=%lu "
-              "config_generation=%llu credentials=stored",
+              "config_generation=%llu data_generation=%llu "
+              "reset_boundary=%llu credentials_active=false reboot=%s",
               diag::maskIdentifier(device_id).c_str(),
               config_.sensorStatusConfig().friendly_name.c_str(),
               static_cast<unsigned long>(config_.config().config_version),
-              static_cast<unsigned long long>(assigned_generation));
-  next_heartbeat_ms_ = 0;
-  return heartbeat(retry_after_ms);
+              static_cast<unsigned long long>(assigned_generation),
+              static_cast<unsigned long long>(assigned_data_generation),
+              static_cast<unsigned long long>(assigned_reset_boundary),
+              enrollment_activation_reboot_queued_ ? "queued" : "deferred");
+  metrics_.last_error = enrollment_activation_reboot_queued_
+                            ? "enrollment_activation_reboot_pending"
+                            : "enrollment_activation_reboot_queue_failed";
+  return true;
 }
 
 bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
@@ -1517,6 +1621,13 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
       acknowledgement_disposition ==
           sync_policy::AcknowledgementDisposition::Invalid ||
       maximum_seen < config_.serverMaximumSeenSequence();
+  // Heartbeat acknowledgement reconciliation mutates the same durable cursor
+  // as reading-batch ACKs. Lease only the response-application phase so reset
+  // can still allow heartbeat transport while preventing a late cursor write
+  // from crossing the Prepared boundary.
+  const ReadingSyncLease cursor_lease;
+  const bool reset_cursor_frozen =
+      !cursor_lease.acquired() || config_.dataResetFrozen();
   if (cursor_regressed) {
     if (cursor_contract_valid) {
       ++metrics_.sequence_cursor_conflicts;
@@ -1534,6 +1645,11 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
         static_cast<unsigned long long>(acknowledgement),
         static_cast<unsigned long long>(config_.serverMaximumSeenSequence()),
         static_cast<unsigned long long>(maximum_seen));
+  } else if (reset_cursor_frozen) {
+    PM_LOG_INFO("RESET", "HEARTBEAT_CURSOR_UPDATE_GATED",
+                "response_ack=%llu response_maximum_seen=%llu",
+                static_cast<unsigned long long>(acknowledgement),
+                static_cast<unsigned long long>(maximum_seen));
   } else {
     const bool acknowledgement_persisted =
         acknowledgement == current_ack ||
@@ -1556,7 +1672,8 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
           sequence_state.local_newest_sequence,
           sequence_state.local_journal_high_water, current_ack,
           config_.serverMaximumSeenSequence(), maximum_seen);
-  if (!cursor_regressed && sequence_state.storage_mounted &&
+  if (!cursor_regressed && !reset_cursor_frozen &&
+      sequence_state.storage_mounted &&
       required_sequence_floor > sequence_state.local_journal_high_water) {
     ++metrics_.sequence_reconciliation_requests;
     if (!storage_coordinator_.queueSequenceReconciliation(
@@ -1569,7 +1686,8 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
     } else {
       ++metrics_.sequence_reconciliation_deferred;
     }
-  } else if (!cursor_regressed && !sequence_state.storage_mounted &&
+  } else if (!cursor_regressed && !reset_cursor_frozen &&
+             !sequence_state.storage_mounted &&
              required_sequence_floor >
                  sequence_state.local_journal_high_water) {
     PM_LOG_INFO(
@@ -1590,7 +1708,8 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
     PM_LOG_INFO("OTA", "MANIFEST_POLL_RELEASED",
                 "source=heartbeat next_tick=true concurrent_tls=false");
   }
-  if (!cursor_regressed && sync_policy::shouldReleaseReadingBackoff(
+  if (!cursor_regressed && !reset_cursor_frozen &&
+      sync_policy::shouldReleaseReadingBackoff(
           immediate_sync_, acknowledgement, newest_sequence,
           immediate_sync_release_recorded_,
           last_immediate_sync_release_ack_)) {
@@ -1645,6 +1764,11 @@ bool ServerSync::heartbeat(std::uint32_t &retry_after_ms) {
 }
 
 bool ServerSync::pushReadings() {
+  const ReadingSyncLease reset_lease;
+  if (!reset_lease.acquired() || config_.dataResetFrozen()) {
+    reading_page_job_id_.clear();
+    return false;
+  }
   HistoryQuery query;
   query.after_sequence = config_.serverAckSequence();
   query.limit = kReadingBatchRecordLimit;
@@ -1749,6 +1873,7 @@ bool ServerSync::pushReadings() {
     document["schema_version"] = "reading-batch/1.0.0";
     document["protocol_version"] = version::PROTOCOL;
     document["device_id"] = transport_device_id_;
+    document["data_generation"] = config_.dataGeneration();
     JsonArray unavailable =
         document["unavailable_sequence_ranges"].to<JsonArray>();
     for (const auto &range : page.unavailable_sequence_ranges) {
@@ -1798,6 +1923,14 @@ bool ServerSync::pushReadings() {
   // its internal-RAM working set. The body is the only request payload owner.
   std::vector<std::string>().swap(page.records);
   logTaskCheckpoint("AFTER_JSON_BUILD");
+  // A prepare that wins after page selection must prevent the outbound POST;
+  // the coordinator also waits for this lease before publishing Prepared.
+  if (config_.dataResetFrozen() || data_reset::resetAdmissionActive()) {
+    body.clear();
+    PM_LOG_INFO("RESET", "READ_BATCH_TRANSPORT_GATED",
+                "phase=before_post cursor_unchanged=true");
+    return false;
+  }
   ++transport_scratch_.request_reuses;
   const HttpResult response =
       request("POST", "/api/v1/device-readings/batch", body.data(),
@@ -1883,6 +2016,15 @@ bool ServerSync::pushReadings() {
                  static_cast<unsigned long long>(config_.serverAckSequence()),
                  static_cast<unsigned long long>(metrics_.batch_failures),
                  static_cast<unsigned long long>(next_reading_push_ms_ - now));
+    logTaskCheckpoint("AFTER_RESPONSE_PARSE");
+    return false;
+  }
+  // The POST may have crossed the wire just before reset admission. Do not
+  // mutate the local durable cursor from its response after the prepare gate;
+  // a later generation can safely resend the immutable batch as duplicates.
+  if (config_.dataResetFrozen() || data_reset::resetAdmissionActive()) {
+    PM_LOG_INFO("RESET", "READ_BATCH_ACK_GATED",
+                "phase=before_ack_persist cursor_unchanged=true");
     logTaskCheckpoint("AFTER_RESPONSE_PARSE");
     return false;
   }
@@ -2066,6 +2208,7 @@ bool ServerSync::pushEvents() {
     JsonDocument document(psramJsonAllocator());
     document["protocol_version"] = version::PROTOCOL;
     document["device_id"] = transport_device_id_;
+    document["data_generation"] = config_.dataGeneration();
     if (storage_health.oldest_event_sequence != 0U) {
       document["first_stored_event_sequence"] =
           storage_health.oldest_event_sequence;
@@ -3057,6 +3200,10 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
   const StoragePolicy &storage_policy = transport_runtime_config_.storage_policy;
   MeasurementSnapshot latest;
   const bool has_latest = diagnostics_.latest(latest);
+  const std::uint64_t heartbeat_generation = config_.dataGeneration();
+  const bool latest_allowed = sync_policy::heartbeatLatestAllowed(
+      has_latest, latest.valid, config_.dataResetFrozen(),
+      latest.data_generation, heartbeat_generation);
   std::array<char, 21U> last_sync_at{};
   std::array<char, 21U> measured_at{};
   std::array<char, 21U> last_cleanup_at{};
@@ -3066,7 +3213,7 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
       clock_.synchronized() &&
       clock_.formatUtcIso8601(last_sync_at.data(), last_sync_at.size());
   const bool has_measured_at =
-      has_latest && latest.valid &&
+      latest_allowed &&
       formatIsoUtc(latest.utc_ms, measured_at.data(), measured_at.size());
   const bool has_last_cleanup_at =
       formatIsoUtc(storage.last_cleanup_utc_ms, last_cleanup_at.data(),
@@ -3083,6 +3230,7 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
   document["schema_version"] = "heartbeat/1.0.0";
   document["protocol_version"] = version::PROTOCOL;
   document["device_id"] = transport_device_id_;
+  document["data_generation"] = heartbeat_generation;
   document["boot_id"] = transport_boot_id_;
   document["firmware_version"] = version::FIRMWARE;
   document["firmware_build_hash"] = OtaService::runningBuildHash();
@@ -3100,6 +3248,19 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
   document["connection_mode"] =
       connectionModeName(transport_runtime_config_.connection_mode);
   document["configuration_version"] = config_.serverConfigVersion();
+  const DataResetHeartbeatSnapshot reset = data_reset_.heartbeatSnapshot();
+  JsonObject data_reset = document["data_reset"].to<JsonObject>();
+  data_reset["protocol"] = "data-reset/1.0.0";
+  data_reset["state"] = reset.state;
+  data_reset["checkpoint"] = reset.checkpoint;
+  data_reset["failure_code"] =
+      reset.failure_code.empty() ? nullptr : reset.failure_code.c_str();
+  if (!reset.operation_id.empty()) {
+    data_reset["operation_id"] = reset.operation_id;
+    data_reset["target_generation"] = reset.target_generation;
+  }
+  data_reset["reset_boundary"] = reset.reset_boundary;
+  data_reset["reset_required"] = reset.reset_required;
   JsonObject time = document["time"].to<JsonObject>();
   time["trusted"] = clock_.synchronized();
   time["source"] = clock_.synchronized() ? "sntp" : "untrusted";
@@ -3115,7 +3276,7 @@ bool ServerSync::heartbeatBody(ServerSyncBuffer &output) const {
   meter_json["error_count"] = meter.consecutive_errors;
   JsonObject meter_details = meter_json["details"].to<JsonObject>();
   meter_details["last_error"] = meterErrorCode(meter.last_error);
-  if (has_latest && latest.valid && has_measured_at) {
+  if (latest_allowed && has_measured_at) {
     JsonObject live = document["latest"].to<JsonObject>();
     live["measured_at"] = measured_at.data();
     live["voltage_v"] = latest.voltage_v;

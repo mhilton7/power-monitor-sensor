@@ -14,9 +14,15 @@
   "properties": {
     "schema_version": {"const": 1},
     "protocol": {"const": "pm-protocol/1.0.0"},
+    "data_generation": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Additive data-only-reset epoch; omission means generation zero for legacy sensors."
+    },
     "device_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f-]{36}$"},
     "friendly_name": {"type": "string", "minLength": 1, "maxLength": 64},
-    "sequence": {"type": "integer", "minimum": 1},
+    "sequence": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
     "boot_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f-]{36}$"},
     "start_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
     "end_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},

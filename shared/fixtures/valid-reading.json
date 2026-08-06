@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "protocol": "pm-protocol/1.0.0",
+  "data_generation": 0,
   "device_id": "6db47e3d-b16c-4746-8f21-64310f9e9252",
   "friendly_name": "Garage HVAC",
   "sequence": 583913,
@@ -24,4 +25,3 @@
   "quality_flags": 0,
   "firmware_version": "1.0.0"
 }
-

@@ -2,12 +2,16 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <string>
 #include <type_traits>
 #include <vector>
+
+#include <ArduinoJson.h>
 
 #include "RandomizedReliability.h"
 #include "api/BoundedCookie.h"
@@ -34,6 +38,13 @@
 #include "ota/OtaFaultInjection.h"
 #include "ota/OtaManifestV2.h"
 #include "ota/OtaUpdatePolicy.h"
+#include "reset/DataResetPolicy.h"
+#include "reset/DataResetCapacityPolicy.h"
+#include "reset/DataResetReceipt.h"
+#include "reset/DataResetCleanupStore.h"
+#include "reset/DataResetDrainStore.h"
+#include "reset/DataResetEventStore.h"
+#include "reset/DataResetStore.h"
 #include "security/AuthPolicy.h"
 #include "security/AuthReplayWindow.h"
 #include "security/Crypto.h"
@@ -922,6 +933,1066 @@ void testAtomicConfigStore() {
       pm::persistence::loadActive(enrollment_store, enrollment_keys, loaded) &&
           text(loaded.payload) == "enrolled:new-credentials:generation-1",
       "failed enrollment update preserves UUID, secret, and OTA key");
+}
+
+pm::data_reset::PrepareRequest resetPrepareRequest(
+    const std::string &operation_id =
+        "11111111-1111-4111-8111-111111111111",
+    const std::uint64_t target_generation = 4U) {
+  pm::data_reset::PrepareRequest request;
+  request.protocol = pm::data_reset::kProtocolVersion;
+  request.operation_id = operation_id;
+  request.device_id = "22222222-2222-4222-8222-222222222222";
+  request.target_generation = target_generation;
+  request.reset_timestamp = "2026-08-06T08:00:00Z";
+  request.plan_revision = 1U;
+  request.plan_digest = std::string(64U, 'a');
+  request.categories = {pm::data_reset::kMeasurementHistoryCategory};
+  request.expected_boundary = 98'211U;
+  request.server_highest_contiguous = 98'211U;
+  request.server_maximum_seen = 98'215U;
+  request.expected_firmware_version = "1.0.18";
+  request.expected_build_hash_set = true;
+  request.expected_build_hash = std::string(64U, 'b');
+  request.expected_card_generation_set = true;
+  request.expected_card_generation = 77U;
+  return request;
+}
+
+pm::data_reset::Record preparedResetRecord() {
+  pm::data_reset::Record record;
+  record.state = pm::data_reset::State::Prepared;
+  record.prepare = resetPrepareRequest();
+  record.prepared_firmware_version = "1.0.18";
+  record.prepared_build_hash = std::string(64U, 'b');
+  record.prepared_boot_id = "33333333-3333-4333-8333-333333333333";
+  record.newest_stored_sequence = 98'220U;
+  record.newest_syncable_sequence = 98'218U;
+  record.sensor_server_acknowledgement = 98'211U;
+  record.sensor_maximum_seen = 98'220U;
+  record.prepared_removal_floor = 98'219U;
+  record.local_sequence_floor = 98'220U;
+  record.next_sequence = 98'221U;
+  record.local_record_count = 45U;
+  record.card_generation = 77U;
+  record.sd_status = "mounted";
+  record.prepared_pzem_energy_wh = 100'000U;
+  record.software_energy_baseline_before_wh = 12'000U;
+  record.configuration_digest_before = std::string(64U, 'c');
+  record.prepared_receipt = R"({"state":"prepared"})";
+  record.prepared_receipt_digest = std::string(64U, 'd');
+  record.measurement_pause_started_utc_ms = 1'786'003'200'123ULL;
+  return record;
+}
+
+pm::data_reset::CommitRequest resetCommitRequest() {
+  pm::data_reset::CommitRequest request;
+  request.protocol = pm::data_reset::kProtocolVersion;
+  request.operation_id = "11111111-1111-4111-8111-111111111111";
+  request.device_id = "22222222-2222-4222-8222-222222222222";
+  request.target_generation = 4U;
+  request.plan_revision = 1U;
+  request.plan_digest = std::string(64U, 'a');
+  request.approved_boundary = 98'220U;
+  request.prepared_receipt_digest = std::string(64U, 'd');
+  return request;
+}
+
+pm::data_reset::Record commitAuthorizedResetRecord() {
+  pm::data_reset::Record record = preparedResetRecord();
+  record.state = pm::data_reset::State::Committing;
+  record.checkpoint = pm::data_reset::Checkpoint::CommitAuthorized;
+  record.approved_boundary_set = true;
+  record.approved_boundary = 98'220U;
+  record.new_sequence_floor = 98'220U;
+  record.new_next_sequence = 98'221U;
+  record.commit_energy_baseline_set = true;
+  record.commit_pzem_energy_wh = 100'025U;
+  record.application_energy_baseline_wh = 112'025U;
+  return record;
+}
+
+void testDataResetPolicyAndStore() {
+  using pm::data_reset::Checkpoint;
+  using pm::data_reset::RequestDisposition;
+  using pm::data_reset::State;
+
+  pm::data_reset::releaseResetAdmission();
+  pm::data_reset::releaseDisruptiveAdmission();
+  check(pm::data_reset::claimDisruptiveAdmission() &&
+            !pm::data_reset::claimResetAdmission(),
+        "an OTA/reboot claim that wins first excludes reset admission");
+  pm::data_reset::releaseDisruptiveAdmission();
+  bool first_reset_claim = false;
+  bool repeated_reset_claim = true;
+  check(pm::data_reset::claimResetAdmission(first_reset_claim) &&
+            pm::data_reset::claimResetAdmission(repeated_reset_claim) &&
+            first_reset_claim && !repeated_reset_claim &&
+            !pm::data_reset::claimDisruptiveAdmission(),
+        "accepted reset admission is idempotent and excludes queued OTA/reboot");
+  if (repeated_reset_claim) {
+    pm::data_reset::releaseResetAdmission();
+  }
+  check(pm::data_reset::resetAdmissionActive(),
+        "failed gate reassertion cannot release already-owned reset admission");
+  pm::data_reset::releaseResetAdmission();
+
+  while (pm::data_reset::readingSyncInFlight() != 0U) {
+    pm::data_reset::finishReadingSync();
+  }
+  check(pm::data_reset::tryBeginReadingSync() &&
+            pm::data_reset::readingSyncInFlight() == 1U,
+        "reading synchronization acquires a tracked pre-reset lease");
+  check(pm::data_reset::claimResetAdmission() &&
+            !pm::data_reset::tryBeginReadingSync() &&
+            pm::data_reset::readingSyncInFlight() == 1U,
+        "reset admission gates new sync while retaining the winning in-flight lease");
+  pm::data_reset::finishReadingSync();
+  check(pm::data_reset::readingSyncInFlight() == 0U,
+        "prepare can become durable only after the pre-gate sync lease drains");
+  pm::data_reset::releaseResetAdmission();
+  check(pm::data_reset::sampleForGenerationAllowed(false, 4U, 4U) &&
+            !pm::data_reset::sampleForGenerationAllowed(false, 3U, 4U) &&
+            !pm::data_reset::sampleForGenerationAllowed(true, 4U, 4U),
+        "aggregation resumes for new-generation samples and rejects forced stale interleavings");
+
+  const pm::data_reset::GateSnapshot persistent_release_failure{
+      true, false, true};
+  for (std::size_t retry = 0U; retry < 4U; ++retry) {
+    check(!pm::data_reset::completionExternallyVisible(
+              State::Completed, Checkpoint::Completed,
+              persistent_release_failure) &&
+              !pm::data_reset::cancellationExternallyVisible(
+                  State::Cancelled, Checkpoint::None,
+                  persistent_release_failure),
+          "persistent gate-release failure never publishes a terminal replay state");
+  }
+  const std::array<pm::data_reset::GateSnapshot, 3U>
+      transient_release_sequence{{
+          {true, false, true},
+          {false, false, true},
+          {false, true, false},
+      }};
+  check(!pm::data_reset::completionExternallyVisible(
+            State::Completed, Checkpoint::Completed,
+            transient_release_sequence[0]) &&
+            !pm::data_reset::completionExternallyVisible(
+                State::Completed, Checkpoint::Completed,
+                transient_release_sequence[1]) &&
+            pm::data_reset::completionExternallyVisible(
+                State::Completed, Checkpoint::Completed,
+                transient_release_sequence[2]) &&
+            pm::data_reset::cancellationExternallyVisible(
+                State::Cancelled, Checkpoint::None,
+                transient_release_sequence[2]) &&
+            !pm::data_reset::completionExternallyVisible(
+                State::Committing, Checkpoint::Verified,
+                transient_release_sequence[2]),
+        "transient gate release publishes completion exactly after every gate opens");
+
+  pm::data_reset::PostBaselineFreshnessLatch latest_latch;
+  check(latest_latch.eligible(0U),
+        "latest evidence starts eligible for the boot generation");
+  latest_latch.suspend();
+  check(!latest_latch.eligible(0U) && !latest_latch.eligible(4U),
+        "prepare suppresses cached and newly polled latest evidence");
+  latest_latch.markBaselineInstalled(4U);
+  check(!latest_latch.eligible(4U),
+        "baseline checkpoint alone does not publish a pre-baseline sample");
+  latest_latch.resume(4U);
+  check(!latest_latch.eligible(3U) && latest_latch.eligible(4U),
+        "first eligible latest evidence must be captured post-baseline in the new generation");
+  check(pm::data_reset::installedEnergyBaselineMatches(112'025U, 112'025U) &&
+            !pm::data_reset::installedEnergyBaselineMatches(12'000U,
+                                                            112'025U),
+        "reboot verification rejects a fallback or corrupted energy baseline");
+  check(pm::resetCardBindingMatches(
+            77U, "22222222-2222-4222-8222-222222222222", 77U,
+            "22222222-2222-4222-8222-222222222222") &&
+            !pm::resetCardBindingMatches(
+                78U, "22222222-2222-4222-8222-222222222222", 77U,
+                "22222222-2222-4222-8222-222222222222") &&
+            !pm::resetCardBindingMatches(
+                77U, "99999999-9999-4999-8999-999999999999", 77U,
+                "22222222-2222-4222-8222-222222222222"),
+        "cleanup rejects a card swapped after commit authorization");
+  check(pm::resetManifestBindingMatches(
+            2U, 77U, "22222222-2222-4222-8222-222222222222",
+            "hardware-a", 77U,
+            "22222222-2222-4222-8222-222222222222", "hardware-a") &&
+            !pm::resetManifestBindingMatches(
+                2U, 77U, "22222222-2222-4222-8222-222222222222",
+                "hardware-swapped", 77U,
+                "22222222-2222-4222-8222-222222222222", "hardware-a") &&
+            !pm::resetManifestBindingMatches(
+                1U, 77U, "22222222-2222-4222-8222-222222222222",
+                "hardware-a", 77U,
+                "22222222-2222-4222-8222-222222222222", "hardware-a"),
+        "live reset manifest validation rejects hot-swapped and legacy media");
+
+  const pm::data_reset::PrepareRequest prepare = resetPrepareRequest();
+  check(pm::data_reset::validPrepareRequest(prepare),
+        "data reset accepts the exact normative prepare request");
+  pm::data_reset::PrepareRequest unsupported = prepare;
+  unsupported.categories.push_back("events");
+  check(!pm::data_reset::validPrepareRequest(unsupported),
+        "data reset rejects categories outside measurement_history");
+  unsupported = prepare;
+  unsupported.expected_build_hash_set = false;
+  unsupported.expected_build_hash.clear();
+  unsupported.expected_card_generation_set = false;
+  unsupported.expected_card_generation = 0U;
+  check(pm::data_reset::validPrepareRequest(unsupported),
+        "data reset supports nullable expected build and card evidence");
+  unsupported = prepare;
+  unsupported.reset_timestamp = "2026-08-06T08:00:00+00:00";
+  check(!pm::data_reset::validPrepareRequest(unsupported),
+        "data reset requires canonical UTC Z timestamps on the signed wire");
+
+  check(pm::data_reset::classifyPrepareRequest(nullptr, 3U, prepare) ==
+            RequestDisposition::Accept &&
+            pm::data_reset::classifyPrepareRequest(nullptr, 4U, prepare) ==
+                RequestDisposition::StaleGeneration,
+        "prepare generation must advance monotonically");
+  check(std::string(pm::data_reset::requestDispositionName(
+            RequestDisposition::Conflict)) == "reset_operation_conflict",
+        "changed operation parameters use the typed conflict code");
+
+  pm::data_reset::Record preparing;
+  preparing.state = State::Preparing;
+  preparing.prepare = prepare;
+  preparing.measurement_pause_started_utc_ms = 1'786'003'200'123ULL;
+  check(pm::data_reset::validRecord(preparing) &&
+            pm::data_reset::readingGateRequired(preparing.state,
+                                                preparing.checkpoint),
+        "durable preparing state gates readings before evidence capture");
+  pm::data_reset::Record safe_failure = preparing;
+  safe_failure.failure_code = "data_reset_storage_inventory_failed";
+  pm::data_reset::Record invalid_failure = safe_failure;
+  invalid_failure.failure_code = "Data-Reset Failure";
+  pm::data_reset::Record overlong_failure = safe_failure;
+  overlong_failure.failure_code = std::string(81U, 'a');
+  pm::data_reset::Record leading_underscore_failure = safe_failure;
+  leading_underscore_failure.failure_code = "_data_reset_failed";
+  check(pm::data_reset::validRecord(safe_failure) &&
+            !pm::data_reset::validRecord(invalid_failure) &&
+            !pm::data_reset::validRecord(overlong_failure) &&
+            !pm::data_reset::validRecord(leading_underscore_failure),
+        "durable reset failure codes are bounded nonsecret wire tokens");
+  check(pm::data_reset::classifyPrepareRequest(&preparing, 3U, prepare) ==
+            RequestDisposition::Replay,
+        "identical prepare retry is idempotent");
+  pm::data_reset::PrepareRequest changed_prepare = prepare;
+  changed_prepare.plan_digest = std::string(64U, 'e');
+  check(pm::data_reset::classifyPrepareRequest(&preparing, 3U,
+                                               changed_prepare) ==
+            RequestDisposition::Conflict,
+        "same operation with changed prepare parameters conflicts");
+
+  const pm::data_reset::Record prepared = preparedResetRecord();
+  check(pm::data_reset::validRecord(prepared) &&
+            pm::data_reset::validRecordUpdate(preparing, prepared),
+        "prepared evidence is a valid durable state transition");
+  const pm::data_reset::BoundaryResult boundary =
+      pm::data_reset::highestTrustedBoundary(
+          pm::data_reset::boundaryInputs(prepared));
+  check(boundary.valid && boundary.boundary == 98'220U &&
+            boundary.next_sequence == 98'221U,
+        "reset boundary includes every server and sensor high-water mark");
+
+  pm::data_reset::Record receipt_record;
+  receipt_record.state = State::Prepared;
+  receipt_record.prepare.protocol = pm::data_reset::kProtocolVersion;
+  receipt_record.prepare.operation_id =
+      "187da6e7-c0da-4f95-a2d2-740b874ed9a4";
+  receipt_record.prepare.device_id =
+      "b09baa6a-273f-4338-88e1-af0b47989036";
+  receipt_record.prepare.target_generation = 2U;
+  receipt_record.prepare.reset_timestamp = "2026-08-06T08:00:00Z";
+  receipt_record.prepare.plan_revision = 1U;
+  receipt_record.prepare.plan_digest = std::string(64U, 'd');
+  receipt_record.prepare.categories = {
+      pm::data_reset::kMeasurementHistoryCategory};
+  receipt_record.prepare.expected_boundary = 91U;
+  receipt_record.prepare.server_highest_contiguous = 90U;
+  receipt_record.prepare.server_maximum_seen = 91U;
+  receipt_record.prepare.expected_firmware_version = "1.0.18";
+  receipt_record.prepare.expected_build_hash_set = true;
+  receipt_record.prepare.expected_build_hash =
+      "abababababababababababababababababababababababababababababababab";
+  receipt_record.prepare.expected_card_generation_set = true;
+  receipt_record.prepare.expected_card_generation = 77U;
+  receipt_record.prepared_firmware_version = "1.0.18";
+  receipt_record.prepared_build_hash =
+      "abababababababababababababababababababababababababababababababab";
+  receipt_record.prepared_boot_id =
+      "1b79f263-bd3a-4a53-9251-4c4278f5536a";
+  receipt_record.newest_stored_sequence = 91U;
+  receipt_record.newest_syncable_sequence = 91U;
+  receipt_record.sensor_server_acknowledgement = 90U;
+  receipt_record.sensor_maximum_seen = 91U;
+  receipt_record.local_sequence_floor = 1U;
+  receipt_record.next_sequence = 92U;
+  receipt_record.local_record_count = 42U;
+  receipt_record.card_generation = 77U;
+  receipt_record.sd_status = "verified";
+  receipt_record.prepared_pzem_energy_wh = 100'025U;
+  receipt_record.software_energy_baseline_before_wh = 12'000U;
+  receipt_record.configuration_digest_before = std::string(64U, 'c');
+  receipt_record.measurement_pause_started_utc_ms =
+      1'786'003'200'123ULL;
+  receipt_record.prepare_drain_records_added = 1U;
+  receipt_record.prepare_drain_sequence_range_set = true;
+  receipt_record.prepare_drain_first_sequence = 91U;
+  receipt_record.prepare_drain_last_sequence = 91U;
+  receipt_record.prepare_drain_syncable_records_added = 1U;
+
+  std::ifstream receipt_vector_input(
+      "shared/auth-test-vectors/data-reset-receipt-v1.json");
+  const std::string receipt_vector_text{
+      std::istreambuf_iterator<char>(receipt_vector_input),
+      std::istreambuf_iterator<char>()};
+  JsonDocument receipt_vector;
+  const bool receipt_vector_loaded = receipt_vector_input.good() ||
+                                     receipt_vector_input.eof();
+  const bool receipt_vector_parsed =
+      !deserializeJson(receipt_vector, receipt_vector_text);
+  check(receipt_vector_loaded && receipt_vector_parsed,
+        "shared reset receipt vector loads in the native firmware test");
+  const std::string expected_prepared_canonical =
+      receipt_vector["canonical_json_utf8"] | "";
+  const std::string actual_prepared_canonical =
+      pm::data_reset::buildPreparedReceiptCanonical(receipt_record);
+  if (actual_prepared_canonical != expected_prepared_canonical) {
+    std::cerr << "prepared receipt expected: " << expected_prepared_canonical
+              << "\nprepared receipt actual:   " << actual_prepared_canonical
+              << '\n';
+  }
+  check(actual_prepared_canonical == expected_prepared_canonical,
+        "firmware prepared-receipt builder emits the shared canonical bytes");
+
+  pm::data_reset::Record completion_receipt_record = receipt_record;
+  completion_receipt_record.state = State::Completed;
+  completion_receipt_record.checkpoint = Checkpoint::Completed;
+  completion_receipt_record.approved_boundary_set = true;
+  completion_receipt_record.approved_boundary = 91U;
+  completion_receipt_record.new_sequence_floor = 91U;
+  completion_receipt_record.new_next_sequence = 92U;
+  completion_receipt_record.commit_energy_baseline_set = true;
+  completion_receipt_record.commit_pzem_energy_wh = 100'030U;
+  completion_receipt_record.verified_pzem_energy_wh = 100'030U;
+  completion_receipt_record.readings_deleted = 42U;
+  completion_receipt_record.configuration_digest_after = std::string(64U, 'c');
+  completion_receipt_record.prepared_receipt_digest =
+      "457aaf4eca118f76afc9f98c724792c619dfab59c78b09fd8220f6d4b47400b2";
+  completion_receipt_record.measurement_pause_ended_utc_ms =
+      1'786'003'201'123ULL;
+  completion_receipt_record.measurement_pause_evidenced = true;
+  pm::data_reset::CommitReceiptRuntime receipt_runtime;
+  receipt_runtime.next_sequence = 92U;
+  receipt_runtime.sequence_floor = 91U;
+  receipt_runtime.server_ack_sequence = 91U;
+  receipt_runtime.server_maximum_seen = 91U;
+  const std::string expected_completion_canonical =
+      receipt_vector["completion_canonical_json_utf8"] | "";
+  const std::string actual_completion_canonical =
+      pm::data_reset::buildCommitReceiptCanonical(
+          completion_receipt_record, receipt_runtime);
+  if (actual_completion_canonical != expected_completion_canonical) {
+    std::cerr << "completion receipt expected: "
+              << expected_completion_canonical
+              << "\ncompletion receipt actual:   "
+              << actual_completion_canonical << '\n';
+  }
+  check(actual_completion_canonical == expected_completion_canonical,
+        "firmware completion-receipt builder emits the shared canonical bytes");
+
+  pm::data_reset::BoundaryInputs final_safe_boundary =
+      pm::data_reset::boundaryInputs(prepared);
+  final_safe_boundary.prepared_removal_floor =
+      pm::data_reset::kMaximumResetBoundary;
+  const pm::data_reset::BoundaryResult final_safe_result =
+      pm::data_reset::highestTrustedBoundary(final_safe_boundary);
+  pm::data_reset::BoundaryInputs exhausted = final_safe_boundary;
+  exhausted.prepared_removal_floor =
+      pm::data_reset::kMaximumResetBoundary + 1U;
+  pm::data_reset::PrepareRequest exhausted_prepare = prepare;
+  exhausted_prepare.expected_boundary =
+      pm::data_reset::kMaximumResetBoundary + 1U;
+  check(final_safe_result.valid &&
+            final_safe_result.next_sequence ==
+                pm::data_reset::kMaximumResetBoundary + 1U &&
+            !pm::data_reset::highestTrustedBoundary(exhausted).valid &&
+            !pm::data_reset::validPrepareRequest(exhausted_prepare),
+        "reset boundary stays inside signed BIGINT with a post-reset append");
+
+  const pm::data_reset::CommitRequest commit_request = resetCommitRequest();
+  check(pm::data_reset::validCommitRequest(commit_request) &&
+            pm::data_reset::classifyCommitRequest(prepared, commit_request) ==
+                RequestDisposition::Accept,
+        "matching commit is accepted only after durable prepare");
+  pm::data_reset::CommitRequest exhausted_commit = commit_request;
+  exhausted_commit.approved_boundary =
+      pm::data_reset::kMaximumResetBoundary + 1U;
+  check(!pm::data_reset::validCommitRequest(exhausted_commit),
+        "commit rejects a boundary that exhausts signed server sequences");
+  pm::data_reset::Record cancelled_before_commit = prepared;
+  cancelled_before_commit.state = State::Cancelled;
+  cancelled_before_commit.measurement_pause_ended_utc_ms =
+      cancelled_before_commit.measurement_pause_started_utc_ms + 1U;
+  cancelled_before_commit.measurement_pause_evidenced = true;
+  check(pm::data_reset::classifyCommitRequest(cancelled_before_commit,
+                                              commit_request) ==
+            RequestDisposition::NotPrepared,
+        "cancel-first ordering makes a later commit fail without authorization");
+  pm::data_reset::CommitRequest low_boundary = commit_request;
+  low_boundary.approved_boundary = 98'219U;
+  check(pm::data_reset::classifyCommitRequest(prepared, low_boundary) ==
+            RequestDisposition::BoundaryTooLow,
+        "commit cannot lower the trusted sequence boundary");
+  pm::data_reset::CommitRequest changed_commit = commit_request;
+  changed_commit.plan_digest = std::string(64U, 'e');
+  check(pm::data_reset::classifyCommitRequest(prepared, changed_commit) ==
+            RequestDisposition::Conflict,
+        "commit must bind to the exact prepared plan");
+
+  const pm::data_reset::Record authorized = commitAuthorizedResetRecord();
+  check(pm::data_reset::validRecord(authorized) &&
+            pm::data_reset::validRecordUpdate(prepared, authorized) &&
+            pm::data_reset::commitPointReached(authorized.checkpoint),
+        "commit authorization and fixed energy baseline persist together");
+  check(pm::data_reset::classifyCommitRequest(authorized, commit_request) ==
+            RequestDisposition::Replay,
+        "duplicate commit after authorization replays without rebaselining");
+  changed_commit = commit_request;
+  changed_commit.approved_boundary += 1U;
+  check(pm::data_reset::classifyCommitRequest(authorized, changed_commit) ==
+            RequestDisposition::Conflict,
+        "authorized boundary is immutable across commit retries");
+  pm::data_reset::Record changed_baseline = authorized;
+  ++changed_baseline.application_energy_baseline_wh;
+  check(!pm::data_reset::validRecordUpdate(authorized, changed_baseline),
+        "authorized PZEM software baseline cannot be changed");
+
+  pm::data_reset::Record sequence_advanced = authorized;
+  sequence_advanced.checkpoint = Checkpoint::SequenceAdvanced;
+  pm::data_reset::Record cursors_advanced = sequence_advanced;
+  cursors_advanced.checkpoint = Checkpoint::CursorsAdvanced;
+  pm::data_reset::Record readings_cleared = cursors_advanced;
+  readings_cleared.checkpoint = Checkpoint::ReadingsCleared;
+  readings_cleared.readings_deleted = 45U;
+  readings_cleared.indexes_deleted = 45U;
+  readings_cleared.exports_deleted = 2U;
+  readings_cleared.backlog_entries_deleted = 7U;
+  pm::data_reset::Record baseline_installed = readings_cleared;
+  baseline_installed.checkpoint = Checkpoint::BaselineInstalled;
+  pm::data_reset::Record verified = baseline_installed;
+  verified.checkpoint = Checkpoint::Verified;
+  verified.verified_pzem_energy_wh = verified.commit_pzem_energy_wh;
+  verified.configuration_digest_after = verified.configuration_digest_before;
+  verified.measurement_pause_ended_utc_ms =
+      verified.measurement_pause_started_utc_ms + 1U;
+  verified.measurement_pause_evidenced = true;
+  verified.configuration_digest_after =
+      verified.configuration_digest_before;
+  pm::data_reset::Record completed = verified;
+  completed.state = State::Completed;
+  completed.checkpoint = Checkpoint::Completed;
+  completed.completion_timestamp = "2026-08-06T08:00:10Z";
+  completed.completion_receipt = R"({"state":"completed"})";
+  check(pm::data_reset::validRecordUpdate(authorized, sequence_advanced) &&
+            pm::data_reset::validRecordUpdate(sequence_advanced,
+                                              cursors_advanced) &&
+            pm::data_reset::validRecordUpdate(cursors_advanced,
+                                              readings_cleared) &&
+            pm::data_reset::validRecordUpdate(readings_cleared,
+                                              baseline_installed) &&
+            pm::data_reset::validRecordUpdate(baseline_installed, verified) &&
+            pm::data_reset::validRecordUpdate(verified, completed),
+        "commit checkpoints advance exactly once through completion");
+  check(!pm::data_reset::validRecordUpdate(readings_cleared,
+                                           sequence_advanced) &&
+            !pm::data_reset::readingGateRequired(completed.state,
+                                                 completed.checkpoint),
+        "checkpoint regression is rejected and completion reopens readings");
+  check(pm::data_reset::classifyPrepareRequest(&completed, 4U, prepare) ==
+            RequestDisposition::Replay,
+        "identical prepare remains idempotent after generation completion");
+
+  pm::data_reset::Record attention = sequence_advanced;
+  attention.state = State::AttentionRequired;
+  attention.failure_code = "storage_unavailable";
+  pm::data_reset::Record resumed = attention;
+  resumed.state = State::Committing;
+  resumed.checkpoint = Checkpoint::CursorsAdvanced;
+  check(pm::data_reset::validRecordUpdate(sequence_advanced, attention) &&
+            pm::data_reset::readingGateRequired(attention.state,
+                                                attention.checkpoint) &&
+            pm::data_reset::validRecordUpdate(attention, resumed),
+        "attention state remains gated and resumes from its checkpoint");
+  pm::data_reset::Record commit_latched = prepared;
+  commit_latched.approved_boundary_set = true;
+  commit_latched.approved_boundary = commit_request.approved_boundary;
+  commit_latched.new_sequence_floor = commit_request.approved_boundary;
+  commit_latched.new_next_sequence = commit_request.approved_boundary + 1U;
+  pm::data_reset::Record precommit_attention = commit_latched;
+  precommit_attention.state = State::AttentionRequired;
+  precommit_attention.failure_code = "data_reset_prepare_evidence_changed";
+  pm::data_reset::Record precommit_resumed = precommit_attention;
+  precommit_resumed.state = State::Prepared;
+  precommit_resumed.failure_code.clear();
+  check(pm::data_reset::validRecordUpdate(prepared, commit_latched) &&
+            pm::data_reset::validRecordUpdate(commit_latched,
+                                              precommit_attention) &&
+            pm::data_reset::classifyCommitRequest(precommit_attention,
+                                                  commit_request) ==
+                RequestDisposition::Replay &&
+            pm::data_reset::validRecordUpdate(precommit_attention,
+                                              precommit_resumed),
+        "pre-authorization attention can resume only by exact commit replay");
+  pm::data_reset::Record cancelled = prepared;
+  cancelled.state = State::Cancelled;
+  cancelled.measurement_pause_ended_utc_ms =
+      cancelled.measurement_pause_started_utc_ms + 1U;
+  cancelled.measurement_pause_evidenced = true;
+  pm::data_reset::Record pre_latch_attention = prepared;
+  pre_latch_attention.state = State::AttentionRequired;
+  pre_latch_attention.failure_code = "data_reset_storage_identity_changed";
+  pm::data_reset::Record pre_latch_attention_cancelled =
+      pre_latch_attention;
+  pre_latch_attention_cancelled.state = State::Cancelled;
+  pre_latch_attention_cancelled.failure_code.clear();
+  pre_latch_attention_cancelled.measurement_pause_ended_utc_ms =
+      pre_latch_attention_cancelled.measurement_pause_started_utc_ms + 1U;
+  pre_latch_attention_cancelled.measurement_pause_evidenced = true;
+  pm::data_reset::Record commit_latched_cancelled = precommit_attention;
+  commit_latched_cancelled.state = State::Cancelled;
+  commit_latched_cancelled.failure_code.clear();
+  commit_latched_cancelled.measurement_pause_ended_utc_ms =
+      commit_latched_cancelled.measurement_pause_started_utc_ms + 1U;
+  commit_latched_cancelled.measurement_pause_evidenced = true;
+  check(pm::data_reset::validRecordUpdate(prepared, cancelled) &&
+            pm::data_reset::validRecordUpdate(
+                prepared, pre_latch_attention) &&
+            pm::data_reset::validRecordUpdate(
+                pre_latch_attention, pre_latch_attention_cancelled) &&
+            !pm::data_reset::validRecordUpdate(
+                precommit_attention, commit_latched_cancelled) &&
+            !pm::data_reset::validRecordUpdate(authorized, cancelled),
+        "pre-latch attention cancels, but accepted commit never does");
+
+  const std::vector<std::uint8_t> encoded =
+      pm::encodeDataResetRecord(prepared);
+  pm::data_reset::Record decoded;
+  check(!encoded.empty() && pm::decodeDataResetRecord(encoded, decoded) &&
+            pm::data_reset::recordsEqual(prepared, decoded),
+        "data reset durable record has an exact binary roundtrip");
+  std::vector<std::uint8_t> corrupt = encoded;
+  corrupt[20] ^= 0x80U;
+  check(!pm::decodeDataResetRecord(corrupt, decoded),
+        "data reset durable record rejects CRC corruption");
+
+  MemoryBlobStore memory;
+  pm::DataResetStore store(memory);
+  pm::DataResetStoreMetadata metadata;
+  check(store.load(decoded, &metadata) == pm::DataResetStoreResult::NotFound,
+        "empty reset store reports no operation");
+  check(store.saveAndVerify(preparing, &metadata) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            metadata.persistence_generation == 1U,
+        "preparing gate commits atomically before reset work");
+  check(store.saveAndVerify(preparing, &metadata) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            metadata.persistence_generation == 1U,
+        "identical durable save does not create another generation");
+  check(store.saveAndVerify(prepared, &metadata) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            metadata.persistence_generation == 2U,
+        "prepared receipt commits and reads back atomically");
+
+  MemoryBlobStore reopened_memory;
+  reopened_memory.blobs = memory.blobs;
+  pm::DataResetStore reopened(reopened_memory);
+  check(reopened.load(decoded, &metadata) ==
+                pm::DataResetStoreResult::Loaded &&
+            pm::data_reset::recordsEqual(decoded, prepared),
+        "prepared reset survives a simulated reboot");
+  reopened_memory.failOnWrite(1U, true);
+  check(reopened.saveAndVerify(authorized, &metadata) ==
+            pm::DataResetStoreResult::CommitFailed,
+        "partial reset slot write reports failure");
+  reopened_memory.allowWrites();
+  check(reopened.load(decoded, &metadata) ==
+                pm::DataResetStoreResult::Loaded &&
+            pm::data_reset::recordsEqual(decoded, prepared),
+        "partial reset slot write preserves prepared receipt");
+  reopened_memory.failOnWrite(2U, true);
+  check(reopened.saveAndVerify(authorized, &metadata) ==
+            pm::DataResetStoreResult::CommitFailed,
+        "partial active-marker write reports failure");
+  reopened_memory.allowWrites();
+  check(reopened.load(decoded, &metadata) ==
+                pm::DataResetStoreResult::Loaded &&
+            pm::data_reset::recordsEqual(decoded, prepared),
+        "partial marker write preserves prepared receipt");
+  check(reopened.saveAndVerify(authorized, &metadata) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            metadata.persistence_generation == 3U,
+        "commit authorization survives readback before mutation");
+  check(reopened.saveAndVerify(prepared, &metadata) ==
+            pm::DataResetStoreResult::InvalidTransition,
+        "durable store rejects rollback to prepared after commit point");
+
+  MemoryBlobStore marker_corrupt;
+  marker_corrupt.blobs = reopened_memory.blobs;
+  marker_corrupt.blobs["dr_active"][0] ^= 0x01U;
+  pm::DataResetStore recovered(marker_corrupt);
+  check(recovered.load(decoded, &metadata) ==
+                pm::DataResetStoreResult::Loaded &&
+            metadata.recovered_fallback &&
+            pm::data_reset::recordsEqual(decoded, authorized),
+        "corrupt active marker recovers the newest valid reset checkpoint");
+
+  check(reopened.saveAndVerify(sequence_advanced) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            reopened.saveAndVerify(cursors_advanced) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            reopened.saveAndVerify(readings_cleared) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            reopened.saveAndVerify(baseline_installed) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            reopened.saveAndVerify(verified) ==
+                pm::DataResetStoreResult::SavedAndVerified &&
+            reopened.saveAndVerify(completed) ==
+                pm::DataResetStoreResult::SavedAndVerified,
+        "every reset checkpoint is independently reboot-safe");
+  pm::data_reset::Record next_operation;
+  next_operation.state = State::Preparing;
+  next_operation.prepare = resetPrepareRequest(
+      "44444444-4444-4444-8444-444444444444", 5U);
+  next_operation.measurement_pause_started_utc_ms = 1U;
+  check(reopened.saveAndVerify(next_operation) ==
+            pm::DataResetStoreResult::SavedAndVerified,
+        "higher generation may start only after terminal completion");
+  pm::DataResetStore default_native_store;
+  check(default_native_store.load(decoded) ==
+            pm::DataResetStoreResult::BackendUnavailable,
+        "native default reset store cannot silently emulate NVS");
+}
+
+void testDataResetAuxiliaryStores() {
+  using pm::DataResetStoreResult;
+
+  pm::IntervalRecord interval;
+  interval.data_generation = 3U;
+  interval.device_id = "22222222-2222-4222-8222-222222222222";
+  interval.friendly_name = "native reset fixture";
+  interval.boot_id = "55555555-5555-4555-8555-555555555555";
+  interval.start_utc_ms = 1000U;
+  interval.end_utc_ms = 2000U;
+  interval.start_monotonic_ms = 10U;
+  interval.end_monotonic_ms = 1010U;
+  interval.time_trusted = true;
+  interval.sample_count = 2U;
+  interval.valid_sample_count = 2U;
+  interval.avg_voltage_v = 120.25F;
+  interval.min_voltage_v = 120.0F;
+  interval.max_voltage_v = 120.5F;
+  interval.avg_current_a = 1.5F;
+  interval.min_current_a = 1.0F;
+  interval.max_current_a = 2.0F;
+  interval.avg_active_power_w = 180.375F;
+  interval.min_active_power_w = 120.0F;
+  interval.max_active_power_w = 240.0F;
+  interval.avg_power_factor = 0.99F;
+  interval.avg_frequency_hz = 60.0F;
+  interval.raw_energy_start_wh = 100U;
+  interval.raw_energy_end_wh = 101U;
+  interval.device_lifetime_energy_wh = 101U;
+  interval.interval_energy_wh = 1.125;
+  interval.energy_method = "pzem_delta";
+  interval.ct_rating_a = 100.0F;
+  interval.firmware_version = "1.0.18";
+
+  pm::data_reset::DrainRecord staged;
+  staged.operation_id = "11111111-1111-4111-8111-111111111111";
+  staged.device_id = interval.device_id;
+  staged.source_generation = 3U;
+  staged.target_generation = 4U;
+  staged.card_generation = 77U;
+  staged.proposed_energy_offset_wh = 900U;
+  staged.interval_count = 1U;
+  staged.intervals[0] = interval;
+  staged.interval_crc32[0] = pm::data_reset::drainIntervalCrc32(interval);
+  check(pm::data_reset::validDrainRecord(staged),
+        "drain staged fixture is valid");
+
+  MemoryBlobStore drain_memory;
+  pm::DataResetDrainStore drain_store(drain_memory);
+  pm::data_reset::DrainRecord assigned = staged;
+  assigned.state = pm::data_reset::DrainState::Assigned;
+  assigned.assigned_first_sequence = 100U;
+  pm::data_reset::DrainRecord completed = assigned;
+  completed.state = pm::data_reset::DrainState::Completed;
+  completed.syncable_records_added = 1U;
+  completed.intervals = {};
+  pm::data_reset::DrainRecord foreign_staged = staged;
+  foreign_staged.operation_id = "33333333-3333-4333-8333-333333333333";
+  foreign_staged.device_id = "44444444-4444-4444-8444-444444444444";
+  foreign_staged.source_generation = 0U;
+  foreign_staged.target_generation = 1U;
+  foreign_staged.intervals[0].device_id = foreign_staged.device_id;
+  foreign_staged.intervals[0].data_generation = 0U;
+  foreign_staged.interval_crc32[0] =
+      pm::data_reset::drainIntervalCrc32(foreign_staged.intervals[0]);
+  const std::string local_hardware_id =
+      "esp32s3-0123456789abcdefabcd";
+  check(pm::data_reset::validDrainRecordUpdate(completed, foreign_staged) &&
+            pm::data_reset::completedDrainFromDifferentDevice(
+                completed, foreign_staged.device_id) &&
+            pm::data_reset::completedDrainFromDifferentDevice(
+                completed, local_hardware_id) &&
+            !pm::data_reset::completedDrainFromDifferentDevice(
+                assigned, foreign_staged.device_id) &&
+            !pm::data_reset::completedDrainFromDifferentDevice(
+                assigned, local_hardware_id) &&
+            !pm::data_reset::completedDrainFromDifferentDevice(
+                completed, completed.device_id) &&
+            !pm::data_reset::completedDrainFromDifferentDevice(completed,
+                                                                "") &&
+            !pm::data_reset::completedDrainFromDifferentDevice(
+                completed, "esp32s3-0123456789abcdefabc") &&
+            !pm::data_reset::completedDrainFromDifferentDevice(
+                completed, "esp32s3-0123456789abcdefabcG") &&
+            !pm::data_reset::completedDrainMatchesCurrentGeneration(
+                completed, completed.device_id,
+                completed.target_generation - 1U) &&
+            pm::data_reset::completedDrainMatchesCurrentGeneration(
+                completed, completed.device_id,
+                completed.target_generation),
+        "only a valid foreign completed drain is ignorable at boot");
+  pm::data_reset::DrainRecord same_device_lower = foreign_staged;
+  same_device_lower.device_id = completed.device_id;
+  same_device_lower.intervals[0].device_id = same_device_lower.device_id;
+  same_device_lower.interval_crc32[0] =
+      pm::data_reset::drainIntervalCrc32(same_device_lower.intervals[0]);
+  check(!pm::data_reset::validDrainRecordUpdate(completed,
+                                                same_device_lower) &&
+            !pm::data_reset::validDrainRecordUpdate(staged,
+                                                    foreign_staged) &&
+            !pm::data_reset::validDrainRecordUpdate(assigned,
+                                                    foreign_staged),
+        "same-device generation regression and foreign unfinished drains fail closed");
+  check(drain_store.saveAndVerify(staged) ==
+                DataResetStoreResult::SavedAndVerified &&
+            drain_store.saveAndVerify(assigned) ==
+                DataResetStoreResult::SavedAndVerified &&
+            drain_store.saveAndVerify(completed) ==
+                DataResetStoreResult::SavedAndVerified &&
+            drain_store.scrubCompletedPayloadCopies(completed) ==
+                DataResetStoreResult::SavedAndVerified,
+        "drain store persists staged/assigned/completed and scrubs payload");
+  pm::persistence::LoadResult drain_active;
+  pm::persistence::LoadResult drain_previous;
+  pm::data_reset::DrainRecord drain_active_record;
+  pm::data_reset::DrainRecord drain_previous_record;
+  check(pm::persistence::loadActive(drain_memory, pm::kDataResetDrainSlots,
+                                    drain_active) &&
+            pm::persistence::loadPrevious(
+                drain_memory, pm::kDataResetDrainSlots,
+                drain_active.generation, drain_previous) &&
+            pm::decodeDataResetDrainRecord(drain_active.payload,
+                                           drain_active_record) &&
+            pm::decodeDataResetDrainRecord(drain_previous.payload,
+                                           drain_previous_record) &&
+            pm::data_reset::drainRecordsEqual(completed,
+                                               drain_active_record) &&
+            pm::data_reset::drainRecordsEqual(completed,
+                                               drain_previous_record),
+        "both drain atomic slots contain only the completed tombstone");
+
+  MemoryBlobStore drain_semantic_memory;
+  pm::DataResetDrainStore drain_semantic_store(drain_semantic_memory);
+  pm::persistence::CommitResult injected;
+  pm::data_reset::DrainRecord recovered_drain;
+  check(drain_semantic_store.saveAndVerify(staged) ==
+                DataResetStoreResult::SavedAndVerified &&
+            pm::persistence::commit(drain_semantic_memory,
+                                    pm::kDataResetDrainSlots,
+                                    bytes("{\"schema_version\":1}"),
+                                    injected) &&
+            drain_semantic_store.load(recovered_drain) ==
+                DataResetStoreResult::Loaded &&
+            pm::data_reset::drainRecordsEqual(staged, recovered_drain),
+        "drain store rolls back a wrapper-valid semantic corruption");
+
+  pm::data_reset::CleanupRecord planned;
+  planned.operation_id = staged.operation_id;
+  planned.device_id = staged.device_id;
+  planned.source_generation = staged.source_generation;
+  planned.target_generation = staged.target_generation;
+  planned.card_generation = staged.card_generation;
+  planned.reading_files = 4U;
+  planned.index_files = 2U;
+  planned.export_files = 1U;
+  planned.metadata_files = 3U;
+  planned.bytes = 4096U;
+  pm::data_reset::CleanupRecord cleanup_completed = planned;
+  cleanup_completed.state = pm::data_reset::CleanupState::Completed;
+  pm::data_reset::CleanupRecord foreign_plan = planned;
+  foreign_plan.operation_id = foreign_staged.operation_id;
+  foreign_plan.device_id = foreign_staged.device_id;
+  foreign_plan.source_generation = 0U;
+  foreign_plan.target_generation = 1U;
+  pm::data_reset::CleanupRecord same_device_lower_plan = foreign_plan;
+  same_device_lower_plan.device_id = cleanup_completed.device_id;
+  check(pm::data_reset::validCleanupRecordUpdate(cleanup_completed,
+                                                 foreign_plan) &&
+            !pm::data_reset::validCleanupRecordUpdate(
+                cleanup_completed, same_device_lower_plan) &&
+            !pm::data_reset::validCleanupRecordUpdate(planned,
+                                                      foreign_plan),
+        "cleanup replacement relaxes ordering only for a foreign tombstone");
+  MemoryBlobStore cleanup_memory;
+  pm::DataResetCleanupStore cleanup_store(cleanup_memory);
+  check(cleanup_store.saveAndVerify(planned) ==
+                DataResetStoreResult::SavedAndVerified &&
+            cleanup_store.saveAndVerify(cleanup_completed) ==
+                DataResetStoreResult::SavedAndVerified,
+        "cleanup exact inventory survives its completion transition");
+  pm::persistence::LoadResult cleanup_active;
+  pm::persistence::LoadResult cleanup_previous;
+  pm::data_reset::CleanupRecord cleanup_active_record;
+  pm::data_reset::CleanupRecord cleanup_previous_record;
+  check(cleanup_store.scrubCompletedPayloadCopies(cleanup_completed) ==
+                DataResetStoreResult::SavedAndVerified &&
+            pm::persistence::loadActive(cleanup_memory,
+                                        pm::kDataResetCleanupSlots,
+                                        cleanup_active) &&
+            pm::persistence::loadPrevious(cleanup_memory,
+                                          pm::kDataResetCleanupSlots,
+                                          cleanup_active.generation,
+                                          cleanup_previous) &&
+            pm::decodeDataResetCleanupRecord(cleanup_active.payload,
+                                             cleanup_active_record) &&
+            pm::decodeDataResetCleanupRecord(cleanup_previous.payload,
+                                             cleanup_previous_record) &&
+            pm::data_reset::cleanupRecordsEqual(cleanup_active_record,
+                                                cleanup_completed) &&
+            pm::data_reset::cleanupRecordsEqual(cleanup_previous_record,
+                                                cleanup_completed),
+        "cleanup completion compacts both atomic slots for repeated reset");
+  MemoryBlobStore cleanup_semantic_memory;
+  pm::DataResetCleanupStore cleanup_semantic_store(cleanup_semantic_memory);
+  pm::data_reset::CleanupRecord recovered_cleanup;
+  check(cleanup_semantic_store.saveAndVerify(planned) ==
+                DataResetStoreResult::SavedAndVerified &&
+            pm::persistence::commit(cleanup_semantic_memory,
+                                    pm::kDataResetCleanupSlots,
+                                    bytes("[]"), injected) &&
+            cleanup_semantic_store.load(recovered_cleanup) ==
+                DataResetStoreResult::Loaded &&
+            pm::data_reset::cleanupRecordsEqual(planned,
+                                                 recovered_cleanup),
+        "cleanup store rolls back a wrapper-valid semantic corruption");
+
+  pm::data_reset::EventJournalRecord events;
+  events.operation_id = staged.operation_id;
+  events.device_id = staged.device_id;
+  events.source_generation = staged.source_generation;
+  events.target_generation = staged.target_generation;
+  events.card_generation = staged.card_generation;
+  events.event_count = 2U;
+  events.events[0] = {"RESET_AUDIT", "info", "same payload", interval.boot_id,
+                      3000U, 41U, 1U};
+  events.events[1] = events.events[0];
+  events.events[1].source_event_id = 42U;
+  events.event_crc32[0] =
+      pm::data_reset::preservedEventCrc32(events.events[0]);
+  events.event_crc32[1] =
+      pm::data_reset::preservedEventCrc32(events.events[1]);
+  check(pm::data_reset::validEventJournalRecord(events) &&
+            events.event_crc32[0] != events.event_crc32[1],
+        "byte-identical events retain distinct durable source identities");
+  MemoryBlobStore event_memory;
+  pm::DataResetEventStore event_store(event_memory);
+  pm::data_reset::EventJournalRecord events_completed = events;
+  events_completed.state = pm::data_reset::EventJournalState::Completed;
+  events_completed.events = {};
+  pm::data_reset::EventJournalRecord foreign_events = events;
+  foreign_events.operation_id = foreign_staged.operation_id;
+  foreign_events.device_id = foreign_staged.device_id;
+  foreign_events.source_generation = 0U;
+  foreign_events.target_generation = 1U;
+  pm::data_reset::EventJournalRecord same_device_lower_events =
+      foreign_events;
+  same_device_lower_events.device_id = events_completed.device_id;
+  check(pm::data_reset::validEventJournalRecordUpdate(events_completed,
+                                                      foreign_events) &&
+            !pm::data_reset::validEventJournalRecordUpdate(
+                events_completed, same_device_lower_events) &&
+            !pm::data_reset::validEventJournalRecordUpdate(events,
+                                                           foreign_events),
+        "event replacement relaxes ordering only for a foreign tombstone");
+  check(event_store.saveAndVerify(events) ==
+                DataResetStoreResult::SavedAndVerified &&
+            event_store.saveAndVerify(events_completed) ==
+                DataResetStoreResult::SavedAndVerified,
+        "event store preserves the fixed batch then commits a tombstone");
+  pm::persistence::LoadResult event_active;
+  pm::persistence::LoadResult event_previous;
+  pm::data_reset::EventJournalRecord event_active_record;
+  pm::data_reset::EventJournalRecord event_previous_record;
+  check(event_store.scrubCompletedPayloadCopies(events_completed) ==
+                DataResetStoreResult::SavedAndVerified &&
+            pm::persistence::loadActive(event_memory,
+                                        pm::kDataResetEventSlots,
+                                        event_active) &&
+            pm::persistence::loadPrevious(event_memory,
+                                          pm::kDataResetEventSlots,
+                                          event_active.generation,
+                                          event_previous) &&
+            pm::decodeDataResetEventJournal(event_active.payload,
+                                            event_active_record) &&
+            pm::decodeDataResetEventJournal(event_previous.payload,
+                                            event_previous_record) &&
+            pm::data_reset::eventJournalRecordsEqual(event_active_record,
+                                                     events_completed) &&
+            pm::data_reset::eventJournalRecordsEqual(event_previous_record,
+                                                     events_completed),
+        "event completion removes staged payload from both atomic slots");
+  MemoryBlobStore event_semantic_memory;
+  pm::DataResetEventStore event_semantic_store(event_semantic_memory);
+  pm::data_reset::EventJournalRecord recovered_events;
+  check(event_semantic_store.saveAndVerify(events) ==
+                DataResetStoreResult::SavedAndVerified &&
+            pm::persistence::commit(event_semantic_memory,
+                                    pm::kDataResetEventSlots,
+                                    bytes("null"), injected) &&
+            event_semantic_store.load(recovered_events) ==
+                DataResetStoreResult::Loaded &&
+            pm::data_reset::eventJournalRecordsEqual(events,
+                                                      recovered_events),
+        "event store rolls back a wrapper-valid semantic corruption");
+}
+
+void testDataResetCapacityPolicy() {
+  using pm::data_reset::DataResetCapacityReport;
+  using pm::data_reset::kRequiredDefaultNvsFreeEntries;
+  using pm::data_reset::kRequiredPmconfigFreeEntries;
+
+  DataResetCapacityReport report;
+  check(!pm::data_reset::dataResetCapacitySufficient(report),
+        "reset capacity query failure rejects prepare");
+  report.pmconfig =
+      {true, kRequiredPmconfigFreeEntries, kRequiredPmconfigFreeEntries};
+  report.default_nvs = {true, kRequiredDefaultNvsFreeEntries,
+                        kRequiredDefaultNvsFreeEntries};
+  check(pm::data_reset::dataResetCapacitySufficient(report),
+        "exact reset journal capacity bound admits prepare");
+  --report.pmconfig.free_entries;
+  check(!pm::data_reset::dataResetCapacitySufficient(report),
+        "one missing pmconfig entry deterministically rejects prepare");
+  report.pmconfig.free_entries = kRequiredPmconfigFreeEntries;
+  --report.default_nvs.free_entries;
+  check(!pm::data_reset::dataResetCapacitySufficient(report),
+        "one missing auxiliary NVS entry deterministically rejects prepare");
+  report.pmconfig_terminal_entries =
+      pm::data_reset::atomicSlotEntries(1024U);
+  report.default_nvs_terminal_entries =
+      pm::data_reset::atomicSlotEntries(
+          pm::data_reset::kCompletedEventJournalMaximumBytes);
+  report.pmconfig.free_entries =
+      pm::data_reset::requiredPmconfigFreeEntries(report);
+  report.default_nvs.free_entries =
+      pm::data_reset::requiredDefaultNvsFreeEntries(report);
+  check(pm::data_reset::dataResetCapacitySufficient(report),
+        "validated terminal records are credited for repeated reset");
+  --report.default_nvs.free_entries;
+  check(!pm::data_reset::dataResetCapacitySufficient(report),
+        "terminal credit still rejects one missing auxiliary entry");
+  report.pmconfig_terminal_entries =
+      std::numeric_limits<std::size_t>::max();
+  report.default_nvs_terminal_entries =
+      std::numeric_limits<std::size_t>::max();
+  check(pm::data_reset::requiredPmconfigFreeEntries(report) ==
+                pm::data_reset::kNvsGarbageCollectionPageEntries +
+                    pm::data_reset::kNvsAdmissionMarginEntries &&
+            pm::data_reset::requiredDefaultNvsFreeEntries(report) ==
+                pm::data_reset::kNvsGarbageCollectionPageEntries +
+                    pm::data_reset::kNvsAdmissionMarginEntries,
+        "terminal credit never consumes the GC page or safety margin");
+  check(kRequiredDefaultNvsFreeEntries < 7U * 126U,
+        "auxiliary worst-case live set fits the existing default NVS layout");
+
+  pm::data_reset::EventJournalRecord maximum_events;
+  maximum_events.operation_id =
+      "11111111-1111-4111-8111-111111111111";
+  maximum_events.device_id = "22222222-2222-4222-8222-222222222222";
+  maximum_events.source_generation =
+      std::numeric_limits<std::uint64_t>::max() - 1U;
+  maximum_events.target_generation =
+      std::numeric_limits<std::uint64_t>::max();
+  maximum_events.card_generation =
+      std::numeric_limits<std::uint64_t>::max();
+  maximum_events.event_count = maximum_events.events.size();
+  for (std::size_t index = 0U; index < maximum_events.events.size(); ++index) {
+    auto &event = maximum_events.events[index];
+    event.code.assign(64U, '\\');
+    event.severity.assign(16U, '\\');
+    event.detail.assign(512U, '\\');
+    event.boot_id.assign(64U, '\\');
+    event.utc_ms = std::numeric_limits<std::uint64_t>::max();
+    event.source_event_id = static_cast<std::uint64_t>(index) + 1U;
+    event.required_occurrences = 1U;
+    maximum_events.event_crc32[index] =
+        pm::data_reset::preservedEventCrc32(event);
+  }
+  const std::vector<std::uint8_t> maximum_event_payload =
+      pm::encodeDataResetEventJournal(maximum_events);
+  pm::data_reset::EventJournalRecord decoded_events;
+  check(!maximum_event_payload.empty() &&
+            maximum_event_payload.size() <=
+                pm::data_reset::kEventJournalMaximumBytes &&
+            pm::decodeDataResetEventJournal(maximum_event_payload,
+                                            decoded_events) &&
+            pm::data_reset::eventJournalRecordsEqual(maximum_events,
+                                                      decoded_events),
+        "maximum event journal fits the capacity proof and round-trips");
+  maximum_events.state = pm::data_reset::EventJournalState::Completed;
+  maximum_events.events = {};
+  const std::vector<std::uint8_t> completed_event_payload =
+      pm::encodeDataResetEventJournal(maximum_events);
+  check(!completed_event_payload.empty() &&
+            completed_event_payload.size() <=
+                pm::data_reset::kCompletedEventJournalMaximumBytes,
+        "completed event tombstone fits its reserved NVS bound");
+
+  pm::data_reset::DrainRecord maximum_completed_drain;
+  maximum_completed_drain.state = pm::data_reset::DrainState::Completed;
+  maximum_completed_drain.operation_id = maximum_events.operation_id;
+  maximum_completed_drain.device_id = maximum_events.device_id;
+  maximum_completed_drain.source_generation =
+      std::numeric_limits<std::uint64_t>::max() - 1U;
+  maximum_completed_drain.target_generation =
+      std::numeric_limits<std::uint64_t>::max();
+  maximum_completed_drain.card_generation =
+      std::numeric_limits<std::uint64_t>::max();
+  maximum_completed_drain.proposed_energy_offset_wh =
+      std::numeric_limits<std::uint64_t>::max();
+  maximum_completed_drain.assigned_first_sequence =
+      std::numeric_limits<std::uint64_t>::max() - 1U;
+  maximum_completed_drain.syncable_records_added = 2U;
+  maximum_completed_drain.interval_count = 2U;
+  maximum_completed_drain.interval_crc32 = {
+      std::numeric_limits<std::uint32_t>::max(),
+      std::numeric_limits<std::uint32_t>::max()};
+  const std::vector<std::uint8_t> completed_drain_payload =
+      pm::encodeDataResetDrainRecord(maximum_completed_drain);
+  check(!completed_drain_payload.empty() &&
+            completed_drain_payload.size() <=
+                pm::data_reset::kCompletedDrainJournalMaximumBytes,
+        "completed drain tombstone fits its rewrite margin");
 }
 
 void testProtocolCanonicalization() {
@@ -3083,6 +4154,9 @@ int main() {
   testConfigRecovery();
   testConfigValidationHelpers();
   testAtomicConfigStore();
+  testDataResetPolicyAndStore();
+  testDataResetAuxiliaryStores();
+  testDataResetCapacityPolicy();
   testSyncCoverage();
   testProtocolCanonicalization();
   testAuthenticationPolicy();

@@ -17,6 +17,7 @@
 #include "network/NetworkService.h"
 #include "network/ServerSyncPolicy.h"
 #include "network/ServerSyncScratch.h"
+#include "reset/DataResetCoordinator.h"
 #include "storage/SdStorage.h"
 #include "storage/StorageCoordinator.h"
 
@@ -28,7 +29,8 @@ public:
              ClockService &clock, SdStorage &storage,
              StorageCoordinator &storage_coordinator,
              Diagnostics &diagnostics, IMeter &meter,
-             QueueHandle_t maintenance_queue);
+             QueueHandle_t maintenance_queue,
+             DataResetCoordinator &data_reset);
   void tick();
   void requestImmediateSync();
   SyncMetrics metrics() const;
@@ -47,6 +49,7 @@ private:
   };
 
   bool enroll(std::uint32_t &retry_after_ms);
+  bool queueEnrollmentActivationReboot();
   bool heartbeat(std::uint32_t &retry_after_ms);
   bool pushReadings();
   bool pushEvents();
@@ -85,6 +88,7 @@ private:
   Diagnostics &diagnostics_;
   IMeter &meter_;
   QueueHandle_t maintenance_queue_{nullptr};
+  DataResetCoordinator &data_reset_;
   SyncMetrics metrics_;
   std::uint64_t next_heartbeat_ms_{0};
   std::uint64_t next_retry_ms_{0};
@@ -127,6 +131,9 @@ private:
   bool immediate_sync_release_recorded_{false};
   bool last_operation_locally_deferred_{false};
   bool fragmentation_deferred_{false};
+  bool data_reset_gate_observed_{false};
+  bool enrollment_activation_reboot_queued_{false};
+  std::uint64_t next_enrollment_activation_reboot_ms_{0U};
   std::string available_firmware_version_;
 };
 

@@ -12,6 +12,7 @@
 #include "meter/IMeter.h"
 #include "network/ClockService.h"
 #include "network/NetworkService.h"
+#include "reset/DataResetPolicy.h"
 #include "storage/SdStorage.h"
 
 namespace pm {
@@ -237,6 +238,10 @@ class Diagnostics {
 public:
   Diagnostics();
   void setLatest(const MeasurementSnapshot &sample);
+  void clearLatest();
+  void suspendLatestForDataReset();
+  void markLatestBaselineInstalled(std::uint64_t generation);
+  void resumeLatestForGeneration(std::uint64_t generation);
   bool latest(MeasurementSnapshot &sample) const;
   void setCommittedSequence(std::uint64_t sequence);
   std::uint64_t committedSequence() const;
@@ -326,6 +331,7 @@ private:
   mutable std::uint64_t tls_lifecycle_checkpoint_total_{0U};
   MeasurementSnapshot latest_;
   bool has_latest_{false};
+  data_reset::PostBaselineFreshnessLatch latest_freshness_{};
   std::uint64_t committed_sequence_{0};
   std::uint32_t storage_queue_depth_{0};
   std::uint32_t action_queue_depth_{0};

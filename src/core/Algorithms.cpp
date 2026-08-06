@@ -56,8 +56,10 @@ std::uint32_t validateMeasurement(MeasurementSnapshot &sample,
   return sample.quality_flags;
 }
 
-EnergyNormalizer::EnergyNormalizer(const std::uint64_t persisted_offset_wh)
-    : offset_wh_(persisted_offset_wh), last_lifetime_wh_(persisted_offset_wh) {}
+EnergyNormalizer::EnergyNormalizer(const std::uint64_t persisted_offset_wh,
+                                   const std::uint64_t baseline_absolute_wh)
+    : offset_wh_(persisted_offset_wh),
+      baseline_absolute_wh_(baseline_absolute_wh) {}
 
 EnergyResult EnergyNormalizer::update(const std::uint64_t raw_start_wh,
                                       const std::uint64_t raw_end_wh,
@@ -125,11 +127,21 @@ EnergyResult EnergyNormalizer::update(const std::uint64_t raw_start_wh,
     result.quality_flags |= EnergyIncomplete;
   }
   if (raw_end_valid) {
-    result.lifetime_wh = offset_wh_ + raw_end_wh;
+    const std::uint64_t absolute_wh =
+        raw_end_wh > std::numeric_limits<std::uint64_t>::max() - offset_wh_
+            ? std::numeric_limits<std::uint64_t>::max()
+            : offset_wh_ + raw_end_wh;
+    result.lifetime_wh = absolute_wh > baseline_absolute_wh_
+                             ? absolute_wh - baseline_absolute_wh_
+                             : 0U;
   } else {
-    result.lifetime_wh =
-        last_lifetime_wh_ +
+    const std::uint64_t interval_wh =
         static_cast<std::uint64_t>(std::llround(result.interval_wh));
+    result.lifetime_wh =
+        interval_wh >
+                std::numeric_limits<std::uint64_t>::max() - last_lifetime_wh_
+            ? std::numeric_limits<std::uint64_t>::max()
+            : last_lifetime_wh_ + interval_wh;
   }
   result.lifetime_wh = std::max(result.lifetime_wh, last_lifetime_wh_);
   last_lifetime_wh_ = result.lifetime_wh;
@@ -137,6 +149,10 @@ EnergyResult EnergyNormalizer::update(const std::uint64_t raw_start_wh,
 }
 
 std::uint64_t EnergyNormalizer::offsetWh() const { return offset_wh_; }
+
+std::uint64_t EnergyNormalizer::baselineAbsoluteWh() const {
+  return baseline_absolute_wh_;
+}
 
 IntervalAggregator::IntervalAggregator(Limits limits)
     : limits_(std::move(limits)) {}
@@ -160,6 +176,7 @@ void IntervalAggregator::reset(const std::uint64_t start_utc_ms,
   raw_start_valid_ = raw_end_valid_ = previous_power_valid_ = false;
   last_sample_seen_ = false;
   last_sample_monotonic_ms_ = 0;
+  last_sample_utc_ms_ = 0;
   all_times_trusted_ = true;
 }
 
@@ -171,6 +188,7 @@ void IntervalAggregator::add(const MeasurementSnapshot &sample) {
   }
   last_sample_seen_ = true;
   last_sample_monotonic_ms_ = sample.monotonic_ms;
+  last_sample_utc_ms_ = sample.utc_ms;
   ++samples_;
   quality_ |= sample.quality_flags;
   all_times_trusted_ = all_times_trusted_ && sample.time_trusted;
@@ -211,6 +229,11 @@ void IntervalAggregator::add(const MeasurementSnapshot &sample) {
 }
 
 bool IntervalAggregator::hasSamples() const { return samples_ != 0; }
+
+bool IntervalAggregator::wouldProduceSyncableRecord() const {
+  return samples_ != 0U && all_times_trusted_ && start_utc_ms_ != 0U &&
+         last_sample_utc_ms_ > start_utc_ms_;
+}
 
 IntervalRecord IntervalAggregator::finish(const std::string &device_id,
                                           const std::string &friendly_name,

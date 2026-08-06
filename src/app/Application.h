@@ -19,6 +19,7 @@
 #include "network/NetworkService.h"
 #include "network/ServerSync.h"
 #include "ota/OtaService.h"
+#include "reset/DataResetCoordinator.h"
 #include "storage/SdStorage.h"
 #include "storage/StorageCoordinator.h"
 
@@ -68,6 +69,7 @@ private:
   HardwareSerial pzem_serial_{1};
   std::unique_ptr<IMeter> meter_;
   OtaService ota_;
+  std::unique_ptr<DataResetCoordinator> data_reset_;
   std::unique_ptr<ServerSync> sync_;
   std::unique_ptr<HttpApi> http_;
   QueueHandle_t sample_queue_{nullptr};
@@ -83,6 +85,7 @@ private:
   TaskHandle_t serial_command_task_{nullptr};
   std::atomic<std::uint64_t> meter_progress_{0};
   std::atomic<std::uint64_t> aggregation_progress_{0};
+  std::atomic<std::uint32_t> sample_enqueues_in_flight_{0};
   std::atomic<std::uint64_t> network_progress_{0};
   std::atomic<std::uint64_t> sync_progress_{0};
   EspHeapTelemetry heap_telemetry_{};

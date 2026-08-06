@@ -204,6 +204,7 @@ bool append(JsonArray output, const std::string &encoded_record) {
   }
 
   JsonObject record = output.add<JsonObject>();
+  record["data_generation"] = source["data_generation"] | 0ULL;
   record["sequence"] = source["sequence"];
   record["boot_id"] = source["boot_id"];
   record["interval_start"] = source["start_utc"];

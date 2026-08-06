@@ -5,6 +5,15 @@
   "boot_id": "44f16f01-46c9-4ea4-9bf7-f194269dd048",
   "firmware_version": "1.0.16",
   "firmware_build_hash": "abababababababababababababababababababababababababababababababab",
+  "data_generation": 0,
+  "data_reset": {
+    "protocol": "data-reset/1.0.0",
+    "state": "none",
+    "checkpoint": "none",
+    "failure_code": null,
+    "reset_boundary": 0,
+    "reset_required": false
+  },
   "ota": {
     "supported": true,
     "protocol_version": 2,

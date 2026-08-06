@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
 #include <limits>
 #include <numeric>
+#include <sys/stat.h>
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -18,6 +21,7 @@
 #include "build_config.h"
 #include "core/Algorithms.h"
 #include "diagnostics/SerialLogger.h"
+#include "reset/DataResetCleanupStore.h"
 #include "storage/RecordFormat.h"
 #include "version.h"
 
@@ -89,6 +93,28 @@ constexpr const char *kCleanupJournalPath =
     "/POWERMON/state/retention.journal";
 constexpr const char *kCleanupTrashDirectory =
     "/POWERMON/recovery/retention-trash";
+
+// Stream::readStringUntil() consumes the delimiter instead of returning it,
+// while PMR1 envelopes intentionally include the final LF in their framing.
+// Preserve that byte so a complete record is not misclassified as a corrupt
+// or incomplete envelope. A missing final LF remains a hard failure.
+bool readEnvelopeLine(File &file, std::string &line) {
+  line.clear();
+  while (file && file.available() > 0) {
+    const int next = file.read();
+    if (next < 0) {
+      break;
+    }
+    line.push_back(static_cast<char>(next));
+    if (line.back() == '\n') {
+      return true;
+    }
+    if (line.size() > 8192U) {
+      return false;
+    }
+  }
+  return false;
+}
 
 // Arduino's FAT directory iterator calls f_stat()/f_open() while the SD SPI
 // driver owns the calling core. A slow or recovering card can remain inside a
@@ -191,9 +217,11 @@ SdStorage::SdStorage() : spi_(FSPI) {
 bool SdStorage::begin(const std::uint32_t spi_hz,
                       const std::string &device_id,
                       const std::string &hardware_fingerprint,
-                      const std::uint64_t required_sequence_floor) {
+                      const std::uint64_t required_sequence_floor,
+                      const std::string &accepted_previous_device_id) {
   preferred_spi_hz_ = std::min(spi_hz, build::MAX_SD_SPI_HZ);
   device_id_ = device_id;
+  accepted_previous_device_id_ = accepted_previous_device_id;
   hardware_fingerprint_ = hardware_fingerprint;
   required_sequence_floor_ = required_sequence_floor;
   return remountPreferred();
@@ -333,13 +361,18 @@ bool SdStorage::remountPreferred() {
   return health_.writable;
 }
 
-bool SdStorage::append(IntervalRecord &record) {
+bool SdStorage::append(IntervalRecord &record,
+                       const std::uint64_t expected_card_generation,
+                       const std::string &expected_card_device_id) {
   if (!lock()) {
     return false;
   }
   if (!health_.mounted || !health_.writable || health_.prepared_for_removal ||
       !health_.sequence_floor_ready ||
-      next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+      next_sequence_ == std::numeric_limits<std::uint64_t>::max() ||
+      (expected_card_generation != 0U &&
+       !currentCardManifestMatchesReset(expected_card_generation,
+                                        expected_card_device_id))) {
     ++health_.write_failures;
     health_.last_error = !health_.sequence_floor_ready
                              ? "sequence_reconciliation_required"
@@ -384,7 +417,10 @@ bool SdStorage::append(IntervalRecord &record) {
   }
   const std::string path = recordPath(record);
   const std::size_t slash = path.find_last_of('/');
-  if (slash == std::string::npos || !ensureDirectory(path.substr(0, slash))) {
+  if ((expected_card_generation != 0U &&
+       !currentCardManifestMatchesReset(expected_card_generation,
+                                        expected_card_device_id)) ||
+      slash == std::string::npos || !ensureDirectory(path.substr(0, slash))) {
     ++health_.write_failures;
     health_.last_error = "record_directory_failed";
     PM_LOG_ERROR("SD", "RECORD_DIRECTORY_FAILED",
@@ -430,7 +466,11 @@ bool SdStorage::append(IntervalRecord &record) {
                 "error=PM-SD-006 sequence=%llu recovery=rebuild_indexes",
                 static_cast<unsigned long long>(record.sequence));
   }
-  const bool sequence_journal_persisted = persistSequence(record.sequence);
+  const bool sequence_journal_persisted =
+      (expected_card_generation == 0U ||
+       currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) &&
+      persistSequence(record.sequence);
   if (!sequence_journal_persisted) {
     ++health_.write_failures;
     health_.last_error = "sequence_journal_degraded";
@@ -439,6 +479,20 @@ bool SdStorage::append(IntervalRecord &record) {
         "error=PM-SD-007 sequence=%llu record_durable=true "
         "next_sequence_advanced=true recovery=scan_record_floor",
         static_cast<unsigned long long>(record.sequence));
+    if (expected_card_generation != 0U) {
+      publishHealthSnapshot(health_);
+      unlock();
+      return false;
+    }
+  }
+  if (expected_card_generation != 0U &&
+      !currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    ++health_.write_failures;
+    health_.last_error = "data_reset_storage_identity_changed";
+    publishHealthSnapshot(health_);
+    unlock();
+    return false;
   }
   health_.oldest_sequence =
       health_.oldest_sequence == 0
@@ -490,12 +544,18 @@ bool SdStorage::appendEvent(const std::string &code,
                             const std::string &severity,
                             const std::string &detail,
                             const std::uint64_t utc_ms,
-                            const std::string &boot_id) {
+                            const std::string &boot_id,
+                            const std::uint64_t expected_card_generation,
+                            const std::string &expected_card_device_id,
+                            const std::uint64_t source_event_id) {
   if (!lock()) {
     return false;
   }
   if (!health_.mounted || !health_.writable || code.size() > 64 ||
-      severity.size() > 16 || detail.size() > 512) {
+      severity.size() > 16 || detail.size() > 512 ||
+      (expected_card_generation != 0U &&
+       !currentCardManifestMatchesReset(expected_card_generation,
+                                        expected_card_device_id))) {
     unlock();
     return false;
   }
@@ -509,6 +569,9 @@ bool SdStorage::appendEvent(const std::string &code,
   document["code"] = code;
   document["severity"] = severity;
   document["detail"] = detail;
+  if (source_event_id > 0U) {
+    document["source_event_id"] = source_event_id;
+  }
   std::string payload;
   serializeJson(document, payload);
   const std::string envelope = record::encodeEnvelope(payload);
@@ -564,7 +627,9 @@ bool SdStorage::appendEvent(const std::string &code,
 
 bool SdStorage::reserveUnavailableIntervals(const std::uint64_t count,
                                             const std::uint64_t first_utc_ms,
-                                            const std::uint64_t last_utc_ms) {
+                                            const std::uint64_t last_utc_ms,
+                                            const std::uint64_t expected_card_generation,
+                                            const std::string &expected_card_device_id) {
   if (count == 0U) {
     return true;
   }
@@ -573,7 +638,10 @@ bool SdStorage::reserveUnavailableIntervals(const std::uint64_t count,
   }
   if (!health_.mounted || !health_.writable ||
       health_.prepared_for_removal ||
-      count > std::numeric_limits<std::uint64_t>::max() - next_sequence_) {
+      count > std::numeric_limits<std::uint64_t>::max() - next_sequence_ ||
+      (expected_card_generation != 0U &&
+       !currentCardManifestMatchesReset(expected_card_generation,
+                                        expected_card_device_id))) {
     unlock();
     return false;
   }
@@ -589,7 +657,13 @@ bool SdStorage::reserveUnavailableIntervals(const std::uint64_t count,
   }
   const std::uint64_t first_sequence = next_sequence_;
   const std::uint64_t last_sequence = first_sequence + count - 1U;
-  if (!persistSequence(last_sequence)) {
+  if ((expected_card_generation != 0U &&
+       !currentCardManifestMatchesReset(expected_card_generation,
+                                        expected_card_device_id)) ||
+      !persistSequence(last_sequence) ||
+      (expected_card_generation != 0U &&
+       !currentCardManifestMatchesReset(expected_card_generation,
+                                        expected_card_device_id))) {
     ++health_.write_failures;
     health_.last_error = "dropped_interval_sequence_journal_failed";
     publishHealthSnapshot(health_);
@@ -1064,11 +1138,12 @@ SegmentMetadata SdStorage::inspectEventSegment(const std::string &path) const {
     metadata.payload_bytes = input.size();
   }
   while (metadata.complete && input && input.available() > 0) {
-    const String raw = input.readStringUntil('\n');
+    std::string raw;
+    const bool complete_line = readEnvelopeLine(input, raw);
     std::string payload;
     std::uint32_t checksum = 0U;
     JsonDocument document;
-    if (!record::decodeEnvelope(raw.c_str(), payload, checksum) ||
+    if (!complete_line || !record::decodeEnvelope(raw, payload, checksum) ||
         deserializeJson(document, payload) ||
         !document["event_sequence"].is<std::uint64_t>()) {
       metadata.complete = false;
@@ -1107,14 +1182,15 @@ bool SdStorage::loadSegmentMetadata(const std::string &path,
                                     SegmentMetadata &metadata) const {
   const std::string stored_path = metadataPath(path);
   File input = SD.open(stored_path.c_str(), FILE_READ);
-  const String raw = input ? input.readStringUntil('\n') : String{};
+  std::string raw;
+  const bool complete_line = input && readEnvelopeLine(input, raw);
   if (input) {
     input.close();
   }
   std::string payload;
   std::uint32_t checksum = 0U;
   JsonDocument document;
-  if (!record::decodeEnvelope(raw.c_str(), payload, checksum) ||
+  if (!complete_line || !record::decodeEnvelope(raw, payload, checksum) ||
       deserializeJson(document, payload) ||
       (document["schema_version"] | 0) != 1 ||
       (document["record_path"] | "") != path ||
@@ -1214,13 +1290,15 @@ bool SdStorage::persistSegmentMetadata(
     return false;
   }
   File verify = SD.open(temporary.c_str(), FILE_READ);
-  const String raw = verify ? verify.readStringUntil('\n') : String{};
+  std::string raw;
+  const bool complete_line = verify && readEnvelopeLine(verify, raw);
   if (verify) {
     verify.close();
   }
   std::string verified_payload;
   std::uint32_t checksum = 0U;
-  if (!record::decodeEnvelope(raw.c_str(), verified_payload, checksum) ||
+  if (!complete_line ||
+      !record::decodeEnvelope(raw, verified_payload, checksum) ||
       verified_payload != payload) {
     SD.remove(temporary.c_str());
     return false;
@@ -1347,14 +1425,15 @@ bool SdStorage::recoverCleanupJournal() {
   health_.pressure_state = storagePressureStateName(
       StoragePressureState::CleanupRecovering);
   File input = SD.open(kCleanupJournalPath, FILE_READ);
-  const String raw = input ? input.readStringUntil('\n') : String{};
+  std::string raw;
+  const bool complete_line = input && readEnvelopeLine(input, raw);
   if (input) {
     input.close();
   }
   std::string payload;
   std::uint32_t checksum = 0U;
   JsonDocument document;
-  if (!record::decodeEnvelope(raw.c_str(), payload, checksum) ||
+  if (!complete_line || !record::decodeEnvelope(raw, payload, checksum) ||
       deserializeJson(document, payload)) {
     health_.last_error = "cleanup_journal_invalid";
     health_.pressure_state = storagePressureStateName(StoragePressureState::ReadOnly);
@@ -2130,7 +2209,9 @@ void SdStorage::publishHealthSnapshot(const StorageHealth &snapshot) const {
 std::uint64_t SdStorage::nextSequence() const { return next_sequence_; }
 
 bool SdStorage::advanceSequenceFloor(
-    const std::uint64_t acknowledged_sequence) {
+    const std::uint64_t acknowledged_sequence,
+    const std::uint64_t expected_card_generation,
+    const std::string &expected_card_device_id) {
   if (!lock()) {
     PM_LOG_ERROR("STORAGE", "SEQUENCE_FLOOR_ADVANCE_FAILED",
                  "reason=storage_lock_timeout required_floor=%llu",
@@ -2147,6 +2228,16 @@ bool SdStorage::advanceSequenceFloor(
       health_.mounted ? "true" : "false",
       health_.writable ? "true" : "false");
   const std::uint64_t current_floor = next_sequence_ - 1U;
+  const bool card_binding_valid =
+      expected_card_generation == 0U ||
+      currentCardManifestMatchesReset(expected_card_generation,
+                                      expected_card_device_id);
+  if (!card_binding_valid) {
+    health_.last_error = "data_reset_storage_identity_changed";
+    publishHealthSnapshot(health_);
+    unlock();
+    return false;
+  }
   // A requested floor is a lower bound, not an equality assertion. A queued
   // request may become stale while StorageTask is completing retention or a
   // remount. If the durable journal has already advanced beyond that request,
@@ -2169,7 +2260,7 @@ bool SdStorage::advanceSequenceFloor(
     unlock();
     return true;
   }
-  const bool valid =
+  const bool valid = card_binding_valid &&
       health_.mounted && health_.writable &&
       acknowledged_sequence >= health_.newest_sequence &&
       acknowledged_sequence >= current_floor &&
@@ -2197,7 +2288,14 @@ bool SdStorage::advanceSequenceFloor(
     return valid;
   }
   health_.sequence_reconciliation_in_progress = true;
-  const bool persisted = persistSequence(acknowledged_sequence);
+  const bool persisted =
+      (expected_card_generation == 0U ||
+       currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) &&
+      persistSequence(acknowledged_sequence) &&
+      (expected_card_generation == 0U ||
+       currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id));
   if (persisted) {
     const bool blank_or_replaced_card = health_.newest_sequence == 0U;
     next_sequence_ = acknowledged_sequence + 1U;
@@ -2250,6 +2348,854 @@ bool SdStorage::advanceSequenceFloor(
   publishHealthSnapshot(health_);
   unlock();
   return persisted;
+}
+
+bool SdStorage::currentCardManifestMatchesReset(
+    const std::uint64_t expected_card_generation,
+    const std::string &expected_card_device_id) const {
+  constexpr char kManifestPath[] = "/POWERMON/manifest.json";
+  if (SD.cardType() == CARD_NONE || !SD.exists(kManifestPath)) {
+    return false;
+  }
+  File input = SD.open(kManifestPath, FILE_READ);
+  JsonDocument manifest;
+  const DeserializationError parse_error = deserializeJson(manifest, input);
+  if (input) {
+    input.close();
+  }
+  const char *const stored_fingerprint =
+      manifest["hardware_id_fingerprint"].is<const char *>()
+          ? manifest["hardware_id_fingerprint"].as<const char *>()
+          : (manifest["hardware_fingerprint"].is<const char *>()
+                 ? manifest["hardware_fingerprint"].as<const char *>()
+                 : nullptr);
+  if (parse_error || stored_fingerprint == nullptr ||
+      !manifest["schema_version"].is<std::uint32_t>() ||
+      !manifest["device_id"].is<const char *>() ||
+      !manifest["card_generation"].is<std::uint64_t>()) {
+    return false;
+  }
+  return resetManifestBindingMatches(
+      manifest["schema_version"].as<std::uint32_t>(),
+      manifest["card_generation"].as<std::uint64_t>(),
+      manifest["device_id"].as<const char *>(),
+      stored_fingerprint,
+      expected_card_generation, expected_card_device_id,
+      hardware_fingerprint_);
+}
+
+bool SdStorage::containsDataResetDrainRecord(
+    const IntervalRecord &record,
+    const std::uint64_t assigned_sequence,
+    const std::uint64_t expected_card_generation,
+    const std::string &expected_card_device_id) const {
+  if (assigned_sequence == 0U || !lock(pdMS_TO_TICKS(5000U))) {
+    return false;
+  }
+  if (expected_card_generation == 0U ||
+      !currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    unlock();
+    return false;
+  }
+  IntervalRecord expected_record = record;
+  expected_record.sequence = assigned_sequence;
+  const std::string expected_payload = serializeRecord(expected_record);
+  const std::string path = recordPath(expected_record);
+  File input = SD.open(path.c_str(), FILE_READ);
+  bool found = false;
+  while (input && input.available() > 0 && !found) {
+    std::string raw;
+    if (!readEnvelopeLine(input, raw)) {
+      break;
+    }
+    std::string payload;
+    std::uint32_t checksum = 0U;
+    found = record::decodeEnvelope(raw, payload, checksum) &&
+            payload == expected_payload;
+  }
+  if (input)
+    input.close();
+  found = found && currentCardManifestMatchesReset(
+                       expected_card_generation,
+                       expected_card_device_id);
+  unlock();
+  return found;
+}
+
+bool SdStorage::countExactEvents(
+    const std::string &code, const std::string &severity,
+    const std::string &detail, const std::uint64_t utc_ms,
+    const std::string &boot_id,
+    const std::uint64_t expected_card_generation,
+    const std::string &expected_card_device_id,
+    const std::uint64_t source_event_id,
+    std::uint64_t &occurrences) const {
+  occurrences = 0U;
+  if (!lock(pdMS_TO_TICKS(5000U)))
+    return false;
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    unlock();
+    return false;
+  }
+  std::vector<std::string> files;
+  if (!collectFilesStrict("/POWERMON/events", ".events", files)) {
+    unlock();
+    return false;
+  }
+  for (const auto &path : files) {
+    File input = SD.open(path.c_str(), FILE_READ);
+    if (!input) {
+      unlock();
+      return false;
+    }
+    while (input.available() > 0) {
+      std::string raw;
+      std::string payload;
+      std::uint32_t checksum = 0U;
+      JsonDocument document;
+      if (!readEnvelopeLine(input, raw) ||
+          !record::decodeEnvelope(raw, payload, checksum) ||
+          deserializeJson(document, payload) ||
+          !document["code"].is<const char *>() ||
+          !document["severity"].is<const char *>() ||
+          !document["detail"].is<const char *>() ||
+          !document["boot_id"].is<const char *>() ||
+          !document["timestamp_utc_ms"].is<std::uint64_t>() ||
+          (!document["source_event_id"].isNull() &&
+           !document["source_event_id"].is<std::uint64_t>())) {
+        input.close();
+        unlock();
+        return false;
+      }
+      const bool matches = code == document["code"].as<const char *>() &&
+                           severity ==
+                               document["severity"].as<const char *>() &&
+                           detail == document["detail"].as<const char *>() &&
+                           boot_id == document["boot_id"].as<const char *>() &&
+                           source_event_id ==
+                               (document["source_event_id"].is<std::uint64_t>()
+                                    ? document["source_event_id"]
+                                          .as<std::uint64_t>()
+                                    : 0U) &&
+                           utc_ms == document["timestamp_utc_ms"]
+                                         .as<std::uint64_t>();
+      if (matches) {
+        if (occurrences == std::numeric_limits<std::uint64_t>::max()) {
+          input.close();
+          unlock();
+          return false;
+        }
+        ++occurrences;
+      }
+    }
+    input.close();
+  }
+  if (source_event_id == 0U || occurrences > 1U) {
+    occurrences = 0U;
+    unlock();
+    return false;
+  }
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    occurrences = 0U;
+    unlock();
+    return false;
+  }
+  unlock();
+  return true;
+}
+
+bool SdStorage::verifyDataResetCardBinding(
+    const std::uint64_t expected_card_generation,
+    const std::string &expected_card_device_id) const {
+  if (!lock(pdMS_TO_TICKS(5000U)))
+    return false;
+  const bool matches = currentCardManifestMatchesReset(
+      expected_card_generation, expected_card_device_id);
+  unlock();
+  return matches;
+}
+
+DataResetCleanupResult SdStorage::clearReadingDataForReset(
+    const std::string &operation_id,
+    const std::uint64_t source_generation,
+    const std::uint64_t target_generation,
+    const std::uint64_t expected_card_generation,
+    const std::string &expected_card_device_id) {
+  DataResetCleanupResult result;
+  if (!lock(pdMS_TO_TICKS(10'000U))) {
+    result.error_code = "data_reset_storage_lock_timeout";
+    return result;
+  }
+  const auto finish = [this, &result]() {
+    publishHealthSnapshot(health_);
+    unlock();
+    return result;
+  };
+  if (!health_.mounted || !health_.writable ||
+      health_.card_identity_status != "verified") {
+    result.error_code = "data_reset_storage_unavailable";
+    return finish();
+  }
+  // Re-read the currently inserted medium under the storage lock. Cached
+  // health is insufficient because a physical hot-swap does not execute the
+  // mount path. This is intentionally read-only: a missing/legacy/invalid
+  // manifest is never created or repaired by reset cleanup.
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id) ||
+      !resetCardBindingMatches(
+          health_.card_generation, health_.card_device_id,
+          expected_card_generation, expected_card_device_id)) {
+    result.error_code = "data_reset_storage_identity_changed";
+    return finish();
+  }
+  // Resolve an existing retention transaction using its own checksummed
+  // journal before classifying reset files. Never erase that journal or its
+  // trash with a wildcard.
+  if (!recoverCleanupJournal()) {
+    result.error_code = "data_reset_retention_recovery_failed";
+    return finish();
+  }
+
+  struct PlannedRemoval {
+    std::string path;
+    enum class Kind : std::uint8_t { Reading, Index, Export, Metadata } kind;
+    std::uint64_t bytes{0U};
+  };
+  std::vector<PlannedRemoval> plan;
+  const auto plan_files = [this, &plan](const char *root,
+                                        const PlannedRemoval::Kind kind,
+                                        const auto &recognized,
+                                        std::string &error) {
+    std::vector<std::string> files;
+    if (!collectFilesStrict(root, "", files)) {
+      error = "data_reset_storage_inventory_failed";
+      return false;
+    }
+    for (const auto &path : files) {
+      if (!recognized(path)) {
+        error = "data_reset_unknown_storage_artifact";
+        return false;
+      }
+      File file = SD.open(path.c_str(), FILE_READ);
+      if (!file) {
+        error = "data_reset_storage_inventory_changed";
+        return false;
+      }
+      const std::uint64_t bytes = file.size();
+      file.close();
+      plan.push_back({path, kind, bytes});
+    }
+    return true;
+  };
+
+  std::string error;
+  const auto reading_file = [](const std::string &path) {
+    return endsWith(path, ".pmr") || endsWith(path, ".repair");
+  };
+  const auto index_file = [](const std::string &path) {
+    return endsWith(path, ".idx") || endsWith(path, ".rebuild") ||
+           endsWith(path, ".previous") || endsWith(path, ".tmp");
+  };
+  const auto export_file = [](const std::string &path) {
+    return endsWith(path, ".csv") || endsWith(path, ".json") ||
+           endsWith(path, ".ndjson") || endsWith(path, ".tmp");
+  };
+  if (!plan_files("/POWERMON/records", PlannedRemoval::Kind::Reading,
+                  reading_file, error) ||
+      !plan_files("/POWERMON/indexes", PlannedRemoval::Kind::Index,
+                  index_file, error) ||
+      !plan_files("/POWERMON/exports", PlannedRemoval::Kind::Export,
+                  export_file, error)) {
+    result.error_code = error;
+    return finish();
+  }
+
+  // Metadata for reading and event segments shares one directory. Inspect the
+  // checksummed payload and remove only entries that explicitly reference the
+  // reading tree. Corrupt, temporary, or unclassified metadata blocks the
+  // reset before any file is deleted.
+  const auto read_segment_binding = [this](const std::string &path,
+                                            std::string &record_path,
+                                            std::uint64_t &bytes) {
+    if (!endsWith(path, ".json")) {
+      return false;
+    }
+    File input = SD.open(path.c_str(), FILE_READ);
+    std::string raw;
+    const bool complete = input && readEnvelopeLine(input, raw);
+    bytes = input ? input.size() : 0U;
+    if (input)
+      input.close();
+    std::string payload;
+    std::uint32_t checksum = 0U;
+    JsonDocument document;
+    if (!complete || !record::decodeEnvelope(raw, payload, checksum) ||
+        deserializeJson(document, payload) ||
+        !document["record_path"].is<const char *>()) {
+      return false;
+    }
+    record_path = document["record_path"].as<const char *>();
+    return true;
+  };
+  std::vector<std::string> metadata_files;
+  if (!collectFilesStrict("/POWERMON/state/segments", "", metadata_files)) {
+    result.error_code = "data_reset_storage_inventory_failed";
+    return finish();
+  }
+  for (const auto &path : metadata_files) {
+    std::string record_path;
+    std::uint64_t bytes = 0U;
+    if (!read_segment_binding(path, record_path, bytes)) {
+      result.error_code = "data_reset_segment_metadata_invalid";
+      return finish();
+    }
+    if (record_path.rfind("/POWERMON/records/", 0U) == 0U) {
+      plan.push_back({path, PlannedRemoval::Kind::Metadata, bytes});
+    } else if (record_path.rfind("/POWERMON/events/", 0U) != 0U) {
+      result.error_code = "data_reset_segment_metadata_unclassified";
+      return finish();
+    }
+  }
+
+  std::vector<std::string> retention_trash;
+  if (!collectFilesStrict(kCleanupTrashDirectory, "", retention_trash)) {
+    result.error_code = "data_reset_storage_inventory_failed";
+    return finish();
+  }
+  if (!retention_trash.empty()) {
+    result.error_code = "data_reset_unknown_retention_trash";
+    return finish();
+  }
+
+  // Persist the exact initial inventory before the first irreversible delete.
+  // On a power-cut retry the live plan contains only the remaining files, so
+  // returning counts from this NVS journal keeps the signed completion
+  // receipt exact and idempotent.
+  data_reset::CleanupRecord cleanup_journal;
+  DataResetCleanupStore cleanup_store;
+  const DataResetStoreResult cleanup_loaded =
+      cleanup_store.load(cleanup_journal);
+  const auto plan_count = [&plan](const PlannedRemoval::Kind kind) {
+    return static_cast<std::uint64_t>(std::count_if(
+        plan.begin(), plan.end(), [kind](const PlannedRemoval &item) {
+          return item.kind == kind;
+        }));
+  };
+  std::uint64_t planned_bytes = 0U;
+  for (const auto &item : plan) {
+    if (item.bytes > std::numeric_limits<std::uint64_t>::max() -
+                         planned_bytes) {
+      result.error_code = "data_reset_cleanup_count_overflow";
+      return finish();
+    }
+    planned_bytes += item.bytes;
+  }
+  const data_reset::CleanupRecord current_plan{
+      1U,
+      data_reset::CleanupState::Planned,
+      operation_id,
+      expected_card_device_id,
+      source_generation,
+      target_generation,
+      expected_card_generation,
+      plan_count(PlannedRemoval::Kind::Reading),
+      plan_count(PlannedRemoval::Kind::Index),
+      plan_count(PlannedRemoval::Kind::Export),
+      plan_count(PlannedRemoval::Kind::Metadata),
+      planned_bytes};
+  const bool replace_completed =
+      cleanup_loaded == DataResetStoreResult::Loaded &&
+      cleanup_journal.operation_id != operation_id &&
+      cleanup_journal.state == data_reset::CleanupState::Completed;
+  if (cleanup_loaded == DataResetStoreResult::NotFound || replace_completed) {
+    cleanup_journal = current_plan;
+    if (cleanup_store.saveAndVerify(cleanup_journal) !=
+        DataResetStoreResult::SavedAndVerified) {
+      result.error_code = "data_reset_cleanup_plan_persistence_failed";
+      return finish();
+    }
+  } else if (cleanup_loaded != DataResetStoreResult::Loaded) {
+    result.error_code = "data_reset_cleanup_journal_load_failed";
+    return finish();
+  } else if (cleanup_journal.operation_id != operation_id) {
+    result.error_code = "data_reset_cleanup_journal_conflict";
+    return finish();
+  }
+  if (cleanup_journal.device_id != expected_card_device_id ||
+      cleanup_journal.source_generation != source_generation ||
+      cleanup_journal.target_generation != target_generation ||
+      cleanup_journal.card_generation != expected_card_generation) {
+    result.error_code = "data_reset_cleanup_journal_binding_changed";
+    return finish();
+  }
+  if (current_plan.reading_files > cleanup_journal.reading_files ||
+      current_plan.index_files > cleanup_journal.index_files ||
+      current_plan.export_files > cleanup_journal.export_files ||
+      current_plan.metadata_files > cleanup_journal.metadata_files ||
+      current_plan.bytes > cleanup_journal.bytes ||
+      (cleanup_journal.state == data_reset::CleanupState::Completed &&
+       !plan.empty())) {
+    result.error_code = "data_reset_cleanup_inventory_changed";
+    return finish();
+  }
+  result.reading_files_removed = cleanup_journal.reading_files;
+  result.index_files_removed = cleanup_journal.index_files;
+  result.export_files_removed = cleanup_journal.export_files;
+  result.metadata_files_removed = cleanup_journal.metadata_files;
+  result.bytes_removed = cleanup_journal.bytes;
+
+  // Classification may be lengthy. Revalidate the live medium immediately
+  // before the first destructive operation as well, closing a hot-swap during
+  // inventory construction.
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    result.error_code = "data_reset_storage_identity_changed";
+    return finish();
+  }
+
+  // These cached fields all describe the pre-reset reading inventory. Once
+  // commit has reached the irreversible cleanup phase they must never be
+  // published again, including when a later file deletion or recovery scan
+  // needs to be retried. Operational counters, event health, card identity,
+  // and reset audit evidence remain intact.
+  health_.current_file.clear();
+  health_.last_write_utc_ms = 0U;
+  health_.last_write_latency_ms = 0U;
+  health_.reclaimable_bytes = 0U;
+  health_.protected_unacknowledged_bytes = 0U;
+  health_.protected_untrusted_bytes = 0U;
+  health_.dropped_interval_count = 0U;
+  health_.first_dropped_interval_utc_ms = 0U;
+  health_.last_dropped_interval_utc_ms = 0U;
+  // segment_count includes both reading and preserved event segments. Keep
+  // the event-only portion internally consistent until recover() refreshes
+  // both counts from the live card.
+  health_.segment_count = health_.event_segment_count;
+  health_.eligible_segment_count = 0U;
+  health_.protected_segment_count = 0U;
+  health_.open_segment_count = 0U;
+  health_.closed_segment_count = 0U;
+  health_.untrusted_segment_count = 0U;
+  health_.export_count = 0U;
+  health_.repair_artifact_count = 0U;
+  health_.temporary_artifact_count = 0U;
+
+  for (const auto &item : plan) {
+    // A card can be physically swapped between any two deletes without the
+    // SPI mount object changing. Bind every destructive action to a fresh
+    // manifest read, not merely to the inventory-time health snapshot.
+    if (!currentCardManifestMatchesReset(expected_card_generation,
+                                         expected_card_device_id)) {
+      result.error_code = "data_reset_storage_identity_changed";
+      health_.last_error = result.error_code;
+      return finish();
+    }
+    if (!SD.exists(item.path.c_str()) || !SD.remove(item.path.c_str())) {
+      result.error_code = "data_reset_storage_delete_failed";
+      health_.last_error = result.error_code;
+      return finish();
+    }
+  }
+
+  // Prove deletion independently of recover(), whose best-effort scans are
+  // appropriate for ordinary degraded operation but must never turn an
+  // unreadable reset directory into a successful empty inventory.
+  const auto require_empty_tree =
+      [this](const char *root, std::string &error_code) {
+        std::vector<std::string> remaining;
+        if (!collectFilesStrict(root, "", remaining)) {
+          error_code = "data_reset_storage_verification_failed";
+          return false;
+        }
+        if (!remaining.empty()) {
+          error_code = "data_reset_reading_inventory_not_empty";
+          return false;
+        }
+        return true;
+      };
+  if (!require_empty_tree("/POWERMON/records", result.error_code) ||
+      !require_empty_tree("/POWERMON/indexes", result.error_code) ||
+      !require_empty_tree("/POWERMON/exports", result.error_code)) {
+    health_.last_error = result.error_code;
+    return finish();
+  }
+
+  retention_trash.clear();
+  if (!collectFilesStrict(kCleanupTrashDirectory, "", retention_trash)) {
+    result.error_code = "data_reset_storage_verification_failed";
+    health_.last_error = result.error_code;
+    return finish();
+  }
+  if (!retention_trash.empty()) {
+    result.error_code = "data_reset_unknown_retention_trash";
+    health_.last_error = result.error_code;
+    return finish();
+  }
+
+  metadata_files.clear();
+  if (!collectFilesStrict("/POWERMON/state/segments", "", metadata_files)) {
+    result.error_code = "data_reset_storage_verification_failed";
+    health_.last_error = result.error_code;
+    return finish();
+  }
+  for (const auto &path : metadata_files) {
+    std::string record_path;
+    std::uint64_t bytes = 0U;
+    if (!read_segment_binding(path, record_path, bytes)) {
+      result.error_code = "data_reset_segment_metadata_invalid";
+      health_.last_error = result.error_code;
+      return finish();
+    }
+    if (record_path.rfind("/POWERMON/records/", 0U) == 0U) {
+      result.error_code = "data_reset_reading_inventory_not_empty";
+      health_.last_error = result.error_code;
+      return finish();
+    }
+    if (record_path.rfind("/POWERMON/events/", 0U) != 0U) {
+      result.error_code = "data_reset_segment_metadata_unclassified";
+      health_.last_error = result.error_code;
+      return finish();
+    }
+  }
+
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    result.error_code = "data_reset_storage_identity_changed";
+    health_.last_error = result.error_code;
+    return finish();
+  }
+
+  if (cleanup_journal.state != data_reset::CleanupState::Completed) {
+    data_reset::CleanupRecord completed = cleanup_journal;
+    completed.state = data_reset::CleanupState::Completed;
+    if (cleanup_store.saveAndVerify(completed) !=
+        DataResetStoreResult::SavedAndVerified) {
+      result.error_code = "data_reset_cleanup_completion_persistence_failed";
+      health_.last_error = result.error_code;
+      return finish();
+    }
+    cleanup_journal = std::move(completed);
+  }
+  if (cleanup_store.scrubCompletedPayloadCopies(cleanup_journal) !=
+      DataResetStoreResult::SavedAndVerified) {
+    result.error_code = "data_reset_cleanup_payload_scrub_failed";
+    health_.last_error = result.error_code;
+    return finish();
+  }
+
+  if (!recover()) {
+    result.error_code = "data_reset_storage_rescan_failed";
+    health_.last_error = result.error_code;
+    return finish();
+  }
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    result.error_code = "data_reset_storage_identity_changed";
+    health_.last_error = result.error_code;
+    return finish();
+  }
+  updateCapacity();
+  result.ok = health_.local_record_count == 0U &&
+              health_.oldest_sequence == 0U &&
+              health_.newest_syncable_sequence == 0U;
+  result.error_code = result.ok ? "" : "data_reset_reading_inventory_not_empty";
+  if (!result.ok)
+    health_.last_error = result.error_code;
+  return finish();
+}
+
+bool SdStorage::clearPreEnrollmentReadingData(
+    const std::uint64_t expected_card_generation,
+    const std::string &expected_card_device_id,
+    std::string &error_code) {
+  error_code.clear();
+  if (!lock(pdMS_TO_TICKS(10'000U))) {
+    error_code = "enrollment_storage_lock_timeout";
+    return false;
+  }
+  const auto finish = [this](const bool result) {
+    publishHealthSnapshot(health_);
+    unlock();
+    return result;
+  };
+  if (!health_.mounted || !health_.writable ||
+      health_.card_identity_status != "verified" ||
+      !currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id) ||
+      !resetCardBindingMatches(
+          health_.card_generation, health_.card_device_id,
+          expected_card_generation, expected_card_device_id)) {
+    error_code = "enrollment_storage_identity_changed";
+    return finish(false);
+  }
+  if (!recoverCleanupJournal()) {
+    error_code = "enrollment_retention_recovery_failed";
+    return finish(false);
+  }
+
+  struct Removal {
+    std::string path;
+  };
+  std::vector<Removal> plan;
+  const auto collect_recognized =
+      [this, &plan, &error_code](const char *root, const auto &recognized) {
+        std::vector<std::string> files;
+        if (!collectFilesStrict(root, "", files)) {
+          error_code = "enrollment_storage_inventory_failed";
+          return false;
+        }
+        for (const auto &path : files) {
+          if (!recognized(path)) {
+            error_code = "enrollment_unknown_storage_artifact";
+            return false;
+          }
+          File input = SD.open(path.c_str(), FILE_READ);
+          if (!input) {
+            error_code = "enrollment_storage_inventory_changed";
+            return false;
+          }
+          input.close();
+          plan.push_back({path});
+        }
+        return true;
+      };
+  const auto reading_file = [](const std::string &path) {
+    return endsWith(path, ".pmr") || endsWith(path, ".repair");
+  };
+  const auto index_file = [](const std::string &path) {
+    return endsWith(path, ".idx") || endsWith(path, ".rebuild") ||
+           endsWith(path, ".previous") || endsWith(path, ".tmp");
+  };
+  const auto export_file = [](const std::string &path) {
+    return endsWith(path, ".csv") || endsWith(path, ".json") ||
+           endsWith(path, ".ndjson") || endsWith(path, ".tmp");
+  };
+  if (!collect_recognized("/POWERMON/records", reading_file) ||
+      !collect_recognized("/POWERMON/indexes", index_file) ||
+      !collect_recognized("/POWERMON/exports", export_file)) {
+    return finish(false);
+  }
+
+  const auto read_segment_binding =
+      [this](const std::string &path, std::string &record_path) {
+        if (!endsWith(path, ".json"))
+          return false;
+        File input = SD.open(path.c_str(), FILE_READ);
+        std::string raw;
+        const bool complete = input && readEnvelopeLine(input, raw);
+        if (input)
+          input.close();
+        std::string payload;
+        std::uint32_t checksum = 0U;
+        JsonDocument document;
+        if (!complete || !record::decodeEnvelope(raw, payload, checksum) ||
+            deserializeJson(document, payload) ||
+            !document["record_path"].is<const char *>()) {
+          return false;
+        }
+        record_path = document["record_path"].as<const char *>();
+        return true;
+      };
+  std::vector<std::string> metadata_files;
+  if (!collectFilesStrict("/POWERMON/state/segments", "", metadata_files)) {
+    error_code = "enrollment_storage_inventory_failed";
+    return finish(false);
+  }
+  for (const auto &path : metadata_files) {
+    std::string record_path;
+    if (!read_segment_binding(path, record_path)) {
+      error_code = "enrollment_segment_metadata_invalid";
+      return finish(false);
+    }
+    if (record_path.rfind("/POWERMON/records/", 0U) == 0U) {
+      plan.push_back({path});
+    } else if (record_path.rfind("/POWERMON/events/", 0U) != 0U) {
+      error_code = "enrollment_segment_metadata_unclassified";
+      return finish(false);
+    }
+  }
+  std::vector<std::string> retention_trash;
+  if (!collectFilesStrict(kCleanupTrashDirectory, "", retention_trash) ||
+      !retention_trash.empty()) {
+    error_code = "enrollment_unknown_retention_trash";
+    return finish(false);
+  }
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id)) {
+    error_code = "enrollment_storage_identity_changed";
+    return finish(false);
+  }
+
+  health_.current_file.clear();
+  health_.last_write_utc_ms = 0U;
+  health_.last_write_latency_ms = 0U;
+  health_.reclaimable_bytes = 0U;
+  health_.protected_unacknowledged_bytes = 0U;
+  health_.protected_untrusted_bytes = 0U;
+  health_.dropped_interval_count = 0U;
+  health_.first_dropped_interval_utc_ms = 0U;
+  health_.last_dropped_interval_utc_ms = 0U;
+  health_.segment_count = health_.event_segment_count;
+  health_.eligible_segment_count = 0U;
+  health_.protected_segment_count = 0U;
+  health_.open_segment_count = 0U;
+  health_.closed_segment_count = 0U;
+  health_.untrusted_segment_count = 0U;
+  health_.export_count = 0U;
+  health_.repair_artifact_count = 0U;
+  health_.temporary_artifact_count = 0U;
+  for (const auto &item : plan) {
+    if (!currentCardManifestMatchesReset(expected_card_generation,
+                                         expected_card_device_id)) {
+      error_code = "enrollment_storage_identity_changed";
+      return finish(false);
+    }
+    if (!SD.exists(item.path.c_str()) || !SD.remove(item.path.c_str())) {
+      error_code = "enrollment_storage_delete_failed";
+      return finish(false);
+    }
+  }
+
+  const auto empty_tree = [this](const char *root) {
+    std::vector<std::string> remaining;
+    return collectFilesStrict(root, "", remaining) && remaining.empty();
+  };
+  if (!empty_tree("/POWERMON/records") ||
+      !empty_tree("/POWERMON/indexes") ||
+      !empty_tree("/POWERMON/exports")) {
+    error_code = "enrollment_reading_inventory_not_empty";
+    return finish(false);
+  }
+  metadata_files.clear();
+  if (!collectFilesStrict("/POWERMON/state/segments", "", metadata_files)) {
+    error_code = "enrollment_storage_verification_failed";
+    return finish(false);
+  }
+  for (const auto &path : metadata_files) {
+    std::string record_path;
+    if (!read_segment_binding(path, record_path) ||
+        record_path.rfind("/POWERMON/records/", 0U) == 0U) {
+      error_code = "enrollment_reading_inventory_not_empty";
+      return finish(false);
+    }
+  }
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       expected_card_device_id) ||
+      !recover()) {
+    error_code = "enrollment_storage_verification_failed";
+    return finish(false);
+  }
+  updateCapacity();
+  const bool empty = health_.local_record_count == 0U &&
+                     health_.oldest_sequence == 0U &&
+                     health_.newest_syncable_sequence == 0U;
+  if (!empty)
+    error_code = "enrollment_reading_inventory_not_empty";
+  return finish(empty);
+}
+
+bool SdStorage::rebindCardForEnrollment(
+    const std::uint64_t expected_card_generation,
+    const std::string &source_card_device_id,
+    const std::string &assigned_device_id) {
+  if (expected_card_generation == 0U || source_card_device_id.empty() ||
+      assigned_device_id.size() != 36U ||
+      !lock(pdMS_TO_TICKS(10'000U))) {
+    return false;
+  }
+  const auto finish = [this](const bool result, const char *error) {
+    if (!result && error != nullptr)
+      health_.last_error = error;
+    publishHealthSnapshot(health_);
+    unlock();
+    return result;
+  };
+  if (!health_.mounted || !health_.writable ||
+      health_.card_generation != expected_card_generation) {
+    return finish(false, "enrollment_storage_unavailable");
+  }
+  if (currentCardManifestMatchesReset(expected_card_generation,
+                                      assigned_device_id)) {
+    device_id_ = assigned_device_id;
+    accepted_previous_device_id_ = source_card_device_id;
+    health_.card_device_id = assigned_device_id;
+    return finish(true, nullptr);
+  }
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       source_card_device_id)) {
+    return finish(false, "enrollment_storage_identity_changed");
+  }
+
+  const char *target = "/POWERMON/manifest.json";
+  const char *temporary = "/POWERMON/manifest.enrollment.tmp";
+  const char *backup = "/POWERMON/manifest.enrollment.bak";
+  File input = SD.open(target, FILE_READ);
+  JsonDocument manifest;
+  const bool parsed = input && !deserializeJson(manifest, input);
+  if (input)
+    input.close();
+  if (!parsed || manifest["schema_version"].as<std::uint32_t>() != 2U ||
+      manifest["card_generation"].as<std::uint64_t>() !=
+          expected_card_generation ||
+      std::string(manifest["device_id"] | "") != source_card_device_id) {
+    return finish(false, "enrollment_manifest_invalid");
+  }
+  manifest["device_id"] = assigned_device_id;
+  std::string payload;
+  serializeJson(manifest, payload);
+  if (payload.empty() || (SD.exists(temporary) && !SD.remove(temporary)) ||
+      (SD.exists(backup) && !SD.remove(backup))) {
+    return finish(false, "enrollment_manifest_stage_failed");
+  }
+  File output = SD.open(temporary, FILE_WRITE);
+  const bool written =
+      output &&
+      output.write(reinterpret_cast<const std::uint8_t *>(payload.data()),
+                   payload.size()) == payload.size();
+  if (output) {
+    output.flush();
+    output.close();
+  }
+  File verify = SD.open(temporary, FILE_READ);
+  JsonDocument staged;
+  const bool staged_valid =
+      written && verify && !deserializeJson(staged, verify) &&
+      staged["schema_version"].as<std::uint32_t>() == 2U &&
+      staged["card_generation"].as<std::uint64_t>() ==
+          expected_card_generation &&
+      std::string(staged["device_id"] | "") == assigned_device_id &&
+      std::string(staged["hardware_id_fingerprint"] |
+                  (staged["hardware_fingerprint"] | "")) ==
+          hardware_fingerprint_;
+  if (verify)
+    verify.close();
+  if (!staged_valid) {
+    SD.remove(temporary);
+    return finish(false, "enrollment_manifest_stage_failed");
+  }
+  if (!SD.rename(target, backup)) {
+    SD.remove(temporary);
+    return finish(false, "enrollment_manifest_backup_failed");
+  }
+  if (!SD.rename(temporary, target)) {
+    (void)SD.rename(backup, target);
+    return finish(false, "enrollment_manifest_install_failed");
+  }
+  if (!currentCardManifestMatchesReset(expected_card_generation,
+                                       assigned_device_id)) {
+    return finish(false, "enrollment_manifest_verification_failed");
+  }
+  if (SD.exists(backup) && !SD.remove(backup)) {
+    return finish(false, "enrollment_manifest_backup_cleanup_failed");
+  }
+  device_id_ = assigned_device_id;
+  accepted_previous_device_id_ = source_card_device_id;
+  health_.card_device_id = assigned_device_id;
+  health_.card_identity_status = "verified";
+  return finish(true, nullptr);
 }
 
 bool SdStorage::initializeLayout() {
@@ -2356,6 +3302,10 @@ bool SdStorage::recover() {
   const char *event_log_status = "verified";
   std::vector<std::string> event_files;
   collectFiles("/POWERMON/events", ".events", event_files);
+  health_.event_segment_count =
+      static_cast<std::uint32_t>(event_files.size());
+  health_.segment_count = static_cast<std::uint32_t>(files.size()) +
+                          health_.event_segment_count;
   for (const auto &path : event_files) {
     SegmentMetadata metadata;
     if (loadSegmentMetadata(path, true, metadata) && metadata.closed &&
@@ -2382,11 +3332,13 @@ bool SdStorage::recover() {
     }
     std::size_t scanned_event_records = 0U;
     while (event_file && event_file.available() > 0) {
-      const String raw = event_file.readStringUntil('\n');
+      std::string raw;
+      const bool complete_line = readEnvelopeLine(event_file, raw);
       std::string event_payload;
       std::uint32_t event_checksum = 0U;
       JsonDocument event_document;
-      if (!record::decodeEnvelope(raw.c_str(), event_payload, event_checksum) ||
+      if (!complete_line ||
+          !record::decodeEnvelope(raw, event_payload, event_checksum) ||
           deserializeJson(event_document, event_payload) ||
           !event_document["event_sequence"].is<std::uint64_t>()) {
         event_log_valid = false;
@@ -2582,6 +3534,52 @@ bool SdStorage::recoverFile(const std::string &path,
 
 bool SdStorage::writeManifest() {
   const char *target = "/POWERMON/manifest.json";
+  const char *temporary = "/POWERMON/manifest.enrollment.tmp";
+  const char *backup = "/POWERMON/manifest.enrollment.bak";
+  const auto transition_manifest_valid =
+      [this](const char *path, const std::string &expected_device) {
+        if (!SD.exists(path))
+          return false;
+        File input = SD.open(path, FILE_READ);
+        JsonDocument document;
+        const bool valid =
+            input && !deserializeJson(document, input) &&
+            document["schema_version"].as<std::uint32_t>() == 2U &&
+            document["card_generation"].is<std::uint64_t>() &&
+            document["card_generation"].as<std::uint64_t>() > 0U &&
+            std::string(document["device_id"] | "") == expected_device &&
+            std::string(document["hardware_id_fingerprint"] |
+                        (document["hardware_fingerprint"] | "")) ==
+                hardware_fingerprint_;
+        if (input)
+          input.close();
+        return valid;
+      };
+  // Enrollment rebind uses an exact temporary/backup pair. Recover it before
+  // ordinary manifest initialization so a power cut can never cause a fresh
+  // card identity or generation to be invented over the existing medium.
+  if (!SD.exists(target)) {
+    const bool install_staged =
+        transition_manifest_valid(temporary, device_id_);
+    const bool restore_previous =
+        !accepted_previous_device_id_.empty() &&
+        transition_manifest_valid(backup, accepted_previous_device_id_);
+    if (install_staged) {
+      if (!SD.rename(temporary, target))
+        return false;
+      if (SD.exists(backup))
+        SD.remove(backup);
+    } else if (restore_previous) {
+      if (!SD.rename(backup, target))
+        return false;
+      if (SD.exists(temporary))
+        SD.remove(temporary);
+    } else if (SD.exists(temporary) || SD.exists(backup)) {
+      health_.card_identity_status = "manifest_transition_invalid";
+      health_.last_error = "storage_manifest_transition_invalid";
+      return false;
+    }
+  }
   if (SD.exists(target)) {
     File existing = SD.open(target, FILE_READ);
     JsonDocument stored;
@@ -2600,9 +3598,11 @@ bool SdStorage::writeManifest() {
       const std::string stored_fingerprint =
           stored["hardware_id_fingerprint"] |
           (stored["hardware_fingerprint"] | "");
-      if ((!stored_device.empty() && stored_device != device_id_) ||
-          (!stored_fingerprint.empty() &&
-           stored_fingerprint != hardware_fingerprint_)) {
+      const bool accepted_device =
+          stored_device == device_id_ ||
+          (!accepted_previous_device_id_.empty() &&
+           stored_device == accepted_previous_device_id_);
+      if (!accepted_device || stored_fingerprint != hardware_fingerprint_) {
         health_.card_identity_status = "wrong_sensor";
         health_.card_device_id = stored_device;
         health_.last_error = "storage_card_identity_mismatch";
@@ -2617,6 +3617,12 @@ bool SdStorage::writeManifest() {
       health_.card_device_id = stored_device;
       health_.card_generation = stored["card_generation"] | 0ULL;
       health_.card_replaced_or_initialized = false;
+      if (stored_device == device_id_) {
+        if (SD.exists(temporary))
+          SD.remove(temporary);
+        if (SD.exists(backup))
+          SD.remove(backup);
+      }
       return true;
     }
     // Schema 1 cards predate identity binding. Upgrade in place without
@@ -2642,9 +3648,9 @@ bool SdStorage::writeManifest() {
   document["created_monotonic_ms"] = millis();
   std::string payload;
   serializeJson(document, payload);
-  const char *temporary = "/POWERMON/manifest.json.tmp";
-  SD.remove(temporary);
-  File file = SD.open(temporary, FILE_WRITE);
+  const char *initialization_temporary = "/POWERMON/manifest.json.tmp";
+  SD.remove(initialization_temporary);
+  File file = SD.open(initialization_temporary, FILE_WRITE);
   const bool ok =
       file && file.write(reinterpret_cast<const std::uint8_t *>(payload.data()),
                          payload.size()) == payload.size();
@@ -2653,10 +3659,10 @@ bool SdStorage::writeManifest() {
     file.close();
   }
   if (!ok) {
-    SD.remove(temporary);
+    SD.remove(initialization_temporary);
     return false;
   }
-  File verify = SD.open(temporary, FILE_READ);
+  File verify = SD.open(initialization_temporary, FILE_READ);
   JsonDocument verified;
   const bool verified_ok = verify && !deserializeJson(verified, verify) &&
                            verified["schema_version"].as<unsigned>() == 2U &&
@@ -2665,11 +3671,11 @@ bool SdStorage::writeManifest() {
     verify.close();
   }
   if (!verified_ok) {
-    SD.remove(temporary);
+    SD.remove(initialization_temporary);
     return false;
   }
   SD.remove(target);
-  const bool installed = SD.rename(temporary, target);
+  const bool installed = SD.rename(initialization_temporary, target);
   health_.card_identity_status = installed ? "verified" : "manifest_write_failed";
   health_.card_device_id = installed ? device_id_ : "";
   health_.card_generation = installed ? generation : 0U;
@@ -2828,6 +3834,7 @@ std::string SdStorage::serializeRecord(const IntervalRecord &value) const {
   JsonDocument document;
   document["schema_version"] = value.schema_version;
   document["protocol"] = version::PROTOCOL;
+  document["data_generation"] = value.data_generation;
   document["device_id"] = value.device_id;
   document["friendly_name"] = value.friendly_name;
   document["sequence"] = value.sequence;
@@ -2893,6 +3900,64 @@ void SdStorage::collectFiles(const std::string &directory, const char *suffix,
     entry = root.openNextFile();
   }
   root.close();
+}
+
+bool SdStorage::collectFilesStrict(const std::string &directory,
+                                   const char *suffix,
+                                   std::vector<std::string> &output) const {
+  ScopedFatDirectoryWatchdogGuard watchdog_guard;
+  std::size_t scanned_entries = 0U;
+  const auto scan = [&output, suffix, &scanned_entries](
+                        const auto &self,
+                        const std::string &logical_directory) -> bool {
+    const std::string physical_directory = "/sd" + logical_directory;
+    DIR *const root = opendir(physical_directory.c_str());
+    if (root == nullptr)
+      return false;
+    bool ok = true;
+    for (;;) {
+      errno = 0;
+      dirent *const entry = readdir(root);
+      if (entry == nullptr) {
+        ok = errno == 0;
+        break;
+      }
+      const std::string name = entry->d_name;
+      if (name == "." || name == "..")
+        continue;
+      if (name.empty() || name.find('/') != std::string::npos ||
+          name.find('\\') != std::string::npos) {
+        ok = false;
+        break;
+      }
+      const std::string logical_path = logical_directory + "/" + name;
+      const std::string physical_path = "/sd" + logical_path;
+      struct stat metadata {};
+      if (stat(physical_path.c_str(), &metadata) != 0) {
+        ok = false;
+        break;
+      }
+      if (S_ISDIR(metadata.st_mode)) {
+        if (!self(self, logical_path)) {
+          ok = false;
+          break;
+        }
+      } else if (S_ISREG(metadata.st_mode)) {
+        if (endsWith(logical_path, suffix))
+          output.push_back(logical_path);
+      } else {
+        ok = false;
+        break;
+      }
+      ++scanned_entries;
+      if (scanned_entries % kCooperativeScanRecords == 0U)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (closedir(root) != 0)
+      ok = false;
+    return ok;
+  };
+  return scan(scan, directory);
 }
 
 void SdStorage::cleanupTemporaryArtifacts(const std::uint64_t now_utc_ms) {

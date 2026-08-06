@@ -184,6 +184,16 @@ class StorageAndOtaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete"):
             decode(line[:-1])
 
+    def test_sd_envelope_scans_preserve_record_terminator(self) -> None:
+        source = (ROOT / "src/storage/SdStorage.cpp").read_text(encoding="utf-8")
+        self.assertIn("bool readEnvelopeLine(File &file, std::string &line)", source)
+        self.assertGreaterEqual(source.count("readEnvelopeLine("), 9)
+        self.assertNotIn("record::decodeEnvelope(raw.c_str()", source)
+        self.assertIn(
+            "if (line.back() == '\\n') {",
+            source,
+        )
+
     def test_index_rebuild_repairs_only_incomplete_tail(self) -> None:
         root_directory = case_directory("index-repair")
         try:

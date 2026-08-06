@@ -206,7 +206,15 @@ components:
         effective_metadata: {type: object}
         server_ota_signing_public_key: {type: [string, 'null']}
         heartbeat_policy: {type: object}
-        sync_policy: {type: object}
+        sync_policy:
+          type: object
+          additionalProperties: false
+          required: [maximum_batch_records, durable_interval_seconds, data_generation, reset_boundary]
+          properties:
+            maximum_batch_records: {type: integer, minimum: 1, maximum: 10000}
+            durable_interval_seconds: {type: integer, minimum: 10, maximum: 3600}
+            data_generation: {type: integer, minimum: 0, maximum: 9223372036854775806}
+            reset_boundary: {type: integer, minimum: 0, maximum: 9223372036854775806}
     SubsystemHealth:
       type: object
       required: [ok, status]
@@ -264,6 +272,11 @@ components:
         boot_id: {type: string, format: uuid}
         firmware_version: {type: string}
         firmware_build_hash: {type: string}
+        data_generation:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Additive data-only-reset epoch; omission means generation zero for legacy sensors.
         ota: {$ref: '#/components/schemas/OtaCapability'}
         uptime_seconds: {type: integer, minimum: 0}
         reboot_reason: {type: string}
@@ -277,12 +290,12 @@ components:
             - {type: 'null'}
         pzem: {$ref: '#/components/schemas/SubsystemHealth'}
         sd: {$ref: '#/components/schemas/StorageSubsystemHealth'}
-        oldest_stored_sequence: {type: integer, minimum: 0}
-        oldest_syncable_sequence: {type: integer, minimum: 0, description: Oldest retained durable interval with trustworthy UTC bounds that can be synchronized.}
-        newest_syncable_sequence: {type: integer, minimum: 0}
-        newest_stored_sequence: {type: integer, minimum: 0}
-        server_ack_sequence: {type: integer, minimum: 0}
-        server_maximum_seen_sequence: {type: integer, minimum: 0}
+        oldest_stored_sequence: {type: integer, minimum: 0, maximum: 9223372036854775807}
+        oldest_syncable_sequence: {type: integer, minimum: 0, maximum: 9223372036854775807, description: Oldest retained durable interval with trustworthy UTC bounds that can be synchronized.}
+        newest_syncable_sequence: {type: integer, minimum: 0, maximum: 9223372036854775807}
+        newest_stored_sequence: {type: integer, minimum: 0, maximum: 9223372036854775807}
+        server_ack_sequence: {type: integer, minimum: 0, maximum: 9223372036854775807}
+        server_maximum_seen_sequence: {type: integer, minimum: 0, maximum: 9223372036854775807}
         backlog_estimate: {type: integer, minimum: 0}
         configuration_version: {type: integer, minimum: 0}
         time: {$ref: '#/components/schemas/TimeHealth'}
@@ -307,6 +320,19 @@ components:
               additionalProperties: true
           additionalProperties: true
         queue: {type: object}
+        data_reset:
+          type: object
+          required: [protocol, state, checkpoint]
+          properties:
+            protocol: {const: data-reset/1.0.0}
+            state: {type: string, minLength: 1, maxLength: 48}
+            checkpoint: {type: string, minLength: 1, maxLength: 48}
+            failure_code: {type: [string, 'null'], maxLength: 80, pattern: '^[a-z0-9][a-z0-9_]{0,79}$'}
+            operation_id: {type: [string, 'null'], format: uuid}
+            target_generation: {type: [integer, 'null'], minimum: 1}
+            reset_boundary: {type: [integer, 'null'], minimum: 0, maximum: 9223372036854775805}
+            reset_required: {type: boolean, default: false}
+          additionalProperties: true
     HeartbeatResponse:
       type: object
       required: [server_receive_time, highest_contiguous_accepted_sequence, gap_ranges, desired_configuration_version, firmware_release_available, recommended_heartbeat_interval_seconds, immediate_sync_requested]
@@ -322,7 +348,12 @@ components:
       type: object
       required: [sequence, boot_id, interval_start, interval_end, time_trusted, energy_method, ct_rating_amps, quality_flags, firmware_version]
       properties:
-        sequence: {type: integer, minimum: 1}
+        data_generation:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Additive data-only-reset epoch; omission means generation zero for legacy sensors.
+        sequence: {type: integer, minimum: 1, maximum: 9223372036854775807}
         boot_id: {type: string}
         interval_start: {type: string, format: date-time}
         interval_end: {type: string, format: date-time}
@@ -356,6 +387,10 @@ components:
         protocol_version: {const: pm-protocol/1.0.0}
         schema_version: {const: reading-batch/1.0.0}
         device_id: {type: string, format: uuid}
+        data_generation:
+          type: integer
+          minimum: 0
+          default: 0
         readings:
           type: array
           maxItems: 500
@@ -391,10 +426,11 @@ components:
         evidence: {type: object}
     EventBatch:
       type: object
-      required: [protocol_version, device_id, events]
+      required: [protocol_version, device_id, data_generation, events]
       properties:
         protocol_version: {const: pm-protocol/1.0.0}
         device_id: {type: string, format: uuid}
+        data_generation: {type: integer, minimum: 0}
         events:
           type: array
           minItems: 1
